@@ -13053,7 +13053,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "  /topic             Enable topic mode, or show status if already on\n"
             "  /topic help        Show this message\n"
             "  /topic off         Disable topic mode and clear topic bindings\n"
-            "  /topic <id>        Inside a topic: restore a previous session by ID\n"
+            "  /topic <id-or-title> Inside a topic: restore a previous session by ID or title\n"
             "\n"
             "How it works:\n"
             "1. Run /topic once in this DM — Hermes checks BotFather Threads\n"
@@ -13137,7 +13137,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "",
                 "To restore one:",
                 "1. Create or open a topic. To create a new one, open All Messages and send any message there.",
-                "2. Send /topic <session-id> inside that topic.",
+                "2. Send /topic <session-id-or-title> inside that topic.",
                 f"Example: Send /topic {sessions[0].get('id')} inside a topic.",
             ])
         else:
@@ -13146,20 +13146,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "",
                 "To restore a previous session later:",
                 "1. Create or open a topic. To create a new one, open All Messages and send any message there.",
-                "2. Send /topic <session-id> inside that topic.",
+                "2. Send /topic <session-id-or-title> inside that topic.",
             ])
         return "\n".join(lines)
 
     async def _restore_telegram_topic_session(self, event: MessageEvent, raw_session_id: str) -> str:
         """Restore an existing Telegram-owned Hermes session into this topic."""
         source = event.source
-        session_id = self._session_db.resolve_session_id(raw_session_id.strip())
+        raw = raw_session_id.strip()
+        session_id = self._session_db.resolve_session_id(raw)
         if not session_id:
-            return f"Session not found: {raw_session_id.strip()}"
+            try:
+                session_id = self._session_db.resolve_session_by_title(raw)
+            except Exception:
+                session_id = None
+        if not session_id:
+            return f"Session not found: {raw}"
 
         session = self._session_db.get_session(session_id)
         if not session:
-            return f"Session not found: {raw_session_id.strip()}"
+            return f"Session not found: {raw}"
         if str(session.get("source") or "") != "telegram":
             return "That session is not a Telegram session and cannot be restored into this topic."
         if str(session.get("user_id") or "") != str(source.user_id):

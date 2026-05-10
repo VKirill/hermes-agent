@@ -163,6 +163,15 @@ class TestAutoTitleSession:
             auto_title_session(db, "sess-1", "hi", "hello")
             gen.assert_not_called()
 
+    def test_replaces_generated_telegram_fallback_title(self):
+        db = MagicMock()
+        db.get_session_title.return_value = "Telegram May 10 12:38 deadbe"
+
+        with patch("agent.title_generator.generate_title", return_value="DeFi Liquidation Searcher"):
+            auto_title_session(db, "sess-1", "hi", "hello")
+
+        db.set_session_title.assert_called_once_with("sess-1", "DeFi Liquidation Searcher")
+
     def test_generates_and_sets_title(self):
         db = MagicMock()
         db.get_session_title.return_value = None

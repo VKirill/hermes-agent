@@ -914,6 +914,24 @@ class SessionStore:
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
             profile=self._resolve_profile_for_key(source),
         )
+
+    def _assign_generated_fallback_title(self, source: SessionSource, entry: SessionEntry) -> None:
+        """Give newly-created sessions an immediate platform fallback title."""
+        if self._db is None:
+            return
+        try:
+            from agent.session_title_defaults import fallback_title_for_gateway_session
+
+            title = fallback_title_for_gateway_session(
+                source.platform,
+                entry.session_id,
+                created_at=entry.created_at,
+            )
+            if not title:
+                return
+            self._db.set_session_title(entry.session_id, title)
+        except Exception as exc:
+            logger.debug("Failed to assign generated session fallback title: %s", exc)
     
     def _is_session_expired(self, entry: SessionEntry) -> bool:
         """Check if a session has expired based on its reset policy.
@@ -1115,6 +1133,7 @@ class SessionStore:
         if self._db and db_create_kwargs:
             try:
                 self._db.create_session(**db_create_kwargs)
+                self._assign_generated_fallback_title(source, entry)
             except Exception as e:
                 print(f"[gateway] Warning: Failed to create SQLite session: {e}")
 
@@ -1340,6 +1359,8 @@ class SessionStore:
         if self._db and db_create_kwargs:
             try:
                 self._db.create_session(**db_create_kwargs)
+                if new_entry.origin is not None:
+                    self._assign_generated_fallback_title(new_entry.origin, new_entry)
             except Exception as e:
                 logger.debug("Session DB operation failed: %s", e)
 

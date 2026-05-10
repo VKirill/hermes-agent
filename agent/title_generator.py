@@ -9,6 +9,7 @@ import threading
 from typing import Callable, Optional
 
 from agent.auxiliary_client import call_llm
+from agent.session_title_defaults import is_generated_fallback_title
 
 logger = logging.getLogger(__name__)
 
@@ -129,10 +130,12 @@ def auto_title_session(
     if not session_db or not session_id:
         return
 
-    # Check if title already exists (user may have set one via /title before first response)
+    # Check if title already exists.  User-set titles are authoritative, but
+    # deterministic Telegram fallback titles are placeholders that content-based
+    # auto-title is allowed to replace after the first successful exchange.
     try:
         existing = session_db.get_session_title(session_id)
-        if existing:
+        if existing and not is_generated_fallback_title(existing):
             return
     except Exception:
         return
