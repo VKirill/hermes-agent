@@ -12884,6 +12884,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         session_id: str,
         title: str,
+        icon_id: Optional[str] = None,
     ) -> None:
         """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
         if not self._is_telegram_topic_lane(source) or not source.chat_id or not source.thread_id:
@@ -12940,6 +12941,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
                     name=topic_name,
+                    icon_custom_emoji_id=icon_id,
                 )
                 return
 
@@ -12950,17 +12952,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if edit_forum_topic is None:
                 return
             try:
-                await edit_forum_topic(
-                    chat_id=int(source.chat_id),
-                    message_thread_id=int(source.thread_id),
-                    name=topic_name,
-                )
+                kwargs = {
+                    "chat_id": int(source.chat_id),
+                    "message_thread_id": int(source.thread_id),
+                    "name": topic_name,
+                }
+                if icon_id is not None:
+                    kwargs["icon_custom_emoji_id"] = icon_id
+                await edit_forum_topic(**kwargs)
             except (TypeError, ValueError):
-                await edit_forum_topic(
-                    chat_id=source.chat_id,
-                    message_thread_id=source.thread_id,
-                    name=topic_name,
-                )
+                kwargs = {
+                    "chat_id": source.chat_id,
+                    "message_thread_id": source.thread_id,
+                    "name": topic_name,
+                }
+                if icon_id is not None:
+                    kwargs["icon_custom_emoji_id"] = icon_id
+                await edit_forum_topic(**kwargs)
         except Exception:
             logger.debug("Failed to rename Telegram topic for auto-generated title", exc_info=True)
 
@@ -12992,6 +13000,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: SessionSource,
         session_id: str,
         title: str,
+        icon_id: Optional[str] = None,
     ) -> None:
         """Schedule a topic rename from the auto-title background thread."""
         if not title or not self._is_telegram_topic_lane(source):
@@ -13009,7 +13018,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             copied_source = source
         future = safe_schedule_threadsafe(
-            self._rename_telegram_topic_for_session_title(copied_source, session_id, title),
+            self._rename_telegram_topic_for_session_title(copied_source, session_id, title, icon_id=icon_id),
             loop,
             logger=logger,
             log_message="Telegram topic title rename failed to schedule",
@@ -17755,10 +17764,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         } if agent else None,
                     }
                     if self._is_telegram_topic_lane(source):
-                        maybe_auto_title_kwargs["title_callback"] = lambda title: self._schedule_telegram_topic_title_rename(
+                        maybe_auto_title_kwargs["title_callback"] = lambda title, icon_id=None: self._schedule_telegram_topic_title_rename(
                             source,
                             effective_session_id,
                             title,
+                            icon_id=icon_id,
                         )
                     maybe_auto_title(
                         self._session_db,
