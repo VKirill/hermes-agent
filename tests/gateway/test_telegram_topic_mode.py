@@ -857,6 +857,7 @@ async def test_auto_generated_title_renames_bound_telegram_topic(tmp_path):
         chat_id="208214988",
         thread_id="42",
         name="Build Telegram Topic UX",
+        icon_custom_emoji_id=None,
     )
 
 
