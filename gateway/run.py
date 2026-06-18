@@ -9377,6 +9377,86 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    @staticmethod
+    def _delivery_message_ids_from_result(result: Any) -> list[str]:
+        ids: list[str] = []
+
+        def _add(value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    _add(item)
+                return
+            text = str(value).strip()
+            if text and text != "__no_edit__" and text not in ids:
+                ids.append(text)
+
+        _add(getattr(result, "continuation_message_ids", None))
+        raw = getattr(result, "raw_response", None)
+        if isinstance(raw, dict):
+            _add(raw.get("message_ids"))
+        _add(getattr(result, "message_id", None))
+        return ids
+
+    def _record_telegram_assistant_delivery(
+        self,
+        session_id: str,
+        message_ids: Any,
+    ) -> None:
+        if not session_id or not self._session_db:
+            return
+        try:
+            self._session_db.set_latest_assistant_platform_message_ids(
+                session_id,
+                message_ids,
+            )
+        except Exception:
+            logger.debug(
+                "Failed to persist Telegram assistant delivery ids for %s",
+                session_id,
+                exc_info=True,
+            )
+
+    def _attach_telegram_delivery_recorder(
+        self,
+        event: MessageEvent,
+        source: SessionSource,
+        session_id: str,
+    ) -> None:
+        if not event or not source or source.platform != Platform.TELEGRAM:
+            return
+        recorded_ids: list[str] = []
+
+        def _recorder(result: Any) -> None:
+            changed = False
+            for message_id in self._delivery_message_ids_from_result(result):
+                if message_id not in recorded_ids:
+                    recorded_ids.append(message_id)
+                    changed = True
+            if changed:
+                self._record_telegram_assistant_delivery(session_id, recorded_ids)
+
+        try:
+            setattr(event, "_hermes_delivery_recorder", _recorder)
+        except Exception:
+            logger.debug("Failed to attach Telegram delivery recorder", exc_info=True)
+
+    def _record_streamed_telegram_delivery(
+        self,
+        source: SessionSource,
+        session_id: str,
+        stream_consumer: Any,
+    ) -> None:
+        if not source or source.platform != Platform.TELEGRAM or stream_consumer is None:
+            return
+        message_ids = getattr(stream_consumer, "message_ids", None)
+        if callable(message_ids):
+            message_ids = message_ids()
+        if message_ids is None:
+            message_ids = getattr(stream_consumer, "message_id", None)
+        self._record_telegram_assistant_delivery(session_id, message_ids)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -10620,6 +10700,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 last_prompt_tokens=agent_result.get("last_prompt_tokens", 0),
             )
 
+            if agent_result.get("delivery_message_ids"):
+                self._record_telegram_assistant_delivery(
+                    session_entry.session_id,
+                    agent_result.get("delivery_message_ids"),
+                )
+
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
             # still persisted in session history so later turns keep normal
@@ -10679,6 +10765,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.debug("trailing footer send failed: %s", _e)
                 return None
 
+            if response and not agent_result.get("failed") and not _intentional_silence:
+                self._attach_telegram_delivery_recorder(
+                    event,
+                    source,
+                    session_entry.session_id,
+                )
             return response
             
         except Exception as e:
@@ -15018,6 +15110,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "proxy response: url=%s session=%s time=%.1fs response=%d chars",
             proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
         )
+        delivery_message_ids = (
+            tuple(getattr(_stream_consumer, "message_ids", ()) or ())
+            if _stream_consumer and full_response
+            else ()
+        )
+        if delivery_message_ids:
+            self._record_streamed_telegram_delivery(
+                source,
+                session_id,
+                _stream_consumer,
+            )
 
         return {
             "final_response": full_response or "(No response from remote agent)",
@@ -15030,6 +15133,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
+            "delivery_message_ids": delivery_message_ids,
         }
 
     # ------------------------------------------------------------------
@@ -17731,6 +17835,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _previewed,
                     _content_delivered,
                 )
+                if _sc is not None:
+                    self._record_streamed_telegram_delivery(source, session_id, _sc)
+                    response["delivery_message_ids"] = tuple(
+                        getattr(_sc, "message_ids", ()) or ()
+                    )
                 response["already_sent"] = True
             elif not _is_empty_sentinel and _transformed and _sc is not None:
                 # Plugin hooks transformed the response after streaming — edit the
@@ -17745,6 +17854,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             finalize=True,
                         )
                         response["already_sent"] = True
+                        self._record_streamed_telegram_delivery(source, session_id, _sc)
+                        response["delivery_message_ids"] = tuple(
+                            getattr(_sc, "message_ids", ()) or ()
+                        )
                         logger.info(
                             "Edited streamed message %s for session %s to include plugin-transformed content.",
                             _sc_msg_id, session_key or "?",
