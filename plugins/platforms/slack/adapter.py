@@ -1059,6 +1059,14 @@ class SlackAdapter(BasePlatformAdapter):
             ):
                 self._app.action(_action_id)(self._handle_slash_confirm_action)
 
+            # Register Block Kit action handlers for suggestion buttons
+            for _action_id in (
+                "hermes_suggest_explain",
+                "hermes_suggest_do",
+                "hermes_suggest_dismiss",
+            ):
+                self._app.action(_action_id)(self._handle_suggestion_action)
+
             # Register plugin-provided Block Kit action handlers.
             #
             # Plugins call ``ctx.register_slack_action_handler(action_id, cb)``
@@ -3082,6 +3090,69 @@ class SlackAdapter(BasePlatformAdapter):
             logger.error("[Slack] send_exec_approval failed: %s", e, exc_info=True)
             return SendResult(success=False, error=str(e))
 
+    async def send_suggestion(
+        self,
+        chat_id: str,
+        suggestion_text: str,
+        can_auto_execute: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a suggestion block with Block Kit interactive buttons.
+
+        The suggestion is sent as a separate message with a divider,
+        a section showing the suggestion text, and action buttons.
+        """
+        if not self._app:
+            return SendResult(success=False, error="Not connected")
+        try:
+            formatted = self.format_message(suggestion_text)
+            thread_ts = self._resolve_thread_ts(None, metadata)
+
+            buttons = [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "✏️ Explain"},
+                    "action_id": "hermes_suggest_explain",
+                    "style": "primary",
+                },
+            ]
+            if can_auto_execute:
+                buttons.append({
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "▶️ Do it"},
+                    "action_id": "hermes_suggest_do",
+                    "style": "primary",
+                })
+            buttons.append({
+                "type": "button",
+                "text": {"type": "plain_text", "text": "✕ Dismiss"},
+                "action_id": "hermes_suggest_dismiss",
+            })
+
+            blocks = [
+                {"type": "divider"},
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": formatted},
+                },
+                {"type": "actions", "elements": buttons},
+            ]
+
+            kwargs: Dict[str, Any] = {
+                "channel": chat_id,
+                "text": "⚡ Suggestion",
+                "blocks": blocks,
+            }
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+
+            result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            msg_ts = result.get("ts", "")
+            return SendResult(success=True, message_id=msg_ts, raw_response=result)
+        except Exception as e:
+            logger.error("[Slack] send_suggestion failed: %s", e, exc_info=True)
+            return SendResult(success=False, error=str(e))
+
     async def send_slash_confirm(
         self,
         chat_id: str,
@@ -3206,6 +3277,72 @@ class SlackAdapter(BasePlatformAdapter):
             return "*" in allowed_ids or normalized_user_id in allowed_ids
 
         return os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+
+    async def _handle_suggestion_action(self, ack, body, action) -> None:
+        """Handle a suggestion button click from Block Kit."""
+        await ack()
+
+        action_id = action.get("action_id", "")
+        message = body.get("message", {})
+        msg_ts = message.get("ts", "")
+        channel_id = body.get("channel", {}).get("id", "")
+        thread_ts = message.get("thread_ts", "")
+        user_name = body.get("user", {}).get("name", "unknown")
+        user_id = body.get("user", {}).get("id", "")
+
+        # Authorization — reuse the exec-approval allowlist.
+        allowed_csv = os.getenv("SLACK_ALLOWED_USERS", "").strip()
+        if allowed_csv:
+            allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
+            if "*" not in allowed_ids and user_id not in allowed_ids:
+                logger.warning(
+                    "[Slack] Unauthorized suggestion click by %s (%s) — ignoring",
+                    user_name,
+                    user_id,
+                )
+                return
+
+        if action_id == "hermes_suggest_dismiss":
+            # Update the message to remove buttons
+            try:
+                blocks = message.get("blocks", [])
+                # Remove the actions block
+                updated_blocks = [b for b in blocks if b.get("type") != "actions"]
+                await self._get_client(channel_id).chat_update(
+                    channel=channel_id,
+                    ts=msg_ts,
+                    text="⚡ Suggestion (dismissed)",
+                    blocks=updated_blocks,
+                )
+            except Exception as e:
+                logger.debug("[Slack] Suggestion dismiss update failed: %s", e)
+            return
+
+        # Explain or Do — inject synthetic message into session
+        prompt_map = {
+            "hermes_suggest_explain": "Explain what you did in the previous response — what tools you used and why.",
+            "hermes_suggest_do": "Execute the suggested next step from the previous response.",
+        }
+        prompt = prompt_map.get(action_id)
+        if not prompt:
+            return
+
+        from gateway.session import SessionSource, Platform
+        from gateway.platforms.base import MessageEvent
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id=channel_id,
+            chat_type="dm",
+            user_id=user_id,
+            user_name=user_name,
+            thread_id=thread_ts or None,
+        )
+        event = MessageEvent(
+            text=prompt,
+            source=source,
+            internal=True,
+        )
+        await self.handle_message(event)
 
     async def _handle_slash_confirm_action(self, ack, body, action) -> None:
         """Handle a slash-confirm button click from Block Kit."""

@@ -11295,6 +11295,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await self._deliver_media_from_response(
                             response, event, _media_adapter,
                         )
+                # Deliver interactive suggestion buttons if the response
+                # contains a SUGGESTION marker and the platform supports it.
+                # Best-effort — failures don't block the response.
+                if response:
+                    try:
+                        await self._deliver_suggestion_from_response(
+                            response, event, source,
+                        )
+                    except Exception as _e:
+                        logger.debug("suggestion delivery failed: %s", _e)
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
                 # Send it now as a small trailing message so Telegram/Discord/etc.
@@ -12481,6 +12491,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
+
+    async def _deliver_suggestion_from_response(
+        self,
+        response_text: str,
+        event: MessageEvent,
+        source: SessionSource,
+    ) -> None:
+        """Deliver interactive suggestion buttons for streaming responses.
+
+        After streaming delivers the text (including any SUGGESTION marker),
+        this method checks for a marker and sends a separate interactive
+        button message on platforms that support ``send_suggestion``.
+
+        For non-streaming responses, the platform adapter's
+        ``_process_message_background`` handles marker stripping and button
+        delivery inline — this method only covers the streaming path.
+        """
+        from gateway.suggestion_parser import extract_suggestion
+
+        cleaned_text, suggestion = extract_suggestion(response_text)
+        if not suggestion:
+            return
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter or not hasattr(adapter, "send_suggestion"):
+            return
+
+        next_step = suggestion.next or suggestion.learn
+        if not next_step:
+            return
+
+        suggestion_text = f"⚡ Next: {next_step}"
+        if suggestion.reason:
+            suggestion_text += f" — {suggestion.reason}"
+
+        await adapter.send_suggestion(
+            source.chat_id,
+            suggestion_text,
+            can_auto_execute=suggestion.can_do,
+            metadata=self._thread_metadata_for_source(
+                source, self._reply_anchor_for_event(event)
+            ),
+        )
 
 
 

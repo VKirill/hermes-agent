@@ -4736,6 +4736,22 @@ class BasePlatformAdapter(ABC):
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
 
+                # Extract any SUGGESTION:{...} marker before sending text.
+                # Always strip the raw marker. On platforms with send_suggestion
+                # (Telegram, Slack) we deliver it as interactive buttons in a
+                # follow-up message. On other platforms we convert it back to a
+                # clean text line so the user still sees the suggestion.
+                _suggestion = None
+                from gateway.suggestion_parser import extract_suggestion
+                _cleaned, _suggestion = extract_suggestion(text_content)
+                if _suggestion:
+                    text_content = _cleaned
+                    if not hasattr(self, "send_suggestion"):
+                        _line = f"\n\n⚡ Next: {_suggestion.next or _suggestion.learn}"
+                        if _suggestion.reason:
+                            _line += f" — {_suggestion.reason}"
+                        text_content = text_content + _line
+
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
                 # an explicit ``/voice on|tts`` opt-in OR when ``voice.auto_tts`` is
@@ -4813,6 +4829,24 @@ class BasePlatformAdapter(ABC):
                             message_id=result.message_id,
                             ttl_seconds=_ephemeral_ttl,
                         )
+
+                # Deliver interactive suggestion buttons if a marker was
+                # stripped from the response and this platform supports it.
+                # Runs even if text_content was empty (marker-only response).
+                if _suggestion and hasattr(self, "send_suggestion"):
+                    try:
+                        _next = _suggestion.next or _suggestion.learn
+                        _suggestion_text = f"⚡ Next: {_next}"
+                        if _suggestion.reason:
+                            _suggestion_text += f" — {_suggestion.reason}"
+                        await self.send_suggestion(
+                            chat_id=event.source.chat_id,
+                            suggestion_text=_suggestion_text,
+                            can_auto_execute=_suggestion.can_do,
+                            metadata=_thread_metadata,
+                        )
+                    except Exception as _sg_err:
+                        logger.debug("[%s] send_suggestion failed: %s", self.name, _sg_err)
 
                 # Human-like pacing delay between text and media
                 human_delay = self._get_human_delay()

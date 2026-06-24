@@ -3755,6 +3755,59 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_exec_approval failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_suggestion(
+        self,
+        chat_id: str,
+        suggestion_text: str,
+        can_auto_execute: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a suggestion block with inline keyboard buttons.
+
+        The suggestion is sent as a separate message after the main response.
+        Buttons:
+        - ✏️ Explain → injects "Explain what you did" into the session
+        - ▶️ Do it → injects "Execute the suggested next step" (only if can_auto_execute)
+        - ✕ Dismiss → edits the message to remove buttons
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            text = self.format_message(suggestion_text)
+
+            buttons = []
+            row1 = [InlineKeyboardButton("✏️ Explain", callback_data="sg:explain")]
+            if can_auto_execute:
+                row1.append(InlineKeyboardButton("▶️ Do it", callback_data="sg:do"))
+            buttons.append(row1)
+            buttons.append([InlineKeyboardButton("✕ Dismiss", callback_data="sg:dismiss")])
+
+            keyboard = InlineKeyboardMarkup(buttons)
+
+            thread_id = self._metadata_thread_id(metadata)
+            reply_to_id = self._reply_to_message_id_for_send(
+                None, metadata, reply_to_mode=self._reply_to_mode
+            )
+            msg = await self._send_message_with_thread_fallback(
+                chat_id=int(chat_id),
+                text=text,
+                parse_mode=ParseMode.MARKDOWN_V2,
+                reply_markup=keyboard,
+                reply_to_message_id=reply_to_id,
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                ),
+                **self._link_preview_kwargs(),
+            )
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_suggestion failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     async def send_slash_confirm(
         self, chat_id: str, title: str, message: str, session_key: str,
         confirm_id: str, metadata: Optional[Dict[str, Any]] = None,
@@ -4483,6 +4536,58 @@ class TelegramAdapter(BasePlatformAdapter):
                 thread_id=query_thread_id,
                 user_name=query_user_name,
             )
+            return
+
+        # --- Suggestion callbacks (sg:action) ---
+        if data.startswith("sg:"):
+            action = data.split(":", 1)[1] if ":" in data else ""
+
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Not authorized.")
+                return
+
+            if action == "dismiss":
+                try:
+                    current_text = query_message.text if query_message else ""
+                    await query.edit_message_text(
+                        text=current_text,
+                        parse_mode=ParseMode.MARKDOWN_V2,
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+                await query.answer(text="Dismissed")
+
+            elif action in ("explain", "do"):
+                prompt_map = {
+                    "explain": "Explain what you did in the previous response — what tools you used and why.",
+                    "do": "Execute the suggested next step from the previous response.",
+                }
+                await query.answer(text={"explain": "Explaining...", "do": "Executing..."}[action])
+                if query_chat_id:
+                    from gateway.session import SessionSource, Platform
+                    from gateway.platforms.base import MessageEvent
+                    source = SessionSource(
+                        platform=Platform.TELEGRAM,
+                        chat_id=str(query_chat_id),
+                        chat_type=str(query_chat_type) if query_chat_type else "dm",
+                        user_id=caller_id,
+                        user_name=query_user_name,
+                        thread_id=str(query_thread_id) if query_thread_id else None,
+                    )
+                    event = MessageEvent(
+                        text=prompt_map[action],
+                        source=source,
+                        internal=True,
+                    )
+                    await self.handle_message(event)
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---

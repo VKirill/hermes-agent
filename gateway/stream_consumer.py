@@ -798,21 +798,31 @@ class GatewayStreamConsumer:
     # treated identically whichever path delivered the text.
     _MEDIA_RE = MEDIA_TAG_CLEANUP_RE
 
+    # Strip SUGGESTION:{...} markers from streamed text. The marker is
+    # post-processed by _deliver_suggestion_from_response after the stream
+    # completes; hiding it during streaming prevents raw JSON from flashing
+    # to the user before the interactive button message is sent.
+    _SUGGESTION_RE = re.compile(r"SUGGESTION:\s*\{.*?\}\s*$", re.DOTALL)
+
     @staticmethod
     def _clean_for_display(text: str) -> str:
-        """Strip MEDIA: directives and internal markers from text before display.
+        """Strip MEDIA: directives, SUGGESTION markers, and internal markers from text before display.
 
         The streaming path delivers raw text chunks that may include
-        ``MEDIA:<path>`` tags and ``[[audio_as_voice]]`` directives meant for
-        the platform adapter's post-processing.  The actual media files are
-        delivered separately via ``_deliver_media_from_response()`` after the
-        stream finishes — we just need to hide the raw directives from the
-        user.
+        ``MEDIA:<path>`` tags, ``[[audio_as_voice]]`` directives, and
+        ``SUGGESTION:{...}`` markers meant for the platform adapter's
+        post-processing.  The actual media files are delivered separately
+        via ``_deliver_media_from_response()`` and suggestion buttons via
+        ``_deliver_suggestion_from_response()`` after the stream finishes
+        — we just need to hide the raw directives from the user.
         """
-        if "MEDIA:" not in text and "[[audio_as_voice]]" not in text:
+        if "MEDIA:" not in text and "[[audio_as_voice]]" not in text and "SUGGESTION:" not in text:
             return text
         cleaned = text.replace("[[audio_as_voice]]", "")
         cleaned = GatewayStreamConsumer._MEDIA_RE.sub("", cleaned)
+        # Strip SUGGESTION:{...} marker — delivered as interactive buttons
+        # after streaming completes (via _deliver_suggestion_from_response).
+        cleaned = GatewayStreamConsumer._SUGGESTION_RE.sub("", cleaned)
         # Collapse excessive blank lines left behind by removed tags
         cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
         # Strip trailing whitespace/newlines but preserve leading content
