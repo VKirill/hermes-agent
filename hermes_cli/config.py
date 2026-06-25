@@ -2589,6 +2589,13 @@ DEFAULT_CONFIG = {
         # Persisted transcripts always stay clean (the timestamp is stored as
         # message metadata regardless of this toggle), so turning it on later
         # surfaces send-times for past messages too.
+        # Echo each successfully transcribed voice/audio message back to the
+        # user as a separate "🎙️ ..." chat message. The transcript is always
+        # included in the agent's context when STT succeeds; disabling this only
+        # hides the extra user-visible confirmation message. Default preserves
+        # existing behavior.
+        "echo_voice_transcripts": True,
+
         "message_timestamps": {
             "enabled": False,
         },

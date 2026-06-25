@@ -149,6 +149,59 @@ def _session_key_for_source(self, source):
 
 ---
 
+## 2.1. Матрица покрытия (для самопроверки полноты)
+
+### A. Все слои изоляции (объединение финального scope #18510) → фаза
+
+| # | Слой | Фаза | Примечание |
+|---|---|---|---|
+| 1 | HERMES_HOME (config/skills/memory/SOUL/sessions) | 1 | через `_profile_runtime_scope` |
+| 2 | `config.yaml` профиля | 1 | home-override |
+| 3 | Память `memories/MEMORY.md` | 1 | home-override |
+| 4 | Sessions/state — **инстанс `state.db`** | 1 | ⚠ дыра №4: путь кэшируется на импорте |
+| 5 | SOUL / system prompt / identity | 1 | + cache-bust; ⚠ дыра №5: агент строить в scope |
+| 6 | `.env` / runtime env | 1 | secret-scope (строго, Решение B) |
+| 7 | Provider resolution | 4 | |
+| 8 | `auth.json` | 4 | не пропустить |
+| 9 | Credential pools | 4 | не пропустить |
+| 10 | Auxiliary clients | 4 | |
+| 11 | Context compression | 4 | под scope |
+| 12 | Title generation | 4 | под scope |
+| 13 | Fail-closed strict auth | 4 | нет тихого фолбэка на main |
+| 14 | Исполнение тулзов (write_file/patch/terminal/code) | 2 | 🔴 главная грабля |
+| 15 | Подпроцессы env (+ **MCP**) | 2 | профильный env, не `os.environ` |
+| 16 | Skills / toolsets | 3 | динамический резолв, не import-time |
+| 17 | `/reload-mcp`, `/reload-skills` | 3 | против профильного home |
+| 18 | Process registry / background scoping | 5 | metadata несёт профиль |
+| 19 | Cron `deliver:` routing | 5 | резолв в профильный контекст |
+| 20 | Safe-root / canonicalize / symlink-guard / `.hermes_profile.json` | 6 | |
+| 21 | `hermes profile audit-isolation` | 6 | диагностика |
+| 22 | `user_profile_enabled: true` дефолт | 6 | для routed-агентов |
+| — | Gateway tools/MCP → профиль | **намеренно НЕ изолируем** | граница по дизайну; профиль объявляет своё; бридж = отдельный opt-in PR |
+
+### B. Все грабли → фаза, где чинятся
+
+| Грабля | Источник | Фаза | Как закрывается |
+|---|---|---|---|
+| G1: агент-кэш не бьётся на правку `SOUL.md` | 5.1.1 | 1 | раздельный session_key + identity-digest в сигнатуре кэша |
+| G2: ContextVar не долетает до исполнения тулзов → запись в чужой SOUL | 5.1.2 / 5.4.3 | 2 | явный проброс home/env во все пути тулзов и подпроцессов |
+| G3: конфиг должен быть «минимальным», `agent.system_prompt` → фолбэк на main | 5.1.3 | 1 | проверка (е): полный декларативный конфиг работает |
+| G4: skills-leak через import-time `SKILLS_DIR` | 5.3 | 3 | динамический резолв home |
+| G5: background process — утечка `session_id` между профилями | 5.2 | 5 | profile identity в metadata процесса |
+| G6: `/reload-mcp` `/reload-skills` бьют по глобалу | 5.2 | 3 | reload против профильного home |
+| G7: FUSE deadlock на macOS облачных маунтах | 5.4.1 | — | Решение D (док: профили локально), не баг Hermes |
+| G8: `user_profile_enabled` дефолт `false` | 5.4.2 | 6 | дефолт `true` в шаблоне |
+| **H1 (наша находка): путь `SessionStore`/`SessionDB` кэшируется (импорт-константа)** | раздел кода | 1 | профильный инстанс БД / ленивый путь |
+| **H2 (наша находка): агент конструируется вне scope** | раздел кода | 1 | scope охватывает cache-lookup + build |
+
+> **Вывод проверки:** все 22 слоя изоляции эталона и все 8 граблей upstream-теста
+> закрыты фазами 1–6 (G7 — документацией, т.к. это не баг Hermes). Дополнительно
+> мы нашли 2 дыры (H1/H2), которых в публичном тексте #18510 не было явно, —
+> учтены в Фазе 1. Если реализовать все фазы и пройти приёмочные кейсы раздела 7,
+> изоляция профиля полная.
+
+---
+
 ## 3. План реализации по фазам
 
 > Делать строго по порядку. После каждой фазы — прогон тестов и ручной smoke на
@@ -241,9 +294,39 @@ def _routed_profile_for_source(self, source) -> Optional[str]:
    `tests/test_system_prompt_identity_digest.py`). См. `_refresh_agent_cache_message_count`
    (`run.py:14538`) и места evict (:14617/:16293) как точки внедрения.
 
+4. **🔴 СКРЫТАЯ ДЫРА: `SessionStore`/`SessionDB` НЕ редиректятся home-override'ом.**
+   Они конструируются один раз на старте: `self.session_store = SessionStore(...)`
+   (`run.py:2738`), `self._session_db = SessionDB()` (`run.py:2900`), а дефолтный
+   путь — **константа уровня импорта** `DEFAULT_DB_PATH = get_hermes_home()/"state.db"`
+   (`hermes_state.py:117`). ContextVar-override их **не** перенаправит → привязанный
+   топик писал бы namespaced-ключ в **глобальный** `state.db`, а не в профильный.
+   **Что делать:** для routed-хода дать профильный `SessionStore`/`SessionDB`
+   (вариант A: конструировать профиль-скоупленный инстанс по `get_profile_dir(name)`
+   и использовать его в routed-потоке; вариант B: сделать путь БД ленивым —
+   резолвить `get_hermes_home()/"state.db"` в момент доступа, а не на импорте).
+   Это ровно предупреждение автора #18510 (раздел 6.1): «routed flows keep using
+   the **active profile** SessionStore/SessionDB for `/new`, auto-title, rebinding».
+   Затрагивает: `/new`, авто-тайтл, `_record_telegram_topic_binding`
+   (`slash_commands.py:275`), handoff-поллинг по `state.db` (`run.py:6371/6405`).
+
+5. **🔴 СКРЫТАЯ ДЫРА: агент должен СТРОИТЬСЯ внутри scope.** `AIAgent(...)`
+   конструируется в нескольких местах (`run.py:9932`, `:12015`, `:16314`), а кэш
+   читается и на quick-пути (`:6681`) — **вне** `_run_agent`. Если для routed-сессии
+   агент соберётся до входа в `_profile_runtime_scope`, профильный `SOUL.md`/identity
+   при билде НЕ подхватятся, даже с раздельным session_key. **Что делать:**
+   гарантировать, что для привязанного топика **и чтение кэша, и построение агента**
+   происходят внутри scope. Практичнее всего — поднять вход в scope на уровень,
+   охватывающий cache-lookup+build (рассмотреть обёртку в `_handle_message_with_agent`
+   `run.py:9468` или в общем пути перед `:6681`/`:16314`), а не только вокруг
+   `_run_agent_inner`. Проверить ВСЕ сайты сборки `AIAgent`, ведущие к routed-сессии.
+
 **Тесты Фазы 1 (написать):** привязать топик A→profileA, B→profileB; проверить
 что (а) `MEMORY.md` пишется в `profiles/<n>/memories/`, (б) session_key различен,
-(в) SOUL разный, (г) непривязанный топик пишет в глобальный home (zero-regression).
+(в) SOUL разный, (г) непривязанный топик пишет в глобальный home (zero-regression),
+(д) **сессии/тайтлы пишутся в профильный `profiles/<n>/state.db`, а не в глобальный**
+(закрывает дыру №4), (е) **полностью декларативный профильный `config.yaml` с
+`agent.system_prompt` НЕ откатывается на главный `~/.hermes/SOUL.md`** (грабля 5.1.3 —
+раньше требовалось держать конфиг минимальным; у нас это должно работать).
 
 ### Фаза 2 — ContextVar в исполнение тулзов (КРИТИЧНО — главная грабля)
 
@@ -262,6 +345,10 @@ def _routed_profile_for_source(self, source) -> Optional[str]:
   `tools/code_execution_tool.py`, `tools/file_tools.py`,
   `tools/environments/local.py`. Подпроцессам передавать профильный env
   (из secret-scope), НЕ `dict(os.environ)`.
+- **MCP-подпроцессы** профиля должны стартовать под профильным home/env. Точка:
+  `tools/mcp_tool.py:2943` уже умеет `set_hermes_home_override(home_override)` —
+  убедиться, что для routed-сессии туда приходит профильный home, а env spawn'а
+  берётся из secret-scope, а не из `os.environ`.
 - Эталонный тест-донор: `tests/test_subprocess_home_isolation.py` (572 строки).
 
 **Проверка приёмки Фазы 2:** в привязанном топике попросить агента
@@ -279,6 +366,13 @@ slash-reload/invoke и `skill_manage` резолвили папку через *
 не на импорте. Доноры: `tools/skills_tool.py`, `tools/skill_manager_tool.py`,
 `agent/skill_commands.py`. Тест-донор: `tests/tools/test_skills_profile_isolation.py`.
 
+**Команды reload в routed-топике.** `/reload-mcp` (`slash_commands.py:3932` —
+«reconnect MCP servers and rebuild the cached agent») и `/reload-skills`
+(`slash_commands.py:3995` — «rescan skills dir») должны выполняться против
+**профильного** home, а перестроение кэша агента — попасть в профильный
+session_key. Проверить, что из привязанного топика они не перечитывают/не
+перестраивают глобальный профиль.
+
 **Граница по дизайну (повторить!):** gateway-level `platform_toolsets` /
 `mcp_servers` **намеренно НЕ** прокидываются в привязанный профиль. Профиль обязан
 объявить свои `toolsets`/`mcp_servers` в собственном `config.yaml`. Бридж
@@ -288,8 +382,10 @@ gateway-тулзов — отдельная opt-in фича с security-ревь
 
 Что делать (порт из #18510):
 - `agent/auxiliary_client.py` (361 строк), `hermes_cli/runtime_provider.py`,
-  `hermes_cli/env_loader.py`, `hermes_cli/auth.py` — провайдер/креды/`auth.json`
-  резолвятся из профиля без мутации `os.environ`.
+  `hermes_cli/env_loader.py`, `hermes_cli/auth.py` — провайдер/креды/**`auth.json`**/
+  **credential pools** резолвятся из профиля без мутации `os.environ`. (Эталон
+  #18510 явно перечисляет «`.env`, `auth.json`, credential pools, provider
+  resolution, auxiliary clients» — не пропусти `auth.json` и пулы кредов.)
 - **Fail-closed:** при отсутствии профильных кредов — видимая ошибка, без тихого
   фолбэка на глобальные; внешне-процессные креды в строгом режиме блокируются.
 - Компрессия контекста и генерация заголовков сессии — тоже под профильным scope.
@@ -552,6 +648,13 @@ gh api "repos/NousResearch/hermes-agent/pulls/18510/files" --paginate \
 gateway/run.py:1395    _profile_runtime_scope(profile_home)           # сид изоляции
 gateway/run.py:2710    set_multiplex_active(...)                       # НЕ трогать (Решение C)
 gateway/run.py:2821    self._agent_cache: OrderedDict[str, tuple]      # ключ = session_key
+gateway/run.py:2738    self.session_store = SessionStore(...)          # ⚠ путь кэшируется (H1)
+gateway/run.py:2900    self._session_db = SessionDB()                  # ⚠ путь кэшируется (H1)
+gateway/run.py:6681    self._agent_cache.get(key)                      # чтение кэша (вне _run_agent)
+gateway/run.py:9468    _handle_message_with_agent                      # кандидат для подъёма scope
+gateway/run.py:9932/12015/16314  AIAgent(...)                          # ⚠ сайты сборки агента (H2)
+hermes_state.py:117    DEFAULT_DB_PATH = get_hermes_home()/"state.db"  # ⚠ импорт-константа (H1)
+gateway/slash_commands.py:3932  _handle_reload_mcp_command  / :3995 _handle_reload_skills_command
 gateway/run.py:2327    _topic_profile_key / :2343 _load_topic_profiles # стор привязок
 gateway/run.py:2356    _save_topic_profile / :2367 _remove_topic_profile
 gateway/run.py:3274    _session_key_for_source                         # ДВЕРЬ №2 (:3296 гейт)
