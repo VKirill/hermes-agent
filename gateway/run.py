@@ -7379,6 +7379,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         token = None
         for attr in ("token", "bot_token", "_token", "api_token", "_bot_token"):
             val = getattr(adapter, attr, None)
+            if not val and hasattr(adapter, "config"):
+                val = getattr(adapter.config, attr, None)
             if isinstance(val, str) and val.strip():
                 token = val.strip()
                 break
