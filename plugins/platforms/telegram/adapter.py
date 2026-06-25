@@ -7521,6 +7521,13 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
     for _key in ("guest_mode", "disable_link_previews", "observe_unmentioned_group_messages"):
         if _key in telegram_cfg:
             extras.setdefault(_key, telegram_cfg[_key])
+    _model_keys = ("model", "provider", "api_key", "base_url", "api_mode")
+    for _mk in _model_keys:
+        _val = telegram_cfg.get(_mk)
+        if _val is None and isinstance(_telegram_extra, dict):
+            _val = _telegram_extra.get(_mk)
+        if _val is not None:
+            extras.setdefault(_mk, _val)
     # Pass through telegram-specific extra keys (e.g. base_url proxy override),
     # but EXCLUDE the generic shared-config keys that _merge_platform_map in
     # gateway/config.py already merges with correct top-level-over-nested
