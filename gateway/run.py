@@ -9339,7 +9339,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             f"Adjust reset timing in config.yaml under session_reset."
                         )
                         try:
-                            session_info = self._format_session_info()
+                            session_info = self._format_session_info(source=source)
                             if session_info:
                                 notice = f"{notice}\n\n{session_info}"
                         except Exception:
@@ -10530,7 +10530,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, source: Optional[SessionSource] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -10539,7 +10539,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         from agent.model_metadata import get_model_context_length, DEFAULT_FALLBACK_CONTEXT
 
-        model = _resolve_gateway_model()
+        model = None
         config_context_length = None
         provider = None
         base_url = None
@@ -10547,19 +10547,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         custom_provs = None
         data = None
 
+        if source is not None:
+            try:
+                model, runtime_kwargs = self._resolve_session_agent_runtime(source=source)
+                provider = runtime_kwargs.get("provider")
+                base_url = runtime_kwargs.get("base_url")
+                api_key = runtime_kwargs.get("api_key")
+            except Exception:
+                pass
+
         try:
             data = _load_gateway_config()
             if data:
                 model_cfg = data.get("model", {})
                 if isinstance(model_cfg, dict):
-                    raw_ctx = model_cfg.get("context_length")
-                    if raw_ctx is not None:
-                        try:
-                            config_context_length = int(raw_ctx)
-                        except (TypeError, ValueError):
-                            pass
-                    provider = model_cfg.get("provider") or None
-                    base_url = model_cfg.get("base_url") or None
+                    default_model = model_cfg.get("default") or model_cfg.get("model") or ""
+                    if not model:
+                        model = default_model
+
+                    if model == default_model:
+                        raw_ctx = model_cfg.get("context_length")
+                        if raw_ctx is not None:
+                            try:
+                                config_context_length = int(raw_ctx)
+                            except (TypeError, ValueError):
+                                pass
+                        if not provider:
+                            provider = model_cfg.get("provider") or None
+                        if not base_url:
+                            base_url = model_cfg.get("base_url") or None
                 try:
                     from hermes_cli.config import get_compatible_custom_providers
                     custom_provs = get_compatible_custom_providers(data)
@@ -10567,6 +10583,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     custom_provs = data.get("custom_providers")
         except Exception:
             pass
+
+        if not model:
+            model = _resolve_gateway_model()
 
         # Also check custom_providers for context_length when top-level model.context_length is not set
         if config_context_length is None and data:

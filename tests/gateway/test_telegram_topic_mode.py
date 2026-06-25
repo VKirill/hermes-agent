@@ -1434,3 +1434,69 @@ def test_session_split_restores_source_thread_id_from_binding(tmp_path):
     meta = GatewayRunner._thread_metadata_for_source(runner, source)
     assert meta is not None
     assert meta["thread_id"] == "17585"
+
+
+# ---------------------------------------------------------------------------
+# Tests for format_session_info with source overrides
+# ---------------------------------------------------------------------------
+
+def test_format_session_info_honors_topic_override(tmp_path):
+    """Verify that _format_session_info resolves and displays the overridden/topic model."""
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+    from gateway.config import Platform
+    from unittest.mock import patch
+
+    runner = object.__new__(GatewayRunner)
+    runner._session_model_overrides = {
+        "agent:main:telegram:dm:208214988:17585": {
+            "model": "MiniMax-M3",
+            "provider": "minimax",
+        }
+    }
+
+    # Mock the session key derivation and config loading
+    runner._session_key_for_source = lambda source: "agent:main:telegram:dm:208214988:17585"
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="208214988",
+        chat_id="208214988",
+        user_name="tester",
+        chat_type="dm",
+        thread_id="17585",
+    )
+
+    with patch("gateway.run._load_gateway_config", return_value={}):
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}):
+            info = runner._format_session_info(source=source)
+
+    assert "MiniMax-M3" in info
+    assert "minimax" in info
+
+
+def test_format_session_info_no_source_falls_back_to_default(tmp_path):
+    """Verify that _format_session_info falls back to default config if no source is provided."""
+    from gateway.run import GatewayRunner
+    from unittest.mock import patch
+
+    runner = object.__new__(GatewayRunner)
+    runner._session_model_overrides = {
+        "agent:main:telegram:dm:208214988:17585": {
+            "model": "MiniMax-M3",
+            "provider": "minimax",
+        }
+    }
+
+    with patch("gateway.run._load_gateway_config", return_value={
+        "model": {
+            "default": "gemini-3.1-flash-lite",
+            "provider": "gemini",
+        }
+    }):
+        with patch("gateway.run._resolve_runtime_agent_kwargs", return_value={}):
+            info = runner._format_session_info(source=None)
+
+    assert "gemini-3.1-flash-lite" in info
+    assert "gemini" in info
+

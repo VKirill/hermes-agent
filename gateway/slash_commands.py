@@ -230,7 +230,7 @@ class GatewaySlashCommandsMixin:
 
         # Resolve session config info to surface to the user
         try:
-            session_info = self._format_session_info()
+            session_info = self._format_session_info(source=source)
         except Exception:
             session_info = ""
 
