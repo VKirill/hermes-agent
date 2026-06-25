@@ -1132,7 +1132,7 @@ class GatewaySlashCommandsMixin:
         from hermes_cli.providers import get_label
 
         source = event.source
-        is_gateway = (source.platform != Platform.CLI) if source.platform else False
+        is_gateway = (source.platform != Platform.LOCAL) if source.platform else False
 
         raw_args = event.get_command_args().strip()
 
