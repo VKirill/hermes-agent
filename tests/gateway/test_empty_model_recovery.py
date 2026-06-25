@@ -30,7 +30,7 @@ def _make_runner():
 
 def _patch_resolution(monkeypatch, *, model_from_config: str, provider: str = "openrouter"):
     """Stub gateway model + runtime resolution to a known state."""
-    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda cfg=None: model_from_config)
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda cfg=None, *a, **kw: model_from_config)
     monkeypatch.setattr(
         gateway_run,
         "_resolve_runtime_agent_kwargs",

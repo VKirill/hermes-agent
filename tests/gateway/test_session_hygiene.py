@@ -707,7 +707,7 @@ async def test_session_hygiene_warns_user_when_compression_aborts(monkeypatch, t
     assert "No messages were dropped" in warn["content"]
     # Warning must land in the originating topic/thread, not the main channel.
     assert warn["chat_id"] == "-1001"
-    assert warn["metadata"] == {"thread_id": "17585"}
+    assert warn["metadata"] == {"thread_id": "17585", "notify": True}
 
     FakeCompressAgentWithSummaryFailure.last_instance.close.assert_called_once()
 
@@ -831,7 +831,7 @@ async def test_session_hygiene_informs_user_when_aux_model_fails_but_recovers(mo
     assert "auxiliary.compression.model" in note["content"]
     # Note must land in the originating topic/thread.
     assert note["chat_id"] == "-1001"
-    assert note["metadata"] == {"thread_id": "17585"}
+    assert note["metadata"] == {"thread_id": "17585", "notify": True}
 
     FakeCompressAgentWithAuxRecovery.last_instance.close.assert_called_once()
 

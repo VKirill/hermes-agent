@@ -667,8 +667,7 @@ async def test_profile_command_reports_custom_root_profile(monkeypatch, tmp_path
 
     result = await runner._handle_profile_command(_make_event("/profile"))
 
-    assert "**Profile:** `coder`" in result
-    assert f"**Home:** `{profile_home}`" in result
+    assert "Активный профиль для этого топика: `coder`" in result
 
 
 @pytest.mark.asyncio

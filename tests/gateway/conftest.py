@@ -32,11 +32,28 @@ incident.
 """
 
 import ast
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+# Ensure busy acks are enabled during test runs, regardless of local config.yaml settings.
+# Without this, if the user has display.busy_ack_enabled=false in ~/.hermes/config.yaml,
+# the gateway test suite will silently fail since the ack-suppression flag leaks into tests.
+os.environ["HERMES_GATEWAY_BUSY_ACK_ENABLED"] = "true"
+
+
+@pytest.fixture(autouse=True)
+def force_busy_acks():
+    """Ensure busy acks environment variable is set to 'true' before every test.
+
+    This overrides any module-level imports of gateway.run that might read the
+    user's ~/.hermes/config.yaml and overwrite the environment variable to 'false'.
+    """
+    os.environ["HERMES_GATEWAY_BUSY_ACK_ENABLED"] = "true"
+
 
 
 def _ensure_telegram_mock() -> None:

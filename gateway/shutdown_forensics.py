@@ -262,7 +262,23 @@ def spawn_async_diagnostic(
             start_new_session=True,
             close_fds=True,
         )
-    except (FileNotFoundError, OSError):
+    except FileNotFoundError:
+        try:
+            proc = subprocess.Popen(
+                ["bash", "-c", script],
+                stdout=fd,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except (FileNotFoundError, OSError):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            return None
+    except OSError:
         try:
             os.close(fd)
         except OSError:

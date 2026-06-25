@@ -42,7 +42,7 @@ async def test_deliver_platform_notice_uses_private_delivery_when_configured():
         "C123",
         "U123",
         "hello",
-        metadata={"thread_id": "111.222"},
+        metadata={"thread_id": "111.222", "notify": True},
     )
     adapter.send.assert_not_awaited()
 
@@ -54,7 +54,7 @@ async def test_deliver_platform_notice_falls_back_to_public_when_private_fails()
 
     await runner._deliver_platform_notice(_make_source(), "hello")
 
-    adapter.send.assert_awaited_once_with("C123", "hello", metadata={"thread_id": "111.222"})
+    adapter.send.assert_awaited_once_with("C123", "hello", metadata={"thread_id": "111.222", "notify": True})
 
 
 @pytest.mark.asyncio
@@ -63,5 +63,5 @@ async def test_deliver_platform_notice_uses_public_delivery_by_default():
 
     await runner._deliver_platform_notice(_make_source(), "hello")
 
-    adapter.send.assert_awaited_once_with("C123", "hello", metadata={"thread_id": "111.222"})
+    adapter.send.assert_awaited_once_with("C123", "hello", metadata={"thread_id": "111.222", "notify": True})
     adapter.send_private_notice.assert_not_awaited()

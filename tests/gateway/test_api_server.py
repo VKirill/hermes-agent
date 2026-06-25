@@ -317,7 +317,7 @@ class TestAdapterInit:
                 "api_mode": "codex_responses",
             },
         )
-        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5.5")
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda *a, **kw: "gpt-5.5")
         monkeypatch.setattr(
             "gateway.run._load_gateway_config",
             lambda: {"agent": {"reasoning_effort": "xhigh"}},
@@ -353,7 +353,7 @@ class TestAdapterInit:
                 "api_mode": "chat_completions",
             },
         )
-        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda: "gpt-5")
+        monkeypatch.setattr("gateway.run._resolve_gateway_model", lambda *a, **kw: "gpt-5")
         monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {"agent": {"max_turns": 200}})
         monkeypatch.setattr(
             "gateway.run.GatewayRunner._load_reasoning_config",

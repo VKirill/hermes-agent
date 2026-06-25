@@ -3548,10 +3548,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 resolved_session_key = None
 
-        model = _resolve_gateway_model(
-            user_config,
-            platform=source.platform if source is not None else None,
-        )
+        if source is not None and getattr(source, "platform", None) is not None:
+            model = _resolve_gateway_model(
+                user_config,
+                platform=source.platform,
+            )
+        else:
+            model = _resolve_gateway_model(user_config)
         platform_override = _get_platform_model_overrides(
             user_config,
             platform=source.platform if source is not None else None,
@@ -3602,11 +3605,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # override is empty (the common case for unconfigured platforms)
         # this is a no-op — the global model/provider is used unchanged.
         requested_provider = platform_override.get("provider")
-        runtime_kwargs = _resolve_runtime_agent_kwargs(
-            requested_provider=requested_provider,
-            explicit_api_key=platform_override.get("api_key"),
-            explicit_base_url=platform_override.get("base_url"),
-        )
+        explicit_api_key = platform_override.get("api_key")
+        explicit_base_url = platform_override.get("base_url")
+        if requested_provider or explicit_api_key or explicit_base_url:
+            runtime_kwargs = _resolve_runtime_agent_kwargs(
+                requested_provider=requested_provider,
+                explicit_api_key=explicit_api_key,
+                explicit_base_url=explicit_base_url,
+            )
+        else:
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
         if requested_provider:
             runtime_kwargs["provider"] = requested_provider
         if (
@@ -10992,11 +11000,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Resolve runtime credentials for probing
         try:
-            runtime = _resolve_runtime_agent_kwargs(
-                requested_provider=plat_overrides.get("provider"),
-                explicit_api_key=plat_overrides.get("api_key"),
-                explicit_base_url=plat_overrides.get("base_url"),
-            )
+            req_prov = plat_overrides.get("provider")
+            exp_key = plat_overrides.get("api_key")
+            exp_url = plat_overrides.get("base_url")
+            if req_prov or exp_key or exp_url:
+                runtime = _resolve_runtime_agent_kwargs(
+                    requested_provider=req_prov,
+                    explicit_api_key=exp_key,
+                    explicit_base_url=exp_url,
+                )
+            else:
+                runtime = _resolve_runtime_agent_kwargs()
             provider = provider or runtime.get("provider")
             base_url = base_url or runtime.get("base_url")
             api_key = runtime.get("api_key")

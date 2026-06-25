@@ -135,7 +135,7 @@ async def test_handle_fast_command_persists_config(monkeypatch, tmp_path):
 
     monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
-    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda *a, **kw: "gpt-5.4")
 
     response = await runner._handle_fast_command(_make_event("/fast fast"))
 
@@ -165,7 +165,7 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
         "_load_gateway_runtime_config",
         lambda: {"agent": {"service_tier": "fast"}},
     )
-    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda *a, **kw: "gpt-5.4")
     monkeypatch.setattr(
         gateway_run,
         "_resolve_runtime_agent_kwargs",
