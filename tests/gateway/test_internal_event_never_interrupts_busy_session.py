@@ -134,7 +134,7 @@ async def test_non_internal_event_still_interrupts() -> None:
     runner = _make_runner()
     runner._busy_input_mode = "interrupt"
     adapter = _make_adapter()
-    event = _make_internal_event(text="please stop")
+    event = _make_internal_event(text="hello")
     # Flip to a real user message.
     object.__setattr__(event, "internal", False)
     sk = build_session_key(event.source)
@@ -148,4 +148,4 @@ async def test_non_internal_event_still_interrupts() -> None:
         handled = await runner._handle_active_session_busy_message(event, sk)
 
     assert handled is True
-    parent.interrupt.assert_called_once_with("please stop")
+    parent.interrupt.assert_called_once_with("hello")
