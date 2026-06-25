@@ -182,6 +182,13 @@ class GatewaySlashCommandsMixin:
         # Clear any session-scoped model/reasoning overrides so the next agent
         # picks up configured defaults instead of previous session switches.
         self._session_model_overrides.pop(session_key, None)
+        try:
+            from gateway.run import _load_topic_models
+            persistent_override = _load_topic_models().get(session_key)
+            if persistent_override:
+                self._session_model_overrides[session_key] = persistent_override
+        except Exception:
+            pass
         self._set_session_reasoning_override(session_key, None)
         if hasattr(self, "_pending_model_notes"):
             self._pending_model_notes.pop(session_key, None)
@@ -1124,6 +1131,9 @@ class GatewaySlashCommandsMixin:
         )
         from hermes_cli.providers import get_label
 
+        source = event.source
+        is_gateway = (source.platform != Platform.CLI) if source.platform else False
+
         raw_args = event.get_command_args().strip()
 
         # Parse --provider, --global, --session, and --refresh flags
@@ -1135,6 +1145,8 @@ class GatewaySlashCommandsMixin:
             is_session,
         ) = parse_model_flags(raw_args)
         persist_global = resolve_persist_behavior(is_global_flag, is_session)
+        if is_gateway and not is_global_flag:
+            persist_global = False
 
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:
@@ -1170,13 +1182,23 @@ class GatewaySlashCommandsMixin:
             pass
 
         # Check for session override
-        source = event.source
         # Normalize the source the same way a normal message turn does
         # (Telegram DM topic recovery) before deriving the override key, so
         # the override is stored under the key the next message turn reads
         # (#30479).
         source = self._normalize_source_for_session_key(source)
         session_key = self._session_key_for_source(source)
+
+        if model_input in ("default", "reset", "clear"):
+            self._session_model_overrides.pop(session_key, None)
+            try:
+                from gateway.run import _remove_topic_model
+                _remove_topic_model(session_key)
+            except Exception:
+                pass
+            self._evict_cached_agent(session_key)
+            return "Topic-specific model override cleared. Now using the global default model."
+
         override = self._session_model_overrides.get(session_key, {})
         if override:
             current_model = override.get("model", current_model)
@@ -1325,6 +1347,19 @@ class GatewaySlashCommandsMixin:
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
                         }
+                        if is_gateway:
+                            if persist_global:
+                                try:
+                                    from gateway.run import _remove_topic_model
+                                    _remove_topic_model(_session_key)
+                                except Exception:
+                                    pass
+                            else:
+                                try:
+                                    from gateway.run import _save_topic_model
+                                    _save_topic_model(_session_key, _self._session_model_overrides[_session_key])
+                                except Exception as e:
+                                    logger.warning("Failed to save persistent topic model: %s", e)
 
                         # Evict cached agent so the next turn creates a fresh
                         # agent from the override rather than relying on the
@@ -1556,6 +1591,19 @@ class GatewaySlashCommandsMixin:
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
+            if is_gateway:
+                if persist_global:
+                    try:
+                        from gateway.run import _remove_topic_model
+                        _remove_topic_model(session_key)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        from gateway.run import _save_topic_model
+                        _save_topic_model(session_key, self._session_model_overrides[session_key])
+                    except Exception as e:
+                        logger.warning("Failed to save persistent topic model: %s", e)
 
             # Evict cached agent so the next turn creates a fresh agent from the
             # override rather than relying on cache signature mismatch detection.

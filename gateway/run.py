@@ -2201,6 +2201,42 @@ def _resolve_gateway_model(config: dict | None = None) -> str:
     return ""
 
 
+def _load_topic_models() -> dict:
+    """Load the persistent topic-specific model overrides from ~/.hermes/topic_models.json."""
+    import json
+    path = _hermes_home / "topic_models.json"
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_topic_model(session_key: str, model_data: dict) -> None:
+    """Save a persistent topic-specific model override to ~/.hermes/topic_models.json."""
+    path = _hermes_home / "topic_models.json"
+    data = _load_topic_models()
+    data[session_key] = model_data
+    try:
+        atomic_json_write(path, data)
+    except Exception as e:
+        logger.warning("Failed to save topic model: %s", e)
+
+
+def _remove_topic_model(session_key: str) -> None:
+    """Remove a persistent topic-specific model override from ~/.hermes/topic_models.json."""
+    path = _hermes_home / "topic_models.json"
+    data = _load_topic_models()
+    if session_key in data:
+        data.pop(session_key)
+        try:
+            atomic_json_write(path, data)
+        except Exception as e:
+            logger.warning("Failed to remove topic model: %s", e)
+
+
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -2644,9 +2680,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._agent_cache: "OrderedDict[str, tuple]" = OrderedDict()
         self._agent_cache_lock = _threading.Lock()
 
-        # Per-session model overrides from /model command.
-        # Key: session_key, Value: dict with model/provider/api_key/base_url/api_mode
         self._session_model_overrides: Dict[str, Dict[str, str]] = {}
+        try:
+            self._session_model_overrides.update(_load_topic_models())
+        except Exception as e:
+            logger.warning("Failed to load topic models at startup: %s", e)
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
@@ -3362,6 +3400,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         model = _resolve_gateway_model(user_config)
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
+        if not override and resolved_session_key:
+            try:
+                persistent_override = _load_topic_models().get(resolved_session_key)
+                if persistent_override:
+                    self._session_model_overrides[resolved_session_key] = persistent_override
+                    override = persistent_override
+            except Exception:
+                pass
         if override:
             override_model = override.get("model", model)
             override_runtime = {
@@ -6459,6 +6505,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # its agent from these overrides. Only true session
                         # finalization, /new, and /reset clear them.)
                         self._session_model_overrides.pop(key, None)
+                        _remove_topic_model(key)
                         self._set_session_reasoning_override(key, None)
                         if hasattr(self, "_pending_model_notes"):
                             self._pending_model_notes.pop(key, None)
