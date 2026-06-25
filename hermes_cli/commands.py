@@ -47,7 +47,7 @@ class CommandDef:
     """Definition of a single slash command."""
 
     name: str                          # canonical name without slash: "background"
-    description: str                   # human-readable description
+    _description: str                  # human-readable description
     category: str                      # "Session", "Configuration", etc.
     aliases: tuple[str, ...] = ()      # alternative names: ("bg",)
     args_hint: str = ""                # argument placeholder: "<prompt>", "[name]"
@@ -55,6 +55,19 @@ class CommandDef:
     cli_only: bool = False             # only available in CLI
     gateway_only: bool = False         # only available in gateway/messaging
     gateway_config_gate: str | None = None  # config dotpath; when truthy, overrides cli_only for gateway
+
+    @property
+    def description(self) -> str:
+        """Return translated description when language is Russian."""
+        try:
+            from agent.i18n import t, get_language
+            if get_language() == "ru":
+                val = t(f"command_descriptions.{self.name}")
+                if val and val != f"command_descriptions.{self.name}":
+                    return val
+        except Exception:
+            pass
+        return self._description
 
 
 # ---------------------------------------------------------------------------

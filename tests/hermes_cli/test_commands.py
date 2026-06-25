@@ -45,6 +45,22 @@ def _completions(completer: SlashCommandCompleter, text: str):
 # ---------------------------------------------------------------------------
 
 class TestCommandRegistry:
+    def test_command_description_i18n_ru(self, monkeypatch):
+        import agent.i18n
+        # Force language to Russian and mock translation lookup
+        monkeypatch.setattr(agent.i18n, "get_language", lambda: "ru")
+        original_t = agent.i18n.t
+        def mock_t(key, **kwargs):
+            if key == "command_descriptions.new":
+                return "Начать новый сеанс (очистить историю)"
+            return original_t(key, **kwargs)
+        monkeypatch.setattr(agent.i18n, "t", mock_t)
+
+        # Get command definition for "new"
+        cmd = resolve_command("new")
+        assert cmd is not None
+        assert cmd.description == "Начать новый сеанс (очистить историю)"
+
     def test_registry_is_nonempty(self):
         assert len(COMMAND_REGISTRY) > 30
 
