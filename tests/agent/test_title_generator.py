@@ -196,7 +196,7 @@ class TestAutoTitleSession:
         db = MagicMock()
         db.get_session_title.return_value = "Telegram May 10 12:38 deadbe"
 
-        with patch("agent.title_generator.generate_title", return_value="DeFi Liquidation Searcher"):
+        with patch("agent.title_generator.generate_title", return_value=("DeFi Liquidation Searcher", None)):
             auto_title_session(db, "sess-1", "hi", "hello")
 
         db.set_session_title.assert_called_once_with("sess-1", "DeFi Liquidation Searcher")

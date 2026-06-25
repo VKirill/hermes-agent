@@ -51,7 +51,7 @@ _TITLE_PROMPT_PINNED_LANGUAGE = (
 _TITLE_PROMPT_PINNED_LANGUAGE += TOPIC_ICON_OPTIONS_TEXT + "\n\n"
 _TITLE_PROMPT_PINNED_LANGUAGE += (
     "Return ONLY a valid JSON object with exactly two keys — no markdown, no explanation:\n"
-    '  {"title": "<conversation title>", "icon": <icon number>}\n'
+    '  {{"title": "<conversation title>", "icon": <icon number>}}\n'
     "Do not wrap in triple backticks. Do not add commentary."
 )
 
