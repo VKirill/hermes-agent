@@ -203,6 +203,11 @@ class GatewayStreamConsumer:
         self._draft_failures = 0
         self._before_finalize_notified = False
 
+    def _metadata_for_adapter(self, metadata: Optional[dict] = None) -> dict:
+        meta = dict(metadata or self.metadata or {})
+        meta["is_agent"] = True
+        return meta
+
     def _metadata_for_send(
         self,
         *,
@@ -220,7 +225,7 @@ class GatewayStreamConsumer:
         legacy send path, while fresh/fallback final sends can still use richer
         final-message delivery.
         """
-        meta = dict(self.metadata) if self.metadata else {}
+        meta = self._metadata_for_adapter()
         if expect_edits:
             meta["expect_edits"] = True
         if final:
@@ -286,7 +291,7 @@ class GatewayStreamConsumer:
                     param.kind is inspect.Parameter.VAR_KEYWORD
                     for param in params.values()
                 ):
-                    kwargs["metadata"] = self.metadata
+                    kwargs["metadata"] = self._metadata_for_adapter()
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)
@@ -1044,7 +1049,7 @@ class GatewayStreamConsumer:
         try:
             supported = self.adapter.supports_draft_streaming(
                 chat_type=self.cfg.chat_type or None,
-                metadata=self.metadata,
+                metadata=self._metadata_for_adapter(),
             )
         except Exception:
             logger.debug("supports_draft_streaming probe raised", exc_info=True)
@@ -1078,7 +1083,7 @@ class GatewayStreamConsumer:
                 chat_id=self.chat_id,
                 draft_id=self._draft_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=self._metadata_for_adapter(),
             )
         except Exception as e:
             logger.debug(
@@ -1125,7 +1130,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=tail,
-                metadata=self.metadata,
+                metadata=self._metadata_for_adapter(),
             )
             if result.success:
                 self._already_sent = True
@@ -1158,10 +1163,12 @@ class GatewayStreamConsumer:
         if not text.strip():
             return False
         try:
+            meta = self._metadata_for_adapter()
+            meta["is_commentary"] = True
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self.metadata,
+                metadata=meta,
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser
@@ -1257,7 +1264,7 @@ class GatewayStreamConsumer:
             return False
         try:
             try:
-                result = fn(text, metadata=self.metadata)
+                result = fn(text, metadata=self._metadata_for_adapter())
             except TypeError:
                 # Adapter / test double whose hook doesn't accept the metadata
                 # keyword — fall back to the positional-only form.

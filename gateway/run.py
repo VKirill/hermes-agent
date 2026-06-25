@@ -4548,6 +4548,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             reply_anchor = self._reply_anchor_for_event(event)
             thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+            if thread_meta is not None:
+                thread_meta = dict(thread_meta)
+                thread_meta["notify"] = True
+            else:
+                thread_meta = {"notify": True}
             if self._queue_during_drain_enabled():
                 self._queue_or_replace_pending_event(session_key, event)
                 message = f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
@@ -4774,6 +4779,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         reply_anchor = self._reply_anchor_for_event(event)
         thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+        if thread_meta is not None:
+            thread_meta = dict(thread_meta)
+            thread_meta["notify"] = True
+        else:
+            thread_meta = {"notify": True}
         try:
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
@@ -7588,6 +7598,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             notice_delivery = config.get_notice_delivery(source.platform)
 
         metadata = self._thread_metadata_for_source(source)
+        if metadata is not None:
+            metadata = dict(metadata)
+            metadata["notify"] = True
+        else:
+            metadata = {"notify": True}
         if notice_delivery == "private" and getattr(source, "user_id", None):
             try:
                 result = await adapter.send_private_notice(
@@ -8488,6 +8503,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter = self.adapters.get(source.platform)
                 if adapter:
                     _ack_meta = self._thread_metadata_for_source(source)
+                    if _ack_meta is not None:
+                        _ack_meta = dict(_ack_meta)
+                        _ack_meta["notify"] = True
+                    else:
+                        _ack_meta = {"notify": True}
                     await adapter.send(str(source.chat_id), _ack, metadata=_ack_meta)
             except Exception:
                 logger.debug("learn ack send failed", exc_info=True)
@@ -8542,6 +8562,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         adapter = self.adapters.get(source.platform)
                         if adapter:
                             _ack_meta = self._thread_metadata_for_source(source)
+                            if _ack_meta is not None:
+                                _ack_meta = dict(_ack_meta)
+                                _ack_meta["notify"] = True
+                            else:
+                                _ack_meta = {"notify": True}
                             await adapter.send(str(source.chat_id), _ack, metadata=_ack_meta)
                     except Exception:
                         logger.debug("blueprint ack send failed", exc_info=True)
@@ -9007,6 +9032,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _successful_transcripts:
                     _echo_adapter = self.adapters.get(source.platform)
                     _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    if _echo_meta is not None:
+                        _echo_meta = dict(_echo_meta)
+                        _echo_meta["notify"] = True
+                    else:
+                        _echo_meta = {"notify": True}
                     if _echo_adapter:
                         for _tx in _successful_transcripts:
                             try:
@@ -9028,6 +9058,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if any(marker in message_text for marker in _stt_fail_markers):
                     _stt_adapter = self.adapters.get(source.platform)
                     _stt_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    if _stt_meta is not None:
+                        _stt_meta = dict(_stt_meta)
+                        _stt_meta["notify"] = True
+                    else:
+                        _stt_meta = {"notify": True}
                     if _stt_adapter:
                         try:
                             _stt_msg = (
@@ -9169,9 +9204,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _ctx_result.blocked:
                     _adapter = self.adapters.get(source.platform)
                     if _adapter:
+                        _warn_meta = self._thread_metadata_for_source(source)
+                        if _warn_meta is not None:
+                            _warn_meta = dict(_warn_meta)
+                            _warn_meta["notify"] = True
+                        else:
+                            _warn_meta = {"notify": True}
                         await _adapter.send(
                             source.chat_id,
                             "\n".join(_ctx_result.warnings) or "Context injection refused.",
+                            metadata=_warn_meta,
                         )
                     return None
                 if _ctx_result.expanded:
@@ -9416,9 +9458,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 notice = f"{notice}\n\n{session_info}"
                         except Exception:
                             pass
+                        _reset_meta = self._thread_metadata_for_source(source)
+                        if _reset_meta is not None:
+                            _reset_meta = dict(_reset_meta)
+                            _reset_meta["notify"] = True
+                        else:
+                            _reset_meta = {"notify": True}
                         await adapter.send(
                             source.chat_id, notice,
-                            metadata=self._thread_metadata_for_source(source),
+                            metadata=_reset_meta,
                         )
             except Exception as e:
                 logger.debug("Auto-reset notification failed (non-fatal): %s", e)
@@ -9645,6 +9693,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
 
                     _hyg_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                    if _hyg_meta is not None:
+                        _hyg_meta = dict(_hyg_meta)
+                        _hyg_meta["notify"] = True
+                    else:
+                        _hyg_meta = {"notify": True}
 
                     try:
                         from run_agent import AIAgent
@@ -10484,10 +10537,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     try:
                         _foot_adapter = self.adapters.get(source.platform)
                         if _foot_adapter:
+                            _foot_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                            if _foot_meta is not None:
+                                _foot_meta = dict(_foot_meta)
+                                _foot_meta["notify"] = True
+                                _foot_meta["is_agent"] = True
+                            else:
+                                _foot_meta = {"notify": True, "is_agent": True}
                             await _foot_adapter.send(
                                 source.chat_id,
                                 _footer_line,
-                                metadata=self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)),
+                                metadata=_foot_meta,
                             )
                     except Exception as _e:
                         logger.debug("trailing footer send failed: %s", _e)
@@ -11012,6 +11072,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             metadata = self._thread_metadata_for_source(source)
+            if metadata is not None:
+                metadata = dict(metadata)
+                metadata["notify"] = True
+            else:
+                metadata = {"notify": True}
         except Exception:
             metadata = None
 
@@ -11528,6 +11593,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             local_files = BasePlatformAdapter.filter_local_delivery_paths(local_files)
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+            if _thread_meta is not None:
+                _thread_meta = dict(_thread_meta)
+                _thread_meta["notify"] = True
+                _thread_meta["is_agent"] = True
+            else:
+                _thread_meta = {"notify": True, "is_agent": True}
 
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
@@ -11634,6 +11705,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         _thread_metadata = self._thread_metadata_for_source(source, event_message_id)
+        if _thread_metadata is not None:
+            _thread_metadata = dict(_thread_metadata)
+            _thread_metadata["notify"] = True
+            _thread_metadata["is_agent"] = True
+        else:
+            _thread_metadata = {"notify": True, "is_agent": True}
 
         try:
             user_config = _load_gateway_config()

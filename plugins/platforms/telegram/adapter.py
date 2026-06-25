@@ -2639,6 +2639,65 @@ class TelegramAdapter(BasePlatformAdapter):
         if getattr(self, "_send_path_degraded", False):
             return SendResult(success=False, error="send_path_degraded", retryable=True)
 
+        # Check if we should redirect system messages to the "System" topic.
+        # This only applies to private chats when topic mode is enabled.
+        # We identify a message that should stay in the original topic (such as agent answers
+        # and slash command responses) by having 'notify' flag or ('is_agent' flag without 'is_commentary').
+        # Other messages (is_status, is_commentary, or generic system messages) are redirected.
+        is_agent = (metadata or {}).get("is_agent", False)
+        is_commentary = (metadata or {}).get("is_commentary", False)
+        notify = (metadata or {}).get("notify", False)
+        
+        is_agent_or_command_reply = notify or (is_agent and not is_commentary)
+        
+        if not is_agent_or_command_reply:
+            chat_id_int = None
+            try:
+                chat_id_int = int(chat_id)
+            except (TypeError, ValueError):
+                pass
+            
+            if chat_id_int is not None:
+                dm_topics = getattr(self, "_dm_topics", {})
+                system_thread_id = dm_topics.get(f"{chat_id_int}:System")
+                if system_thread_id is not None:
+                    current_thread_id = self._metadata_thread_id(metadata)
+                    
+                    # Find the name of the current topic thread
+                    original_name = None
+                    if current_thread_id is not None:
+                        try:
+                            curr_tid_int = int(current_thread_id)
+                            for k, v in dm_topics.items():
+                                if v == curr_tid_int and k.startswith(f"{chat_id_int}:"):
+                                    original_name = k.split(":", 1)[1]
+                                    break
+                        except (TypeError, ValueError):
+                            pass
+                    
+                    if not original_name:
+                        if current_thread_id is not None:
+                            original_name = f"Thread {current_thread_id}"
+                        else:
+                            original_name = "Lobby"
+                    
+                    # Redirect if we are not already in the "System" topic.
+                    if original_name != "System":
+                        # Copy metadata to avoid modifying caller's dict
+                        metadata = dict(metadata) if metadata else {}
+                        metadata["thread_id"] = str(system_thread_id)
+                        metadata["telegram_dm_topic_created_for_send"] = True
+                        # Remove potentially conflicting parameters
+                        metadata.pop("message_thread_id", None)
+                        metadata.pop("telegram_dm_topic_reply_fallback", None)
+                        metadata.pop("telegram_reply_to_message_id", None)
+                        metadata.pop("direct_messages_topic_id", None)
+                        metadata.pop("telegram_direct_messages_topic_id", None)
+                        reply_to = None
+                        
+                        # Prefix the content with the original topic name
+                        content = f"📍 **[{original_name}]**\n{content}"
+
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
@@ -2960,6 +3019,9 @@ class TelegramAdapter(BasePlatformAdapter):
         message in place. If the edit fails (message deleted, too old, etc.)
         we drop the cached id and send fresh.
         """
+        metadata = dict(metadata) if metadata is not None else {}
+        metadata["is_status"] = True
+
         key = (str(chat_id), str(status_key))
         cached_id = self._status_message_ids.get(key)
         if cached_id is not None:
