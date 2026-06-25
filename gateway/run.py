@@ -2237,6 +2237,60 @@ def _remove_topic_model(session_key: str) -> None:
             logger.warning("Failed to remove topic model: %s", e)
 
 
+def _topic_profile_key(source: Any) -> str:
+    """Derive a profile lookup key from a session source.
+
+    We use a representation of the source's platform, chat type, chat ID, and thread ID
+    which is completely independent of the profile namespace.
+    """
+    if not source:
+        return ""
+    platform = getattr(source, "platform", None)
+    platform_str = platform.value if platform else ""
+    chat_type = getattr(source, "chat_type", "dm") or "dm"
+    chat_id = getattr(source, "chat_id", "") or ""
+    thread_id = getattr(source, "thread_id", "") or ""
+    return f"{platform_str}:{chat_type}:{chat_id}:{thread_id}"
+
+
+def _load_topic_profiles() -> dict:
+    """Load the persistent topic-specific profile overrides from ~/.hermes/topic_profiles.json."""
+    import json
+    path = _hermes_home / "topic_profiles.json"
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_topic_profile(topic_key: str, profile_name: str) -> None:
+    """Save a persistent topic-specific profile override to ~/.hermes/topic_profiles.json."""
+    path = _hermes_home / "topic_profiles.json"
+    data = _load_topic_profiles()
+    data[topic_key] = profile_name
+    try:
+        atomic_json_write(path, data)
+    except Exception as e:
+        logger.warning("Failed to save topic profile: %s", e)
+
+
+def _remove_topic_profile(topic_key: str) -> None:
+    """Remove a persistent topic-specific profile override from ~/.hermes/topic_profiles.json."""
+    path = _hermes_home / "topic_profiles.json"
+    data = _load_topic_profiles()
+    if topic_key in data:
+        data.pop(topic_key)
+        try:
+            atomic_json_write(path, data)
+        except Exception as e:
+            logger.warning("Failed to remove topic profile: %s", e)
+
+
+
+
 def _resolve_hermes_bin() -> Optional[list[str]]:
     """Resolve the Hermes update command as argv parts.
 
@@ -3132,6 +3186,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _session_key_for_source(self, source: SessionSource) -> str:
         """Resolve the current session key for a source, honoring gateway config when available."""
+        try:
+            normalized = self._normalize_source_for_session_key(source)
+            key = _topic_profile_key(normalized)
+            persistent_profile = _load_topic_profiles().get(key)
+            if persistent_profile:
+                source.profile = persistent_profile
+        except Exception:
+            pass
+
         if hasattr(self, "session_store") and self.session_store is not None:
             try:
                 session_key = self.session_store._generate_session_key(source)
@@ -7557,6 +7620,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         6. Run agent conversation
         7. Return response
         """
+        try:
+            normalized = self._normalize_source_for_session_key(event.source)
+            key = _topic_profile_key(normalized)
+            persistent_profile = _load_topic_profiles().get(key)
+            if persistent_profile:
+                event.source.profile = persistent_profile
+        except Exception:
+            pass
+
         source = event.source
 
         if (

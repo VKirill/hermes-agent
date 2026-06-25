@@ -302,17 +302,74 @@ class GatewaySlashCommandsMixin:
         return EphemeralReply(f"{header}{_tip_line}")
 
     async def _handle_profile_command(self, event: MessageEvent) -> str:
-        """Handle /profile — show active profile name and home directory."""
-        from hermes_constants import display_hermes_home
-        from hermes_cli.profiles import get_active_profile_name
+        """Handle /profile command — switch and show active profile for this topic.
 
-        display = display_hermes_home()
-        profile_name = get_active_profile_name()
+        Supports:
+          /profile                              — show active profile and list available profiles
+          /profile <name>                       — pin topic to a profile
+          /profile default/reset/clear          — clear topic profile override
+        """
+        from hermes_constants import display_hermes_home
+        from hermes_cli.profiles import list_profiles
+        from gateway.run import _topic_profile_key, _remove_topic_profile, _save_topic_profile
+
+        source = event.source
+        source = self._normalize_source_for_session_key(source)
+        topic_key = _topic_profile_key(source)
+        session_key = self._session_key_for_source(source)
+
+        profile_input = event.get_command_args().strip()
+
+        # Load all valid profiles on disk
+        try:
+            profiles = list_profiles()
+            valid_profiles = {p.name for p in profiles}
+        except Exception:
+            valid_profiles = {"default"}
+
+        if profile_input:
+            if profile_input in ("default", "reset", "clear"):
+                try:
+                    _remove_topic_profile(topic_key)
+                except Exception:
+                    pass
+                event.source.profile = None
+                self._evict_cached_agent(session_key)
+                return f"Привязка профиля для топика сброшена. Используется глобальный активный профиль '{self._active_profile_name()}'."
+
+            if profile_input not in valid_profiles:
+                available = ", ".join(f"`{name}`" for name in sorted(valid_profiles))
+                return f"⚠️ Неизвестный профиль '{profile_input}'. Доступные профили: {available}."
+
+            # Save the profile override
+            try:
+                _save_topic_profile(topic_key, profile_input)
+            except Exception:
+                pass
+            event.source.profile = profile_input
+            
+            # Evict the cached agent session since the profile/session key changed
+            self._evict_cached_agent(session_key)
+            
+            return f"Для этого топика закреплен профиль `{profile_input}`."
+
+        # No args: show active profile and available profiles
+        topic_profile = event.source.profile or self._active_profile_name()
 
         lines = [
-            t("gateway.profile.header", profile=profile_name),
-            t("gateway.profile.home", home=display),
+            f"👤 **Настройка профиля**",
+            f"Активный профиль для этого топика: `{topic_profile}`",
+            "",
+            "Доступные профили (нажмите для переключения):",
         ]
+        for name in sorted(valid_profiles):
+            is_active = (name == topic_profile)
+            bullet = "⭐" if is_active else "•"
+            lines.append(f"{bullet} `/profile {name}`")
+
+        lines.append("")
+        lines.append("Чтобы сбросить привязку профиля:")
+        lines.append("• `/profile default`")
 
         return "\n".join(lines)
 
