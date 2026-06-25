@@ -3495,6 +3495,27 @@ class GatewaySlashCommandsMixin:
                     name=name,
                 )
 
+        # A Telegram topic can only own one session binding at a time, and a
+        # session can only be linked to one topic. Check before switching the
+        # in-memory SessionStore so an already-linked target doesn't leave the
+        # current topic half-switched.
+        if self._is_telegram_topic_lane(source):
+            try:
+                current_binding = self._session_db.get_telegram_topic_binding(
+                    chat_id=str(source.chat_id),
+                    thread_id=str(source.thread_id),
+                )
+                target_linked = self._session_db.is_telegram_session_linked_to_topic(
+                    session_id=target_id,
+                )
+                if target_linked and (
+                    not current_binding
+                    or str(current_binding.get("session_id") or "") != str(target_id)
+                ):
+                    return "That session is already linked to another Telegram topic."
+            except Exception:
+                logger.debug("Failed to preflight Telegram topic resume binding", exc_info=True)
+
         # Check if already on that session
         current_entry = self.session_store.get_or_create_session(source)
         if current_entry.session_id == target_id:
@@ -3518,6 +3539,20 @@ class GatewaySlashCommandsMixin:
 
         # Get the title for confirmation
         title = self._session_db.get_session_title(target_id) or name
+
+        # Telegram topic lanes are pinned by an explicit topic -> session_id
+        # binding. Keep it in sync with /resume so the next message doesn't
+        # snap back to the previously-bound session.
+        if self._is_telegram_topic_lane(source):
+            try:
+                self._record_telegram_topic_binding(source, new_entry)
+                self._schedule_telegram_topic_title_rename(source, target_id, title)
+            except ValueError as exc:
+                if "already linked" in str(exc):
+                    return "That session is already linked to another Telegram topic."
+                raise
+            except Exception:
+                logger.debug("Failed to rebind Telegram topic after /resume", exc_info=True)
 
         # Count messages for context
         history = self.session_store.load_transcript(target_id)
