@@ -358,3 +358,32 @@ def test_reload_mcp_scoped(test_env):
         assert h == profile_home.resolve()
 
 
+def test_write_file_guard_on_resolve_error(test_env):
+    """Test Tail 3: write_file still applies hard-guard on resolve error."""
+    profile_home = test_env / "profiles" / "profilea"
+    global_soul = test_env / "SOUL.md"
+    
+    # Pre-create session record in profilea's state.db
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=profile_home / "state.db")
+    db.create_session("session123", "telegram")
+    db.close()
+    
+    # We patch _resolve_path_for_task to raise an exception
+    with patch("tools.file_tools._resolve_path_for_task", side_effect=ValueError("Simulated resolve error")):
+        # Call write_file_tool attempting to write to global SOUL.md under a session
+        from gateway.run import _profile_runtime_scope
+        with _profile_runtime_scope(profile_home):
+            tokens = set_session_vars(
+                session_id="session123",
+                agent_hermes_home=str(profile_home),
+                agent_profile="profilea",
+            )
+            try:
+                res = write_file_tool(str(global_soul), "Malicious SOUL override", session_id="session123")
+                assert "Refusing to write to the global SOUL.md" in res or "error" in res
+                
+                # Verify it was NOT written
+                assert global_soul.read_text(encoding="utf-8") == "I am main agent"
+            finally:
+                clear_session_vars(tokens)

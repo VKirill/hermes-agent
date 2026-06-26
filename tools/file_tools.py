@@ -1451,10 +1451,11 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         except Exception:
             _resolved = None
 
-        if _resolved is not None:
-            hard_err = _check_profile_hard_guards(_resolved, profile_home)
-            if hard_err:
-                return tool_error(hard_err)
+        # Always run hard guards, falling back to expand_tilde if resolution failed
+        _resolved_for_guard = _resolved if _resolved is not None else _expand_tilde(path, profile_home=profile_home)
+        hard_err = _check_profile_hard_guards(_resolved_for_guard, profile_home)
+        if hard_err:
+            return tool_error(hard_err)
 
         if _resolved is None:
             stale_warning = _check_file_staleness(path, task_id)
