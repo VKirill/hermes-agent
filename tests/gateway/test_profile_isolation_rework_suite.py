@@ -387,3 +387,54 @@ def test_write_file_guard_on_resolve_error(test_env):
                 assert global_soul.read_text(encoding="utf-8") == "I am main agent"
             finally:
                 clear_session_vars(tokens)
+
+
+def test_g2_hard_guard_blocks_outside_profile_home(test_env):
+    """Verify expanded hard-guard blocks write to any path outside profile_home except tmp and cwd."""
+    profile_home = test_env / "profiles" / "profilea"
+    
+    # Pre-create session record in profilea's state.db
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=profile_home / "state.db")
+    db.create_session("session123", "telegram")
+    db.close()
+    
+    from gateway.run import _profile_runtime_scope
+    with _profile_runtime_scope(profile_home):
+        tokens = set_session_vars(
+            session_id="session123",
+            agent_hermes_home=str(profile_home),
+            agent_profile="profilea",
+        )
+        try:
+            # 1. Writing inside profile home should succeed
+            in_profile_path = profile_home / "some_file.txt"
+            res_ok = write_file_tool(str(in_profile_path), "in profile content", session_id="session123")
+            assert "error" not in res_ok
+            assert in_profile_path.read_text(encoding="utf-8") == "in profile content"
+            
+            # 2. Writing inside temp directory should succeed
+            import tempfile
+            temp_file = Path(tempfile.gettempdir()) / "hermes_test_temp.txt"
+            res_temp = write_file_tool(str(temp_file), "temp content", session_id="session123")
+            assert "error" not in res_temp
+            assert temp_file.read_text(encoding="utf-8") == "temp content"
+            
+            # 3. Writing inside active workspace CWD should succeed
+            cwd_file = Path(os.getcwd()) / "hermes_test_cwd.txt"
+            # Ensure it doesn't already exist or clean up after
+            try:
+                res_cwd = write_file_tool(str(cwd_file), "cwd content", session_id="session123")
+                assert "error" not in res_cwd
+                assert cwd_file.read_text(encoding="utf-8") == "cwd content"
+            finally:
+                if cwd_file.exists():
+                    cwd_file.unlink()
+                    
+            # 4. Writing to an outside/forbidden path should be blocked
+            forbidden_path = test_env / "random_file_outside_profile.txt"
+            res_blocked = write_file_tool(str(forbidden_path), "forbidden content", session_id="session123")
+            assert "Refusing to write to path outside profile home" in res_blocked or "error" in res_blocked
+            assert not forbidden_path.exists()
+        finally:
+            clear_session_vars(tokens)

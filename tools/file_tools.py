@@ -97,6 +97,66 @@ def _check_profile_hard_guards(resolved_path: str, profile_home: Optional[Path])
             parts = rel_to_profiles.parts
             if parts and parts[0] != profile_home.name:
                 return f"Refusing to write to another profile's home directory: {parts[0]}"
+
+        # Block any write inside the default hermes root unless it is inside the active profile home
+        if resolved_target.is_relative_to(root):
+            if not resolved_target.is_relative_to(profile_home.resolve()):
+                return f"Refusing to write to path outside profile home: {resolved_path}"
+
+        # Block any write outside profile_home, except:
+        # 1. Inside profile_home
+        # 2. Inside system temp directories
+        # 3. Inside active workspace / CWD directories
+        if resolved_target.is_relative_to(profile_home.resolve()):
+            return None
+
+        # Temp directories
+        import tempfile
+        temp_roots = [
+            Path(tempfile.gettempdir()).resolve(),
+            Path("/tmp").resolve(),
+            Path("/private/var/tmp").resolve(),
+            Path("/var/tmp").resolve(),
+        ]
+        if any(resolved_target.is_relative_to(tr) for tr in temp_roots):
+            return None
+
+        # Allowed CWD/workspace roots
+        allowed_roots = []
+        allowed_roots.append(Path(os.getcwd()).resolve())
+
+        tcwd = _configured_terminal_cwd()
+        if tcwd:
+            allowed_roots.append(Path(tcwd).resolve())
+
+        try:
+            from tools.terminal_tool import _active_environments, _env_lock
+            with _env_lock:
+                for env in _active_environments.values():
+                    env_cwd = getattr(env, "cwd", None)
+                    if env_cwd:
+                        allowed_roots.append(Path(env_cwd).resolve())
+        except Exception:
+            pass
+
+        try:
+            with _file_ops_lock:
+                for cached in _file_ops_cache.values():
+                    cached_cwd = getattr(cached, "cwd", None)
+                    if cached_cwd:
+                        allowed_roots.append(Path(cached_cwd).resolve())
+                    env = getattr(cached, "env", None)
+                    if env:
+                        env_cwd = getattr(env, "cwd", None)
+                        if env_cwd:
+                            allowed_roots.append(Path(env_cwd).resolve())
+        except Exception:
+            pass
+
+        if any(resolved_target.is_relative_to(ar) for ar in allowed_roots):
+            return None
+
+        return f"Refusing to write to path outside profile home: {resolved_path}"
     except Exception as e:
         logger.debug("Profile hard guard check failed: %s", e)
     return None
