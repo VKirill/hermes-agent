@@ -9309,6 +9309,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "profile":
             return await self._handle_profile_command(event)
 
+        if canonical == "workspace":
+            return await self._handle_workspace_command(event)
+
         if canonical == "whoami":
             return await self._handle_whoami_command(event)
 
