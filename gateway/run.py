@@ -10170,9 +10170,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "Image routing: text (mode=%s). Pre-analyzing %d image(s) via vision_analyze.",
                         _img_mode, len(image_paths),
                     )
-                    message_text = await self._enrich_message_with_vision(
-                        message_text,
-                        image_paths,
+                    # Drive a "typing…" indicator while the (possibly
+                    # multi-second) vision pre-analysis runs, so the topic shows
+                    # that the photo is being processed.
+                    message_text = await self._run_with_typing_indicator(
+                        source,
+                        event,
+                        self._enrich_message_with_vision(
+                            message_text,
+                            image_paths,
+                        ),
                     )
 
             if audio_paths:
@@ -14701,6 +14708,42 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as exc:
             logger.debug("image_routing: decision failed, falling back to text — %s", exc)
             return "text"
+
+    async def _run_with_typing_indicator(self, source, event, coro):
+        """Await *coro* while keeping a "typing…" indicator alive in the source
+        thread.
+
+        Pre-agent enrichment phases (image vision analysis, audio
+        transcription) run before the turn reaches the model, and the auxiliary
+        model round-trip can take several seconds. Without an explicit
+        indicator the user sees nothing while their photo is being analysed, so
+        we drive the platform typing loop for the duration of *coro* and clear
+        it afterwards. Best-effort: any failure to start/stop typing is
+        non-fatal and never blocks the enrichment itself.
+        """
+        adapter = self.adapters.get(source.platform)
+        typing_task = None
+        if adapter is not None and hasattr(adapter, "_keep_typing"):
+            try:
+                _meta = self._thread_metadata_for_source(
+                    source, self._reply_anchor_for_event(event)
+                )
+                typing_task = asyncio.create_task(
+                    adapter._keep_typing(source.chat_id, metadata=_meta)
+                )
+            except Exception:
+                typing_task = None
+        try:
+            return await coro
+        finally:
+            if typing_task is not None:
+                try:
+                    if hasattr(adapter, "_stop_typing_refresh"):
+                        await adapter._stop_typing_refresh(source.chat_id, typing_task)
+                    else:
+                        typing_task.cancel()
+                except Exception:
+                    pass
 
     async def _enrich_message_with_vision(
         self,
