@@ -18,7 +18,7 @@ def clean_hermes_home(tmp_path, monkeypatch):
     profiles_dir = hermes_home / "profiles"
     profiles_dir.mkdir()
     
-    for name in ("profileA", "profileB"):
+    for name in ("profilea", "profileb"):
         pdir = profiles_dir / name
         pdir.mkdir()
         (pdir / "home").mkdir()
@@ -26,6 +26,10 @@ def clean_hermes_home(tmp_path, monkeypatch):
         (pdir / "memories").mkdir()
         (pdir / "sessions").mkdir()
         (pdir / "config.yaml").write_text("agent:\n  system_prompt: overridden", encoding="utf-8")
+        
+        # Write identity marker to satisfy profile safety check
+        from hermes_cli.profiles import write_profile_identity_marker
+        write_profile_identity_marker(name, pdir, profiles_dir, overwrite=True)
 
     # Set up global SOUL.md
     (hermes_home / "SOUL.md").write_text("I am main agent", encoding="utf-8")
@@ -33,8 +37,8 @@ def clean_hermes_home(tmp_path, monkeypatch):
     # Write topic profiles config
     import json
     topic_profiles = {
-        "telegram:dm:111:222": "profileA",
-        "telegram:dm:111:333": "profileB",
+        "telegram:dm:111:222": "profilea",
+        "telegram:dm:111:333": "profileb",
     }
     with open(hermes_home / "topic_profiles.json", "w", encoding="utf-8") as f:
         json.dump(topic_profiles, f)
@@ -75,13 +79,13 @@ def test_session_key_routing_unconditional(clean_hermes_home):
     key_b = runner._session_key_for_source(source_b)
     key_main = runner._session_key_for_source(source_main)
 
-    assert source_a.profile == "profileA"
-    assert source_b.profile == "profileB"
+    assert source_a.profile == "profilea"
+    assert source_b.profile == "profileb"
     assert source_main.profile is None
 
-    assert "profileA" in key_a
-    assert "profileB" in key_b
-    assert "profileA" not in key_main and "profileB" not in key_main
+    assert "profilea" in key_a
+    assert "profileb" in key_b
+    assert "profilea" not in key_main and "profileb" not in key_main
 
 def test_dynamic_session_db_and_store_scoping(clean_hermes_home):
     """Verify that session_store and _session_db are dynamically resolved per-profile."""
@@ -101,12 +105,12 @@ def test_dynamic_session_db_and_store_scoping(clean_hermes_home):
     
     # Simulate a routed run using _routed_profile_for_source helper
     routed = runner._routed_profile_for_source(source_a)
-    assert routed == "profileA"
+    assert routed == "profilea"
     
-    profile_home = clean_hermes_home / "profiles" / "profileA"
+    profile_home = clean_hermes_home / "profiles" / "profilea"
     from gateway.run import _profile_runtime_scope
     with _profile_runtime_scope(profile_home):
-        # Inside the scope, get_hermes_home() points to profileA
+        # Inside the scope, get_hermes_home() points to profilea
         assert get_hermes_home().resolve() == profile_home.resolve()
         # session_store and _session_db should resolve to profile-specific DB paths
         profile_db_path = profile_home / "state.db"
@@ -153,7 +157,7 @@ def test_tilde_expansion_isolated(clean_hermes_home):
     import concurrent.futures
     from contextvars import copy_context
 
-    profile_home = clean_hermes_home / "profiles" / "profileA"
+    profile_home = clean_hermes_home / "profiles" / "profilea"
     
     # Setup the config/home mode to enable profile home mode
     monkeypatch_env = os.environ.copy()
@@ -231,7 +235,7 @@ async def test_telegram_topic_new_command_isolated(clean_hermes_home):
     mock_adapter = MagicMock()
     runner.adapters = {Platform.TELEGRAM: mock_adapter}
     
-    profile_home = clean_hermes_home / "profiles" / "profileA"
+    profile_home = clean_hermes_home / "profiles" / "profilea"
     profile_db_path = profile_home / "state.db"
     from hermes_state import SessionDB
     db = SessionDB(db_path=profile_db_path)
@@ -241,7 +245,7 @@ async def test_telegram_topic_new_command_isolated(clean_hermes_home):
         platform=Platform.TELEGRAM,
         chat_id="111",
         chat_type="dm",
-        thread_id="222",  # profileA is mapped to this
+        thread_id="222",  # profilea is mapped to this
         user_id="user_999",
     )
     
@@ -259,8 +263,8 @@ async def test_telegram_topic_new_command_isolated(clean_hermes_home):
     # Let's run _handle_message.
     await runner._handle_message(event)
 
-    # Check profileA's database for the topic binding!
-    profile_home = clean_hermes_home / "profiles" / "profileA"
+    # Check profilea's database for the topic binding!
+    profile_home = clean_hermes_home / "profiles" / "profilea"
     profile_db_path = profile_home / "state.db"
     assert profile_db_path.exists()
     
@@ -277,5 +281,3 @@ async def test_telegram_topic_new_command_isolated(clean_hermes_home):
         global_db = SessionDB(db_path=global_db_path)
         global_binding = global_db.get_telegram_topic_binding(chat_id="111", thread_id="222")
         assert global_binding is None
-
-
