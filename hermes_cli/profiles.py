@@ -180,17 +180,17 @@ def _has_symlink_ancestor(path: Path, stop_at: Path | None = None) -> bool:
     current = path
     stop = stop_at.resolve(strict=False) if stop_at is not None else None
     while True:
-        try:
-            if current.exists() and current.is_symlink():
-                return True
-        except OSError:
-            return True
         if stop is not None:
             try:
                 if current.resolve(strict=False) == stop:
                     return False
             except OSError:
                 return True
+        try:
+            if current.is_symlink():
+                return True
+        except OSError:
+            return True
         parent = current.parent
         if parent == current:
             return False

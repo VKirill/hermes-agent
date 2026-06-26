@@ -49,20 +49,51 @@ except ImportError:
 # Configuration
 # =============================================================================
 
+def _hermes_dir():
+    if "HERMES_DIR" in globals():
+        return globals()["HERMES_DIR"]
+    return get_hermes_home().resolve()
+
+def _cron_dir():
+    if "CRON_DIR" in globals():
+        return globals()["CRON_DIR"]
+    return _hermes_dir() / "cron"
+
+def _jobs_file():
+    if "JOBS_FILE" in globals():
+        return globals()["JOBS_FILE"]
+    return _cron_dir() / "jobs.json"
+
+def _ticker_heartbeat_file():
+    if "TICKER_HEARTBEAT_FILE" in globals():
+        return globals()["TICKER_HEARTBEAT_FILE"]
+    return _cron_dir() / "ticker_heartbeat"
+
+def _ticker_success_file():
+    if "TICKER_SUCCESS_FILE" in globals():
+        return globals()["TICKER_SUCCESS_FILE"]
+    return _cron_dir() / "ticker_last_success"
+
+def _output_dir():
+    if "OUTPUT_DIR" in globals():
+        return globals()["OUTPUT_DIR"]
+    return _cron_dir() / "output"
+
 def __getattr__(name: str):
     if name == "HERMES_DIR":
-        return get_hermes_home().resolve()
+        return _hermes_dir()
     if name == "CRON_DIR":
-        return get_hermes_home().resolve() / "cron"
+        return _cron_dir()
     if name == "JOBS_FILE":
-        return get_hermes_home().resolve() / "cron" / "jobs.json"
+        return _jobs_file()
     if name == "TICKER_HEARTBEAT_FILE":
-        return get_hermes_home().resolve() / "cron" / "ticker_heartbeat"
+        return _ticker_heartbeat_file()
     if name == "TICKER_SUCCESS_FILE":
-        return get_hermes_home().resolve() / "cron" / "ticker_last_success"
+        return _ticker_success_file()
     if name == "OUTPUT_DIR":
-        return get_hermes_home().resolve() / "cron" / "output"
+        return _output_dir()
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
 
 # Default ticker loop interval (seconds). The single source of truth shared by
 # the in-process ticker (cron/scheduler_provider.py) and the staleness
@@ -80,7 +111,7 @@ ONESHOT_GRACE_SECONDS = 120
 
 def _jobs_lock_file() -> Path:
     """Return the advisory lock path for the current cron directory."""
-    return CRON_DIR / ".jobs.lock"
+    return _cron_dir() / ".jobs.lock"
 
 
 @contextlib.contextmanager
@@ -165,7 +196,7 @@ def _job_output_dir(job_id: str) -> Path:
         raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
     if Path(text).is_absolute() or Path(text).drive:
         raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
-    return OUTPUT_DIR / text
+    return _output_dir() / text
 
 
 def _normalize_skill_list(skill: Optional[str] = None, skills: Optional[Any] = None) -> List[str]:
@@ -272,10 +303,10 @@ def _secure_file(path: Path):
 
 def ensure_dirs():
     """Ensure cron directories exist with secure permissions."""
-    CRON_DIR.mkdir(parents=True, exist_ok=True)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    _secure_dir(CRON_DIR)
-    _secure_dir(OUTPUT_DIR)
+    _cron_dir().mkdir(parents=True, exist_ok=True)
+    _output_dir().mkdir(parents=True, exist_ok=True)
+    _secure_dir(_cron_dir())
+    _secure_dir(_output_dir())
 
 
 # =============================================================================
@@ -564,7 +595,7 @@ def _atomic_write_epoch(path: Path) -> None:
     torn/truncated file. Best-effort: failures are swallowed by callers.
     """
     ensure_dirs()
-    fd, tmp_path = tempfile.mkstemp(dir=str(CRON_DIR), suffix=".tmp", prefix=".hb_")
+    fd, tmp_path = tempfile.mkstemp(dir=str(_cron_dir()), suffix=".tmp", prefix=".hb_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(str(time.time()))
@@ -592,12 +623,12 @@ def record_ticker_heartbeat(success: bool = False) -> None:
     Best-effort: a write failure must never disrupt the tick loop.
     """
     try:
-        _atomic_write_epoch(TICKER_HEARTBEAT_FILE)
+        _atomic_write_epoch(_ticker_heartbeat_file())
     except Exception:
         pass
     if success:
         try:
-            _atomic_write_epoch(TICKER_SUCCESS_FILE)
+            _atomic_write_epoch(_ticker_success_file())
         except Exception:
             pass
 
@@ -616,12 +647,12 @@ def get_ticker_heartbeat_age() -> Optional[float]:
     None = heartbeat file missing/unreadable (older build, never ran, or a
     torn read). Callers treat None as "cannot determine", not "dead".
     """
-    return _epoch_file_age(TICKER_HEARTBEAT_FILE)
+    return _epoch_file_age(_ticker_heartbeat_file())
 
 
 def get_ticker_success_age() -> Optional[float]:
     """Seconds since the ticker last completed a tick WITHOUT raising, or None."""
-    return _epoch_file_age(TICKER_SUCCESS_FILE)
+    return _epoch_file_age(_ticker_success_file())
 
 
 # =============================================================================
@@ -631,19 +662,19 @@ def get_ticker_success_age() -> Optional[float]:
 def load_jobs() -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
     ensure_dirs()
-    if not JOBS_FILE.exists():
+    if not _jobs_file().exists():
         return []
 
     _strict_retry = False  # track whether we used the strict=False fallback
 
     try:
-        with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+        with open(_jobs_file(), 'r', encoding='utf-8') as f:
             data = json.load(f)
     except json.JSONDecodeError:
         # Retry with strict=False to handle bare control chars in string values
         _strict_retry = True
         try:
-            with open(JOBS_FILE, 'r', encoding='utf-8') as f:
+            with open(_jobs_file(), 'r', encoding='utf-8') as f:
                 data = json.loads(f.read(), strict=False)
         except Exception as e:
             logger.error("Failed to auto-repair jobs.json: %s", e)
@@ -679,14 +710,14 @@ def load_jobs() -> List[Dict[str, Any]]:
 def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage. Caller must hold _jobs_lock()."""
     ensure_dirs()
-    fd, tmp_path = tempfile.mkstemp(dir=str(JOBS_FILE.parent), suffix='.tmp', prefix='.jobs_')
+    fd, tmp_path = tempfile.mkstemp(dir=str(_jobs_file().parent), suffix='.tmp', prefix='.jobs_')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump({"jobs": jobs, "updated_at": _hermes_now().isoformat()}, f, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        atomic_replace(tmp_path, JOBS_FILE)
-        _secure_file(JOBS_FILE)
+        atomic_replace(tmp_path, _jobs_file())
+        _secure_file(_jobs_file())
     except BaseException:
         try:
             os.unlink(tmp_path)

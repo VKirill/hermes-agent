@@ -42,11 +42,21 @@ from utils import atomic_replace
 
 logger = logging.getLogger(__name__)
 
+def _cron_dir():
+    if "CRON_DIR" in globals():
+        return globals()["CRON_DIR"]
+    return get_hermes_home().resolve() / "cron"
+
+def _suggestions_file():
+    if "SUGGESTIONS_FILE" in globals():
+        return globals()["SUGGESTIONS_FILE"]
+    return _cron_dir() / "suggestions.json"
+
 def __getattr__(name: str):
     if name == "CRON_DIR":
-        return get_hermes_home().resolve() / "cron"
+        return _cron_dir()
     if name == "SUGGESTIONS_FILE":
-        return get_hermes_home().resolve() / "cron" / "suggestions.json"
+        return _suggestions_file()
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 # In-process lock protecting load->modify->save cycles (the background review
@@ -71,14 +81,14 @@ def _secure_file(path: Path) -> None:
 
 
 def _ensure_dir() -> None:
-    CRON_DIR.mkdir(parents=True, exist_ok=True)
+    _cron_dir().mkdir(parents=True, exist_ok=True)
 
 
 def _load_raw() -> Dict[str, Any]:
-    if not SUGGESTIONS_FILE.exists():
+    if not _suggestions_file().exists():
         return {"suggestions": []}
     try:
-        with open(SUGGESTIONS_FILE, "r", encoding="utf-8") as f:
+        with open(_suggestions_file(), "r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("suggestions.json unreadable (%s); starting empty", e)
@@ -93,7 +103,7 @@ def _load_raw() -> Dict[str, Any]:
 
 def _save_raw(suggestions: List[Dict[str, Any]]) -> None:
     _ensure_dir()
-    fd, tmp_path = tempfile.mkstemp(dir=str(SUGGESTIONS_FILE.parent), suffix=".tmp", prefix=".sugg_")
+    fd, tmp_path = tempfile.mkstemp(dir=str(_suggestions_file().parent), suffix=".tmp", prefix=".sugg_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(
@@ -103,8 +113,8 @@ def _save_raw(suggestions: List[Dict[str, Any]]) -> None:
             )
             f.flush()
             os.fsync(f.fileno())
-        atomic_replace(tmp_path, SUGGESTIONS_FILE)
-        _secure_file(SUGGESTIONS_FILE)
+        atomic_replace(tmp_path, _suggestions_file())
+        _secure_file(_suggestions_file())
     except BaseException:
         try:
             os.unlink(tmp_path)

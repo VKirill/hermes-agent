@@ -1171,7 +1171,13 @@ def init_agent(
         try:
             mem_config = _agent_cfg.get("memory", {})
             agent._memory_enabled = mem_config.get("memory_enabled", False)
-            agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
+            from hermes_cli.config import read_raw_config
+            multiplex_active = False
+            try:
+                multiplex_active = bool(read_raw_config().get("multiplex_profiles", False))
+            except Exception:
+                pass
+            agent._user_profile_enabled = mem_config.get("user_profile_enabled", multiplex_active)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
                 from tools.memory_tool import MemoryStore

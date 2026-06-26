@@ -1622,7 +1622,7 @@ def _resolve_api_key_provider(env: Optional[Dict[str, Any]] = None) -> Tuple[Opt
                     continue
             except ImportError:
                 pass
-                return _try_anthropic(env=env)
+            return _try_anthropic(env=env)
 
         pool_present, entry = _select_pool_entry(provider_id, env=env)
         if pool_present:
@@ -3504,17 +3504,27 @@ def _try_configured_fallback_chain(
         label = f"fallback_chain[{i}]({fb_provider})"
 
         try:
-            fb_client, resolved_model = _resolve_fallback_entry(entry)
+            try:
+                fb_client, resolved_model = _resolve_fallback_entry(entry, env=env)
+            except TypeError as te:
+                if "unexpected keyword argument" in str(te) or "takes" in str(te):
+                    fb_client, resolved_model = _resolve_fallback_entry(entry)
+                else:
+                    raise
         except Exception:
             fb_client, resolved_model = None, None
 
         if fb_client is not None:
             if min_ctx is not None and resolved_model:
+                try:
+                    fb_key = _fallback_entry_api_key(entry, env=env)
+                except TypeError:
+                    fb_key = _fallback_entry_api_key(entry)
                 fb_ctx = _candidate_context_window(
                     fb_provider,
                     resolved_model,
                     base_url=str(entry.get("base_url") or ""),
-                    api_key=_fallback_entry_api_key(entry) or "",
+                    api_key=fb_key or "",
                 )
                 if fb_ctx is not None and fb_ctx < min_ctx:
                     logger.info(
@@ -3541,6 +3551,7 @@ def _try_configured_fallback_chain(
 def _try_configured_fallback_for_unavailable_client(
     task: Optional[str],
     failed_provider: str,
+    env: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try task fallback_chain when an explicit aux provider cannot build.
 
@@ -3553,32 +3564,37 @@ def _try_configured_fallback_for_unavailable_client(
     explicit = (failed_provider or "").strip().lower()
     if not task or not explicit or explicit in {"auto"}:
         return None, None, ""
+    kwargs = {"reason": "provider unavailable"}
+    if env is not None:
+        kwargs["env"] = env
     return _try_configured_fallback_chain(
         task,
         explicit,
-        reason="provider unavailable",
+        **kwargs
     )
 
 
-def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
+def _fallback_entry_api_key(entry: Dict[str, Any], env: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Resolve inline or env-backed API key from a fallback-chain entry."""
     explicit = str(entry.get("api_key") or "").strip()
     if explicit:
         return explicit
     key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
     if key_env:
+        if env is not None:
+            return env.get(key_env, "").strip() or None
         return os.getenv(key_env, "").strip() or None
     return None
 
 
-def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optional[str]]:
+def _resolve_fallback_entry(entry: Dict[str, Any], env: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
     """Resolve one fallback entry through the central provider router."""
     provider = str(entry.get("provider") or "").strip()
     model = str(entry.get("model") or "").strip() or None
     if not provider or not model:
         return None, None
     base_url = str(entry.get("base_url") or "").strip() or None
-    api_key = _fallback_entry_api_key(entry)
+    api_key = _fallback_entry_api_key(entry, env=env)
     api_mode = str(entry.get("api_mode") or entry.get("transport") or "").strip() or None
     return resolve_provider_client(
         provider,
@@ -3586,6 +3602,7 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
         explicit_base_url=base_url,
         explicit_api_key=api_key,
         api_mode=api_mode,
+        env=env,
     )
 
 
@@ -3689,6 +3706,7 @@ def _resolve_single_provider(
         model=model,
         explicit_base_url=base_url,
         explicit_api_key=api_key,
+        env=env,
     )
     return client
 
@@ -5774,7 +5792,7 @@ def call_llm(
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit,
+                    task, _explicit, env=env,
                 )
                 if fb_client is not None:
                     client, final_model = fb_client, fb_model
@@ -6315,7 +6333,7 @@ async def async_call_llm(
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit,
+                    task, _explicit, env=env,
                 )
                 if fb_client is not None:
                     client, final_model = _to_async_client(

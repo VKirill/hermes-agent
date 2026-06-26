@@ -1016,3 +1016,14 @@ agent/secret_scope.py: get_secret (fail-closed при multiplex_active) / set_mu
 5. Бери из #18510 СЛОЙ ИЗОЛЯЦИИ, а резолвер «источник→профиль» оставляй наш.
 6. Оформи PR по чек-листу раздела 8.
 ```
+
+---
+
+## 11. macOS Subprocess HOME Override & FUSE Deadlock
+
+### macOS Subprocess HOME Override
+On macOS, overriding the `HOME` environment variable for spawned subprocesses (like MCP servers, shell commands, or external tools) behaves slightly differently due to OS-level sandboxing, caching, and path resolution constraints:
+1. **Real vs. Symlinked Paths**: macOS frequently resolves system paths like `/var/folders` or `/tmp` to their real canonical locations (e.g. `/private/var/folders`, `/private/tmp`). When configuring isolated profile paths, always resolve paths to their real paths (`Path.resolve(strict=False)`) before configuring/comparing home roots. Comparing unresolved symlinked paths against resolved ones can lead to path escape false positives.
+2. **Mac App Sandbox**: If the gateway is run within a macOS sandbox environment (e.g. Mac App Store distribution or hardened runtime), subprocesses may inherit restricted filesystem access. In such cases, profile home directories MUST reside within the sandbox container directories (like `~/Library/Containers/...`) to avoid permission errors when sub-agents attempt to read/write credentials or memory files.
+3. **FUSE Deadlock**: As noted in Section 5.4.1 (Solution D), heavy I/O from routed profiles to cloud-mounted filesystems (e.g. Google Drive File Stream, iCloud) can cause FUSE deadlocks on macOS. It is highly recommended to store active profile directories on local APFS volumes (under `~/.hermes/profiles/`) rather than direct FUSE mount points.
+

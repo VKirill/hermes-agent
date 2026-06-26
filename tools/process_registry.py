@@ -1794,6 +1794,17 @@ class ProcessRegistry:
         Returns the number of processes recovered as detached.
         """
         paths: list[Path] = [_checkpoint_path_for_home()]
+        if not _checkpoint_path_overridden():
+            from hermes_constants import get_default_hermes_root
+            try:
+                root = get_default_hermes_root()
+                profiles_dir = root / "profiles"
+                if profiles_dir.exists():
+                    for p_dir in profiles_dir.iterdir():
+                        if p_dir.is_dir() and (p_dir / "processes.json").exists():
+                            paths.append(p_dir / "processes.json")
+            except Exception:
+                pass
         if checkpoint_paths and not _checkpoint_path_overridden():
             paths.extend(Path(path) for path in checkpoint_paths)
 

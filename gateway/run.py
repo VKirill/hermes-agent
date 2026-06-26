@@ -2802,52 +2802,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def session_store(self):
         from hermes_constants import get_hermes_home
         current_home = get_hermes_home().resolve()
+        if not hasattr(self, "_profile_cache_lock"):
+            import threading
+            self._profile_cache_lock = threading.Lock()
         if not hasattr(self, "_profile_session_stores"):
             self._profile_session_stores = {}
-        if current_home not in self._profile_session_stores:
-            from gateway.session import SessionStore
-            from tools.process_registry import process_registry
-            profile_sessions_dir = current_home / "sessions"
-            store = SessionStore(
-                profile_sessions_dir,
-                self.config,
-                has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
-                db_path=current_home / "state.db",
-            )
-            self._profile_session_stores[current_home] = store
-        return self._profile_session_stores[current_home]
+        with self._profile_cache_lock:
+            if current_home not in self._profile_session_stores:
+                from gateway.session import SessionStore
+                from tools.process_registry import process_registry
+                profile_sessions_dir = current_home / "sessions"
+                store = SessionStore(
+                    profile_sessions_dir,
+                    self.config,
+                    has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
+                    db_path=current_home / "state.db",
+                )
+                self._profile_session_stores[current_home] = store
+            return self._profile_session_stores[current_home]
 
     @session_store.setter
     def session_store(self, value):
         from hermes_constants import get_hermes_home
         current_home = get_hermes_home().resolve()
+        if not hasattr(self, "_profile_cache_lock"):
+            import threading
+            self._profile_cache_lock = threading.Lock()
         if not hasattr(self, "_profile_session_stores"):
             self._profile_session_stores = {}
-        self._profile_session_stores[current_home] = value
+        with self._profile_cache_lock:
+            self._profile_session_stores[current_home] = value
 
     @property
     def _session_db(self):
         from hermes_constants import get_hermes_home
         current_home = get_hermes_home().resolve()
+        if not hasattr(self, "_profile_cache_lock"):
+            import threading
+            self._profile_cache_lock = threading.Lock()
         if not hasattr(self, "_profile_session_dbs"):
             self._profile_session_dbs = {}
-        if current_home not in self._profile_session_dbs:
-            try:
-                from hermes_state import SessionDB
-                db = SessionDB(db_path=current_home / "state.db")
-                self._profile_session_dbs[current_home] = db
-            except Exception as e:
-                logger.warning("SQLite session store not available for %s: %s", current_home, e)
-                self._profile_session_dbs[current_home] = None
-        return self._profile_session_dbs[current_home]
+        with self._profile_cache_lock:
+            if current_home not in self._profile_session_dbs:
+                try:
+                    from hermes_state import SessionDB
+                    db = SessionDB(db_path=current_home / "state.db")
+                    self._profile_session_dbs[current_home] = db
+                except Exception as e:
+                    logger.warning("SQLite session store not available for %s: %s", current_home, e)
+                    self._profile_session_dbs[current_home] = None
+            return self._profile_session_dbs[current_home]
 
     @_session_db.setter
     def _session_db(self, value):
         from hermes_constants import get_hermes_home
         current_home = get_hermes_home().resolve()
+        if not hasattr(self, "_profile_cache_lock"):
+            import threading
+            self._profile_cache_lock = threading.Lock()
         if not hasattr(self, "_profile_session_dbs"):
             self._profile_session_dbs = {}
-        self._profile_session_dbs[current_home] = value
+        with self._profile_cache_lock:
+            self._profile_session_dbs[current_home] = value
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -13486,8 +13502,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
 
             # Capture old server names before shutdown
+            from tools.mcp_tool import _load_mcp_config, _get_mcp_config_fingerprint
+            try:
+                active_cfgs = _load_mcp_config()
+                active_fps = {
+                    _get_mcp_config_fingerprint(name, cfg)
+                    for name, cfg in active_cfgs.items()
+                }
+            except Exception:
+                active_fps = set()
+
             with _lock:
-                old_servers = set(_servers.keys())
+                old_servers = {
+                    k for k in _servers.keys()
+                    if k in active_fps or (getattr(_servers[k], "fingerprint", None) in active_fps)
+                }
 
             # Read new config before shutting down, so we know what will be added/removed
             # Shutdown existing connections
@@ -13498,7 +13527,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Compute what changed
             with _lock:
-                connected_servers = set(_servers.keys())
+                connected_servers = {
+                    k for k in _servers.keys()
+                    if k in active_fps or (getattr(_servers[k], "fingerprint", None) in active_fps)
+                }
 
             added = connected_servers - old_servers
             removed = old_servers - connected_servers
@@ -13506,11 +13538,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             lines = [t("gateway.reload_mcp.header")]
             if reconnected:
-                lines.append(t("gateway.reload_mcp.reconnected", names=", ".join(sorted(reconnected))))
+                lines.append(t("gateway.reload_mcp.reconnected", names=", ".join(sorted({k.split(":")[0] for k in reconnected}))))
             if added:
-                lines.append(t("gateway.reload_mcp.added", names=", ".join(sorted(added))))
+                lines.append(t("gateway.reload_mcp.added", names=", ".join(sorted({k.split(":")[0] for k in added}))))
             if removed:
-                lines.append(t("gateway.reload_mcp.removed", names=", ".join(sorted(removed))))
+                lines.append(t("gateway.reload_mcp.removed", names=", ".join(sorted({k.split(":")[0] for k in removed}))))
             if not connected_servers:
                 lines.append(t("gateway.reload_mcp.none_connected"))
             else:
@@ -14411,6 +14443,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        _resolve_home = getattr(self, "_resolve_profile_home_for_source", None)
+        if _resolve_home is not None:
+            profile_home = _resolve_home(context.source)
+        else:
+            from hermes_constants import get_hermes_home
+            profile_home = get_hermes_home()
+
+        from hermes_cli.profiles import get_active_profile_name
+        agent_profile = (context.source.profile or "").strip() or get_active_profile_name() or "default"
+        agent_hermes_home = str(profile_home)
+
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -14421,6 +14464,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             async_delivery=_async_delivery,
+            agent_profile=agent_profile,
+            agent_hermes_home=agent_hermes_home,
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -16153,10 +16198,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         by the /p/<profile>/ URL prefix or a per-credential adapter), falling
         back to the active profile (the multiplexer's own home).
         """
-        from hermes_cli.profiles import get_active_profile_name, get_profile_dir
+        from hermes_cli.profiles import get_active_profile_name, get_profile_dir, validate_profile_identity, _get_profiles_root
         try:
             name = (source.profile or "").strip() or get_active_profile_name() or "default"
-            return get_profile_dir(name)
+            p_dir = get_profile_dir(name)
+            if name != "default":
+                validate_profile_identity(name, p_dir, _get_profiles_root())
+            return p_dir
         except Exception:
             from hermes_constants import get_hermes_home
             return get_hermes_home()
