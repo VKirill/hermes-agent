@@ -294,3 +294,28 @@ def test_zero_regression_full_turn(test_env):
     
     profile_home = runner._resolve_profile_home_for_source(source)
     assert profile_home.resolve() == test_env.resolve()
+
+
+def test_g2_fallback_when_session_id_none(test_env):
+    """Test Tail 1 fallback: when session_id is None, get_profile_home_for_session resolves active profile home-override."""
+    from tools.file_tools import get_profile_home_for_session, write_file_tool
+    from gateway.run import _profile_runtime_scope
+    
+    profile_home = test_env / "profiles" / "profilea"
+    
+    # 1. Under profile scope, session_id is None but fallback resolves profile_home
+    with _profile_runtime_scope(profile_home):
+        resolved = get_profile_home_for_session(None)
+        assert resolved is not None
+        assert resolved.resolve() == profile_home.resolve()
+        
+        # Verify hard guard blocks writing outside profile-home even without session_id
+        res = write_file_tool("../../SOUL.md", "Illegal write")
+        res_dict = json.loads(res)
+        assert "error" in res_dict or res_dict.get("success") is False
+        assert (test_env / "SOUL.md").read_text(encoding="utf-8") == "I am main agent"
+
+    # 2. Under default scope, get_profile_home_for_session(None) returns None and allows normal writes
+    resolved_default = get_profile_home_for_session(None)
+    assert resolved_default is None
+

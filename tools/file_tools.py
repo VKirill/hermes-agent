@@ -31,6 +31,14 @@ def get_profile_home_for_session(session_id: Optional[str]) -> Optional[Path]:
         from gateway.session_context import get_session_env
         session_id = get_session_env("HERMES_SESSION_ID")
     if not session_id:
+        from hermes_constants import get_hermes_home, get_default_hermes_root
+        try:
+            cur = get_hermes_home().resolve()
+            root = get_default_hermes_root().resolve()
+            if cur != root and (root / "profiles") in cur.parents:
+                return cur
+        except Exception:
+            pass
         return None
     from hermes_constants import get_default_hermes_root
     try:
