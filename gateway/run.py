@@ -8470,8 +8470,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await adapter.send(source.chat_id, content, metadata=metadata)
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
+        # Ensure we set source.profile from topic overrides before resolving profile
+        try:
+            normalized = self._normalize_source_for_session_key(event.source)
+            key = _topic_profile_key(normalized)
+            persistent_profile = _load_topic_profiles().get(key)
+            if persistent_profile:
+                event.source.profile = persistent_profile
+        except Exception:
+            pass
+
+        source = event.source
+        routed = self._routed_profile_for_source(source)
+        multiplex = getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        topic_home = self._resolve_topic_workspace_for_source(source)
+
+        if not multiplex and routed is None:
+            with _topic_runtime_scope(topic_home):
+                return await self._handle_message_inner(event)
+
+        profile_home = self._resolve_profile_home_for_source(source)
+        with _profile_runtime_scope(profile_home):
+            with _topic_runtime_scope(topic_home):
+                return await self._handle_message_inner(event)
+
+    async def _handle_message_inner(self, event: MessageEvent) -> Optional[str]:
         """
-        Handle an incoming message from any platform.
+        Handle an incoming message from any platform (core pipeline).
         
         This is the core message processing pipeline:
         1. Check user authorization

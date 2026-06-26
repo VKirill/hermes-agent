@@ -240,7 +240,8 @@ class TestTitleInHelp:
         """The /title command is in the _known_commands set."""
         from gateway.run import GatewayRunner
         import inspect
-        source = inspect.getsource(GatewayRunner._handle_message)
+        func = getattr(GatewayRunner, "_handle_message_inner", GatewayRunner._handle_message)
+        source = inspect.getsource(func)
         assert '"title"' in source
 
 

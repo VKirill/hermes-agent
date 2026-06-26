@@ -215,3 +215,67 @@ def test_topic_workspace_override_isolated(clean_hermes_home):
         # Verify code execution tool CWD resolves to the topic custom workspace
         assert _resolve_child_cwd("project", "/staging") == str(custom_workspace)
 
+
+@pytest.mark.asyncio
+async def test_telegram_topic_new_command_isolated(clean_hermes_home):
+    """Verify that /new executed in a Telegram topic lane is correctly routed to the profile scope and DB."""
+    from gateway.platforms.base import MessageEvent
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionSource
+    from gateway.config import Platform, GatewayConfig
+    
+    runner = GatewayRunner(config=GatewayConfig(platforms={}))
+    runner._normalize_source_for_session_key = lambda src: src
+    
+    # We must mock adapters lookup so send does not crash or block
+    mock_adapter = MagicMock()
+    runner.adapters = {Platform.TELEGRAM: mock_adapter}
+    
+    profile_home = clean_hermes_home / "profiles" / "profileA"
+    profile_db_path = profile_home / "state.db"
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=profile_db_path)
+    db.enable_telegram_topic_mode(chat_id="111", user_id="user_999")
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="111",
+        chat_type="dm",
+        thread_id="222",  # profileA is mapped to this
+        user_id="user_999",
+    )
+    
+    event = MessageEvent(
+        text="/new",
+        message_id="999",
+        source=source,
+    )
+    
+    # Bypass confirmation dialog so execute runs immediately
+    async def mock_confirm(*args, **kwargs):
+        return await kwargs["execute"]()
+    runner._maybe_confirm_destructive_slash = mock_confirm
+
+    # Let's run _handle_message.
+    await runner._handle_message(event)
+
+    # Check profileA's database for the topic binding!
+    profile_home = clean_hermes_home / "profiles" / "profileA"
+    profile_db_path = profile_home / "state.db"
+    assert profile_db_path.exists()
+    
+    from hermes_state import SessionDB
+    db = SessionDB(db_path=profile_db_path)
+    binding = db.get_telegram_topic_binding(chat_id="111", thread_id="222")
+    assert binding is not None
+    assert binding["chat_id"] == "111"
+    assert binding["thread_id"] == "222"
+
+    # Verify that the GLOBAL database does NOT have this binding, proving isolation!
+    global_db_path = clean_hermes_home / "state.db"
+    if global_db_path.exists():
+        global_db = SessionDB(db_path=global_db_path)
+        global_binding = global_db.get_telegram_topic_binding(chat_id="111", thread_id="222")
+        assert global_binding is None
+
+
