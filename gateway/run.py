@@ -2739,6 +2739,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
 
+    @property
+    def session_store(self):
+        from hermes_constants import get_hermes_home
+        current_home = get_hermes_home().resolve()
+        if not hasattr(self, "_profile_session_stores"):
+            self._profile_session_stores = {}
+        if current_home not in self._profile_session_stores:
+            from gateway.session import SessionStore
+            from tools.process_registry import process_registry
+            profile_sessions_dir = current_home / "sessions"
+            store = SessionStore(
+                profile_sessions_dir,
+                self.config,
+                has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
+                db_path=current_home / "state.db",
+            )
+            self._profile_session_stores[current_home] = store
+        return self._profile_session_stores[current_home]
+
+    @session_store.setter
+    def session_store(self, value):
+        from hermes_constants import get_hermes_home
+        current_home = get_hermes_home().resolve()
+        if not hasattr(self, "_profile_session_stores"):
+            self._profile_session_stores = {}
+        self._profile_session_stores[current_home] = value
+
+    @property
+    def _session_db(self):
+        from hermes_constants import get_hermes_home
+        current_home = get_hermes_home().resolve()
+        if not hasattr(self, "_profile_session_dbs"):
+            self._profile_session_dbs = {}
+        if current_home not in self._profile_session_dbs:
+            try:
+                from hermes_state import SessionDB
+                db = SessionDB(db_path=current_home / "state.db")
+                self._profile_session_dbs[current_home] = db
+            except Exception as e:
+                logger.warning("SQLite session store not available for %s: %s", current_home, e)
+                self._profile_session_dbs[current_home] = None
+        return self._profile_session_dbs[current_home]
+
+    @_session_db.setter
+    def _session_db(self, value):
+        from hermes_constants import get_hermes_home
+        current_home = get_hermes_home().resolve()
+        if not hasattr(self, "_profile_session_dbs"):
+            self._profile_session_dbs = {}
+        self._profile_session_dbs[current_home] = value
+
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
         self.config = config or load_gateway_config()
@@ -3340,15 +3391,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # produces the same namespace as the primary path: None (legacy
         # agent:main) unless multiplexing is on, then the active profile.
         _profile = None
-        if getattr(config, "multiplex_profiles", False):
-            if source.profile:
-                _profile = source.profile
-            else:
-                try:
-                    from hermes_cli.profiles import get_active_profile_name
-                    _profile = get_active_profile_name() or "default"
-                except Exception:
-                    _profile = None
+        if source.profile:
+            _profile = source.profile
+        elif getattr(config, "multiplex_profiles", False):
+            try:
+                from hermes_cli.profiles import get_active_profile_name
+                _profile = get_active_profile_name() or "default"
+            except Exception:
+                _profile = None
         return build_session_key(
             source,
             group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
@@ -7395,6 +7445,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return "default"
 
+    def _routed_profile_for_source(self, source: SessionSource) -> Optional[str]:
+        """Имя профиля, привязанного к топику источника, или None.
+        None  → непривязанный топик: ничего не скоупим, поведение БЕЗ изменений.
+        "<n>" → входим в _profile_runtime_scope(get_profile_dir(<n>)) на весь ход.
+        """
+        try:
+            normalized = self._normalize_source_for_session_key(source)
+            key = _topic_profile_key(normalized)
+            name = (_load_topic_profiles().get(key) or "").strip()
+            if not name or name in ("default", self._active_profile_name()):
+                return None
+            return name
+        except Exception:
+            return None
+
     # ── Kanban board watchers ───────────────────────────────────────────
     # The kanban notifier/dispatcher watcher loops + their helpers live in
     # GatewayKanbanWatchersMixin (gateway/kanban_watchers.py). They use only
@@ -7889,8 +7954,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # old gateway's connection holding the WAL lock until Python
             # actually exits — causing 'database is locked' errors when
             # the new gateway tries to open the same file.
-            for _db_holder in (self, getattr(self, "session_store", None)):
-                _db = getattr(_db_holder, "_db", None) if _db_holder else None
+            dbs_to_close = []
+            if hasattr(self, "_profile_session_dbs"):
+                dbs_to_close.extend(self._profile_session_dbs.values())
+            if hasattr(self, "_profile_session_stores"):
+                for store in self._profile_session_stores.values():
+                    if hasattr(store, "_db") and store._db not in dbs_to_close:
+                        dbs_to_close.append(store._db)
+            for holder in (self, getattr(self, "session_store", None)):
+                db = getattr(holder, "_db", None) if holder else None
+                if db and db not in dbs_to_close:
+                    dbs_to_close.append(db)
+            
+            for _db in dbs_to_close:
                 if _db is None or not hasattr(_db, "close"):
                     continue
                 try:
@@ -9645,7 +9721,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _run_generation = self._begin_session_run_generation(_quick_key)
 
         try:
-            _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            routed = self._routed_profile_for_source(source)
+            if routed is not None:
+                profile_home = self._resolve_profile_home_for_source(source)
+                with _profile_runtime_scope(profile_home):
+                    _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            else:
+                _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             if getattr(event, "_moa_disable_after_turn", False):
                 try:
                     _restore = getattr(event, "_moa_restore_override", None)
@@ -12633,6 +12715,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         media_types: Optional[List[str]] = None,
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
+        routed = self._routed_profile_for_source(source)
+        if routed is not None:
+            profile_home = self._resolve_profile_home_for_source(source)
+            with _profile_runtime_scope(profile_home):
+                return await self._run_background_task_inner(
+                    prompt, source, task_id, event_message_id, media_urls, media_types
+                )
+        else:
+            return await self._run_background_task_inner(
+                prompt, source, task_id, event_message_id, media_urls, media_types
+            )
+
+    async def _run_background_task_inner(
+        self,
+        prompt: str,
+        source: "SessionSource",
+        task_id: str,
+        event_message_id: Optional[str] = None,
+        media_urls: Optional[List[str]] = None,
+        media_types: Optional[List[str]] = None,
+    ) -> None:
+        """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
 
         media_urls = media_urls or []
@@ -15040,6 +15144,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _api_key = str(runtime.get("api_key", "") or "")
         _api_key_fingerprint = hashlib.sha256(_api_key.encode()).hexdigest() if _api_key else ""
 
+        # Fingerprint the active SOUL.md to bust the cache when it is edited.
+        from hermes_constants import get_hermes_home
+        _soul_path = get_hermes_home() / "SOUL.md"
+        _soul_fingerprint = ""
+        if _soul_path.exists():
+            try:
+                _stat = _soul_path.stat()
+                _soul_fingerprint = f"{_stat.st_mtime}:{_stat.st_size}"
+            except Exception:
+                pass
+
         _cache_keys_sorted = sorted((cache_keys or {}).items())
 
         blob = _j.dumps(
@@ -15050,12 +15165,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 runtime.get("provider", ""),
                 runtime.get("api_mode", ""),
                 sorted(enabled_toolsets) if enabled_toolsets else [],
-                # reasoning_config excluded — it's set per-message on the
-                # cached agent and doesn't affect system prompt or tools.
                 ephemeral_prompt or "",
                 _cache_keys_sorted,
                 str(user_id or ""),
                 str(user_id_alt or ""),
+                _soul_fingerprint,
             ],
             sort_keys=True,
             default=str,
@@ -15915,7 +16029,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+        routed = self._routed_profile_for_source(source)
+        multiplex = getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        if not multiplex and routed is None:
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
