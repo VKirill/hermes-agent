@@ -21,6 +21,7 @@ def clean_hermes_home(tmp_path, monkeypatch):
     for name in ("profileA", "profileB"):
         pdir = profiles_dir / name
         pdir.mkdir()
+        (pdir / "home").mkdir()
         (pdir / "SOUL.md").write_text(f"I am {name}", encoding="utf-8")
         (pdir / "memories").mkdir()
         (pdir / "sessions").mkdir()
@@ -144,3 +145,73 @@ def test_soul_cache_busting(clean_hermes_home):
     )
     
     assert sig1 != sig2
+
+def test_tilde_expansion_isolated(clean_hermes_home):
+    """Verify that tilde (~) expansion resolves to profile-specific home inside routing scope."""
+    from gateway.run import _profile_runtime_scope
+    from tools.file_tools import _expand_tilde
+    import concurrent.futures
+    from contextvars import copy_context
+
+    profile_home = clean_hermes_home / "profiles" / "profileA"
+    
+    # Setup the config/home mode to enable profile home mode
+    monkeypatch_env = os.environ.copy()
+    monkeypatch_env["TERMINAL_HOME_MODE"] = "profile"
+    
+    with patch.dict(os.environ, monkeypatch_env):
+        with _profile_runtime_scope(profile_home):
+            # Directly inside scope:
+            assert _expand_tilde("~/SOUL.md") == str(profile_home / "home" / "SOUL.md")
+            
+            # Inside ThreadPoolExecutor worker thread (simulates tool execution thread):
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            ctx = copy_context()
+            res = pool.submit(ctx.run, lambda: _expand_tilde("~/SOUL.md")).result()
+            assert res == str(profile_home / "home" / "SOUL.md")
+            pool.shutdown()
+
+
+def test_topic_workspace_override_isolated(clean_hermes_home):
+    """Verify that topic-specific workspace override changes HOME, CWD, and tilde expansion."""
+    import json
+    from gateway.run import GatewayRunner, _topic_runtime_scope
+    from gateway.session import SessionSource
+    from gateway.config import Platform, GatewayConfig
+    from hermes_constants import get_subprocess_home, get_terminal_cwd
+    from tools.file_tools import _expand_tilde
+    from tools.code_execution_tool import _resolve_child_cwd
+
+    runner = GatewayRunner(config=GatewayConfig(platforms={}))
+    runner._normalize_source_for_session_key = lambda src: src
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="111",
+        chat_type="dm",
+        thread_id="workspace_topic",
+    )
+
+    custom_workspace = clean_hermes_home / "custom_workspace"
+    custom_workspace.mkdir()
+
+    # Write mapping to topic_workspaces.json
+    topic_workspaces = {
+        "telegram:dm:111:workspace_topic": str(custom_workspace),
+    }
+    with open(clean_hermes_home / "topic_workspaces.json", "w", encoding="utf-8") as f:
+        json.dump(topic_workspaces, f)
+
+    # 1. Verify resolution
+    resolved_path = runner._resolve_topic_workspace_for_source(source)
+    assert resolved_path == str(custom_workspace)
+
+    # 2. Enter scope and verify isolation
+    with _topic_runtime_scope(resolved_path):
+        assert get_subprocess_home() == str(custom_workspace)
+        assert get_terminal_cwd() == str(custom_workspace)
+        assert _expand_tilde("~/SOUL.md") == str(custom_workspace / "SOUL.md")
+        
+        # Verify code execution tool CWD resolves to the topic custom workspace
+        assert _resolve_child_cwd("project", "/staging") == str(custom_workspace)
+

@@ -144,7 +144,8 @@ def _configured_terminal_cwd() -> str | None:
     relative to, which is exactly the ambiguity that misroutes worktree edits.
     Only an absolute, sentinel-free value is honored.
     """
-    return _sentinel_free_abs_cwd(os.environ.get("TERMINAL_CWD"))
+    from hermes_constants import get_terminal_cwd
+    return _sentinel_free_abs_cwd(get_terminal_cwd())
 
 
 def _registered_task_cwd_override(task_id: str = "default") -> str | None:
@@ -433,6 +434,11 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     )
     for prefix in _SENSITIVE_PATH_PREFIXES:
         if resolved.startswith(prefix) or normalized.startswith(prefix):
+            if prefix == "/private/var/":
+                if resolved.startswith("/private/var/folders/") or resolved.startswith("/private/var/tmp/"):
+                    continue
+                if normalized.startswith("/private/var/folders/") or normalized.startswith("/private/var/tmp/"):
+                    continue
             return _err
     if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
         return _err

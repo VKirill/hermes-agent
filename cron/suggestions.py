@@ -42,8 +42,12 @@ from utils import atomic_replace
 
 logger = logging.getLogger(__name__)
 
-CRON_DIR = get_hermes_home().resolve() / "cron"
-SUGGESTIONS_FILE = CRON_DIR / "suggestions.json"
+def __getattr__(name: str):
+    if name == "CRON_DIR":
+        return get_hermes_home().resolve() / "cron"
+    if name == "SUGGESTIONS_FILE":
+        return get_hermes_home().resolve() / "cron" / "suggestions.json"
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 # In-process lock protecting load->modify->save cycles (the background review
 # fork and the main agent can both write).

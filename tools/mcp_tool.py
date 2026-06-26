@@ -381,6 +381,16 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
             or key.startswith("XDG_")
         ):
             env[key] = value
+
+    try:
+        from hermes_constants import get_hermes_home_override, apply_subprocess_home_env
+        override = get_hermes_home_override()
+        if override:
+            env["HERMES_HOME"] = override
+        apply_subprocess_home_env(env)
+    except Exception:
+        pass
+
     if user_env:
         env.update(user_env)
     return env
@@ -1430,6 +1440,7 @@ class MCPServerTask:
         "_rpc_lock", "_pending_refresh_tasks",
         "_pending_call_context",
         "initialize_result", "_ping_unsupported",
+        "fingerprint",
     )
 
     def __init__(self, name: str):
@@ -2441,6 +2452,45 @@ class MCPServerTask:
 # Module-level state
 # ---------------------------------------------------------------------------
 
+def _get_mcp_config_fingerprint(server_name: str, config: dict) -> str:
+    import hashlib
+    cleaned = {k: v for k, v in config.items() if k not in ("enabled",)}
+    serialized = json.dumps(cleaned, sort_keys=True)
+    h = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return f"{server_name}:{h[:16]}"
+
+
+def _get_active_server(server_name: str) -> Optional[MCPServerTask]:
+    with _lock:
+        try:
+            cfg = _load_mcp_config().get(server_name)
+            if cfg:
+                fingerprint = _get_mcp_config_fingerprint(server_name, cfg)
+                srv = _servers.get(fingerprint)
+                if srv is not None:
+                    return srv
+        except Exception:
+            pass
+        srv = _servers.get(server_name)
+        if srv is not None:
+            return srv
+        prefix = f"{server_name}:"
+        for k, v in _servers.items():
+            if k.startswith(prefix):
+                return v
+        return None
+
+
+def _get_active_fingerprint(server_name: str) -> str:
+    try:
+        cfg = _load_mcp_config().get(server_name)
+        if cfg:
+            return _get_mcp_config_fingerprint(server_name, cfg)
+    except Exception:
+        pass
+    return server_name
+
+
 _servers: Dict[str, MCPServerTask] = {}
 _server_connecting: set[str] = set()
 _server_connect_errors: Dict[str, str] = {}
@@ -2614,8 +2664,7 @@ def _handle_auth_error_and_retry(
         recovered = False
 
     if recovered:
-        with _lock:
-            srv = _servers.get(server_name)
+        srv = _get_active_server(server_name)
         if srv is not None and hasattr(srv, "_reconnect_event"):
             loop = _mcp_loop
             if loop is not None and loop.is_running():
@@ -2762,8 +2811,7 @@ def _handle_session_expired_and_retry(
     if not _is_session_expired_error(exc):
         return None
 
-    with _lock:
-        srv = _servers.get(server_name)
+    srv = _get_active_server(server_name)
     if srv is None or not hasattr(srv, "_reconnect_event"):
         return None
 
@@ -3158,8 +3206,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # failure the error paths below bump the count again, which
         # re-stamps the open-time via _bump_server_error (re-arming
         # the cooldown).
-        if _server_error_counts.get(server_name, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
-            opened_at = _server_breaker_opened_at.get(server_name, 0.0)
+        active_fp = _get_active_fingerprint(server_name)
+        if _server_error_counts.get(active_fp, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
+            opened_at = _server_breaker_opened_at.get(active_fp, 0.0)
             age = time.monotonic() - opened_at
             if age < _CIRCUIT_BREAKER_COOLDOWN_SEC:
                 remaining = max(1, int(_CIRCUIT_BREAKER_COOLDOWN_SEC - age))
@@ -3174,10 +3223,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 }, ensure_ascii=False)
             # Cooldown elapsed → fall through as a half-open probe.
 
-        with _lock:
-            server = _servers.get(server_name)
+        server = _get_active_server(server_name)
         if not server or not server.session:
-            _bump_server_error(server_name)
+            _bump_server_error(active_fp)
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
             }, ensure_ascii=False)
@@ -3249,11 +3297,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             try:
                 parsed = json.loads(result)
                 if "error" in parsed:
-                    _bump_server_error(server_name)
+                    _bump_server_error(active_fp)
                 else:
-                    _reset_server_error(server_name)  # success — reset
+                    _reset_server_error(active_fp)  # success — reset
             except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+                _reset_server_error(active_fp)  # non-JSON = success
             return result
         except InterruptedError:
             return _interrupted_call_result()
@@ -3278,7 +3326,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             if recovered is not None:
                 return recovered
 
-            _bump_server_error(server_name)
+            _bump_server_error(active_fp)
             logger.error(
                 "MCP tool %s/%s call failed: %s",
                 server_name, tool_name, exc,
@@ -3356,8 +3404,7 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
     def _handler(args: dict, **kwargs) -> str:
         from tools.registry import tool_error
 
-        with _lock:
-            server = _servers.get(server_name)
+        server = _get_active_server(server_name)
         if not server or not server.session:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
@@ -3414,8 +3461,7 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists prompts from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
-        with _lock:
-            server = _servers.get(server_name)
+        server = _get_active_server(server_name)
         if not server or not server.session:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
@@ -3479,8 +3525,7 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     def _handler(args: dict, **kwargs) -> str:
         from tools.registry import tool_error
 
-        with _lock:
-            server = _servers.get(server_name)
+        server = _get_active_server(server_name)
         if not server or not server.session:
             return json.dumps({
                 "error": f"MCP server '{server_name}' is not connected"
@@ -3548,8 +3593,7 @@ def _make_check_fn(server_name: str):
     """Return a check function that verifies the MCP connection is alive."""
 
     def _check() -> bool:
-        with _lock:
-            server = _servers.get(server_name)
+        server = _get_active_server(server_name)
         return server is not None and server.session is not None
 
     return _check
@@ -3898,7 +3942,11 @@ def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dic
 def _existing_tool_names() -> List[str]:
     """Return tool names for all currently connected servers."""
     names: List[str] = []
+    seen_servers = set()
     for _sname, server in _servers.items():
+        if server in seen_servers:
+            continue
+        seen_servers.add(server)
         if hasattr(server, "_registered_tool_names"):
             names.extend(server._registered_tool_names)
             continue
@@ -4023,14 +4071,17 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
 
     Returns list of registered tool names.
     """
+    fingerprint = _get_mcp_config_fingerprint(name, config)
     connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
     server = await asyncio.wait_for(
         _connect_server(name, config),
         timeout=connect_timeout,
     )
+    server.fingerprint = fingerprint
     with _lock:
-        _server_connecting.discard(name)
-        _server_connect_errors.pop(name, None)
+        _server_connecting.discard(fingerprint)
+        _server_connect_errors.pop(fingerprint, None)
+        _servers[fingerprint] = server
         _servers[name] = server
 
     registered_names = _register_server_tools(name, server, config)
@@ -4073,13 +4124,18 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     # Only attempt servers that aren't already connected and are enabled
     # (enabled: false skips the server entirely without removing its config)
     with _lock:
-        new_servers = {
-            k: v
-            for k, v in servers.items()
-            if k not in _servers and _parse_boolish(v.get("enabled", True), default=True)
-        }
-        _server_connecting.update(new_servers)
-        for srv_name in new_servers:
+        new_servers = {}
+        for k, v in servers.items():
+            if not _parse_boolish(v.get("enabled", True), default=True):
+                continue
+            fp = _get_mcp_config_fingerprint(k, v)
+            if fp not in _servers:
+                new_servers[fp] = (k, v)
+        _server_connecting.update(new_servers.keys())
+        for fp in new_servers:
+            _server_connect_errors.pop(fp, None)
+            # Remove from errors using server name as fallback
+            srv_name = fp.split(":")[0]
             _server_connect_errors.pop(srv_name, None)
         # Track which servers opt-in to parallel tool calls (idempotent).
         for srv_name, srv_cfg in servers.items():
@@ -4094,24 +4150,26 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     # Start the background event loop for MCP connections
     _ensure_mcp_loop()
 
-    async def _discover_one(name: str, cfg: dict) -> List[str]:
+    async def _discover_one(fp: str, name: str, cfg: dict) -> List[str]:
         """Connect to a single server and return its registered tool names."""
+        # Avoid passing fingerprint as keyword argument to match original signature of _discover_and_register_server
         return await _discover_and_register_server(name, cfg)
 
     async def _discover_all():
-        server_names = list(new_servers.keys())
+        fps = list(new_servers.keys())
         # Connect to all servers in PARALLEL
         results = await asyncio.gather(
-            *(_discover_one(name, cfg) for name, cfg in new_servers.items()),
+            *(_discover_one(fp, name, cfg) for fp, (name, cfg) in new_servers.items()),
             return_exceptions=True,
         )
-        for name, result in zip(server_names, results):
+        for fp, result in zip(fps, results):
+            name, cfg = new_servers[fp]
             if isinstance(result, BaseException):
-                command = new_servers.get(name, {}).get("command")
+                command = cfg.get("command")
                 message = _format_connect_error(result)
                 with _lock:
-                    _server_connecting.discard(name)
-                    _server_connect_errors[name] = message
+                    _server_connecting.discard(fp)
+                    _server_connect_errors[fp] = message
                 logger.warning(
                     "Failed to connect to MCP server '%s'%s: %s",
                     name,
@@ -4120,8 +4178,8 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 )
             else:
                 with _lock:
-                    _server_connecting.discard(name)
-                    _server_connect_errors.pop(name, None)
+                    _server_connecting.discard(fp)
+                    _server_connect_errors.pop(fp, None)
 
     # Per-server timeouts are handled inside _discover_and_register_server.
     # The outer timeout is generous: 120s total for parallel discovery.
@@ -4141,10 +4199,17 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
 
     # Log a summary so ACP callers get visibility into what was registered.
     with _lock:
-        connected = [n for n in new_servers if n in _servers]
+        connected = []
+        for fp in new_servers:
+            if fp in _servers:
+                connected.append(fp)
+            else:
+                srv_name = fp.split(":")[0]
+                if srv_name in _servers:
+                    connected.append(srv_name)
         new_tool_count = sum(
-            len(getattr(_servers[n], "_registered_tool_names", []))
-            for n in connected
+            len(getattr(_servers[key], "_registered_tool_names", []))
+            for key in connected
         )
     failed = len(new_servers) - len(connected)
     if new_tool_count or failed:
@@ -4178,26 +4243,36 @@ def discover_mcp_tools() -> List[str]:
         return []
 
     with _lock:
-        new_server_names = [
-            name
-            for name, cfg in servers.items()
-            if name not in _servers and _parse_boolish(cfg.get("enabled", True), default=True)
-        ]
+        new_server_names = []
+        for name, cfg in servers.items():
+            if not _parse_boolish(cfg.get("enabled", True), default=True):
+                continue
+            fp = _get_mcp_config_fingerprint(name, cfg)
+            if fp not in _servers:
+                new_server_names.append(name)
 
     tool_names = register_mcp_servers(servers)
     if not new_server_names:
         return tool_names
 
     with _lock:
-        connected_server_names = [name for name in new_server_names if name in _servers]
+        connected_server_keys = []
+        for name in new_server_names:
+            cfg = servers.get(name)
+            if cfg:
+                fp = _get_mcp_config_fingerprint(name, cfg)
+                if fp in _servers:
+                    connected_server_keys.append(fp)
+                elif name in _servers:
+                    connected_server_keys.append(name)
         new_tool_count = sum(
-            len(getattr(_servers[name], "_registered_tool_names", []))
-            for name in connected_server_names
+            len(getattr(_servers[key], "_registered_tool_names", []))
+            for key in connected_server_keys
         )
 
-    failed_count = len(new_server_names) - len(connected_server_names)
+    failed_count = len(new_server_names) - len(connected_server_keys)
     if new_tool_count or failed_count:
-        summary = f"  MCP: {new_tool_count} tool(s) from {len(connected_server_names)} server(s)"
+        summary = f"  MCP: {new_tool_count} tool(s) from {len(connected_server_keys)} server(s)"
         if failed_count:
             summary += f" ({failed_count} failed)"
         logger.info(summary)
@@ -4246,7 +4321,8 @@ def get_mcp_status() -> List[dict]:
     for name, cfg in configured.items():
         transport = cfg.get("transport", "http") if "url" in cfg else "stdio"
         enabled = _parse_boolish(cfg.get("enabled", True), default=True)
-        server = active_servers.get(name)
+        fp = _get_mcp_config_fingerprint(name, cfg)
+        server = active_servers.get(fp)
         if server and server.session is not None:
             entry = {
                 "name": name,
@@ -4271,7 +4347,7 @@ def get_mcp_status() -> List[dict]:
                 "disabled": True,
                 "status": "disabled",
             })
-        elif name in connecting:
+        elif fp in connecting or name in connecting:
             result.append({
                 "name": name,
                 "transport": transport,
@@ -4280,7 +4356,7 @@ def get_mcp_status() -> List[dict]:
                 "disabled": False,
                 "status": "connecting",
             })
-        elif name in connect_errors:
+        elif fp in connect_errors or name in connect_errors:
             result.append({
                 "name": name,
                 "transport": transport,
@@ -4288,7 +4364,7 @@ def get_mcp_status() -> List[dict]:
                 "connected": False,
                 "disabled": False,
                 "status": "failed",
-                "error": connect_errors[name],
+                "error": connect_errors.get(fp) or connect_errors.get(name),
             })
         else:
             result.append({

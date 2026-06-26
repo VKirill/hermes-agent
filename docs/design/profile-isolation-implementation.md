@@ -46,6 +46,182 @@
 
 ---
 
+## 0A. Рабочий процесс (RUNBOOK) — выполнять строго по порядку
+
+Меташаги вокруг фаз. Цель: не сломать работающий гейтвей, минимизировать
+конфликты, выйти на чистый PR. **Сначала Шаги 1–4, только потом код (Раздел 3).**
+
+> ## ✅ ОКРУЖЕНИЕ УЖЕ ПОДГОТОВЛЕНО (2026-06-26) — Шаги 1–4 ВЫПОЛНЕНЫ
+> - worktree **`~/hermes-isolation-dev`** на ветке **`profile-isolation`** создан;
+> - в него влит свежий `origin/main` (43 коммита, **0 конфликтов**) → HEAD `1bba2a57b`
+>   (= вся работа `topic-model-binding` + соседа + последний апстрим);
+> - **baseline зелёный:** `tests/gateway/test_telegram_topic_mode.py` — 50 passed;
+> - этот план лежит в `~/hermes-isolation-dev/docs/design/profile-isolation-implementation.md`.
+>
+> **Отдельный venv НЕ нужен** — тесты гонять основным venv + PYTHONPATH worktree:
+> ```bash
+> PYTHONPATH=~/hermes-isolation-dev ~/.hermes/hermes-agent/venv/bin/python \
+>   -m pytest ~/hermes-isolation-dev/tests/<...> -q -o 'addopts=' -p no:cacheprovider
+> ```
+> **РЕАЛИЗУЮЩЕМУ АГЕНТУ:** работай в `~/hermes-isolation-dev`, **начинай сразу с
+> Фазы 0/1 (Раздел 3)**, Шаги 2–4 уже сделаны. Шаги 5–8 (выкат в живой гейтвей,
+> сборка PR) — после реализации. Файл-спек `docs/design/...` — рабочая копия,
+> **в feature-коммиты её НЕ добавляй** (в PR не идёт).
+
+### Шаг 1 — зафиксировать стартовую точку и запреты
+
+- Ветка `topic-model-binding`, форк `myfork` = `VKirill/hermes-agent`,
+  апстрим `origin/main` ушёл **всего на ~5 коммитов** (merge-base свежий) —
+  по содержанию мы практически на последнем Hermes, «снимать с нуля» НЕ нужно.
+- ⛔ **НЕ делать** `hermes update`, `git reset --hard origin/main`,
+  `git rebase origin/main`. Первые два сотрут работу; rebase попытается
+  переиграть ~6342 коммита (история форка переписана). **Обновляемся ТОЛЬКО
+  через `git merge`.**
+- ⛔ **Не писать код в живом чекауте** `~/.hermes/hermes-agent` — из него крутится
+  LaunchAgent `ai.hermes.gateway` (работающий бот).
+
+### Шаг 2 — отдельный worktree для разработки
+
+```bash
+cd ~/.hermes/hermes-agent
+git worktree add ~/hermes-isolation-dev -b profile-isolation topic-model-binding
+cd ~/hermes-isolation-dev
+```
+- Живой гейтвей продолжает работать из основного чекаута (`topic-model-binding`),
+  его файлы не трогаются. Разработка — на новой ветке `profile-isolation`.
+- **venv-нюанс:** editable-install (`pip install -e .`) привязан к ОСНОВНОМУ
+  чекауту, поэтому код worktree им не подхватится. Для прогона тестов worktree
+  собрать свой venv:
+  ```bash
+  python3 -m venv .venv && .venv/bin/pip install -e . -q
+  ```
+  Дальше во всех командах `python` = `~/hermes-isolation-dev/.venv/bin/python`.
+
+### Шаг 3 — подтянуть свежий апстрим ДО кода (merge, не rebase)
+
+```bash
+git fetch origin
+git merge origin/main          # абсорбируем ~5 апстрим-коммитов
+```
+- Разрешить конфликты в core **один раз сейчас** (пока изоляции ещё нет — поверхность
+  минимальна). Ожидаемые файлы: `gateway/run.py`, `gateway/session.py`,
+  `hermes_cli/runtime_provider.py`, `hermes_state.py`, `tools/file_tools.py`,
+  `tools/terminal_tool.py`.
+- Правило разрешения (от автора #18510, Раздел 6.1): routed-поток использует
+  **профильный** `SessionStore`/`SessionDB`; сохранить `_resolve_safe_cwd` +
+  профильную метадату процесса.
+
+### Шаг 4 — зелёный baseline ДО изменений
+
+```bash
+python -m pytest tests/gateway/test_telegram_topic_mode.py -q -o 'addopts='
+```
+Убедиться, что после мёрджа всё зелёное — это точка отсчёта.
+
+### Шаг 5 — реализация по фазам (Раздел 3). Цикл на КАЖДУЮ фазу:
+
+1. снять донорские диффы нужных файлов (Раздел 4, команды `gh api`);
+2. реализовать фазу;
+3. написать/прогнать тесты фазы (Раздел 7), `python -m pytest ... -q -o 'addopts='`;
+4. коммит — Conventional Commits, по одной фазе/подзадаче;
+5. **E2E-проверка фазы:** в ОСНОВНОМ чекауте `git merge profile-isolation` в
+   `topic-model-binding`, затем `launchctl kickstart -k gui/$(id -u)/ai.hermes.gateway`,
+   прогнать ручной smoke (Раздел 7). После проверки можно продолжать в worktree.
+- **Порядок строго: 0 → 1 → 2 → 3 → 4 → 5 → 6.** После Фаз 1 и 2 — обязательный
+  ручной smoke (самые рисковые: session/DB-изоляция и запись файлов в чужой SOUL).
+
+### Шаг 6 — ВЫКАТИТЬ наработки в ЖИВОЙ гейтвей (чтобы заработало у нас)
+
+> Это «место назначения №1» — твой работающий бот. Отдельно и независимо от
+> upstream-PR (Шаги 7–8). Когда фаза(ы) готовы и прошли smoke, переносим их в
+> ветку, с которой крутится LaunchAgent:
+
+```bash
+cd ~/.hermes/hermes-agent          # живой чекаут, ветка topic-model-binding
+git merge profile-isolation        # вносим свежий апстрим + изоляцию в живую ветку
+venv/bin/pip install -e . -q       # подхватить новые зависимости/энтрипоинты из апстрим-мёрджа
+launchctl kickstart -k gui/$(id -u)/ai.hermes.gateway   # рестарт → код стал живым
+```
+- editable-install ⇒ гейтвей исполняет код прямо из рабочего дерева; после рестарта
+  новый код активен, переустановка пакета не нужна (но после крупного апстрим-мёрджа
+  разок прогнать `pip install -e .` — апстрим добавил модули `moa`/`projects`).
+- Делать **итеративно** (после каждой проверенной фазы) или **одним заходом в конце**.
+  Рекомендация: первый выкат — после того как Фазы 1 и 2 прошли smoke.
+- Откат: `git reset --hard ORIG_HEAD` (вернуть ветку до мёрджа) + рестарт.
+
+### Шаг 7 — собрать ЧИСТУЮ ветку под PR (upstream, опционально)
+
+> «Место назначения №2» — апстрим NousResearch. На живого бота не влияет.
+
+```bash
+cd ~/.hermes/hermes-agent           # или любой отдельный клон
+git fetch origin
+git switch -c profile-isolation-pr origin/main
+# перенести ТОЛЬКО относящиеся к фиче коммиты (foundation /profile + изоляция),
+# исключив посторонние (clarify-модалки, discord, рус.переводы, /commands pagination):
+git cherry-pick <foundation...> <isolation...>
+```
+- ⚠ cherry-pick на чистый `origin/main` даст конфликты (origin/main ушёл вперёд) —
+  разрешать по правилам раздела 6.1. Прогнать полный таргетный pytest.
+- **Альтернатива (часто чище): не cherry-pick'ать грязную историю, а переписать
+  foundation+изоляцию свежими коммитами** прямо на `profile-isolation-pr` — особенно
+  если конфликтов много.
+
+### Шаг 7a — INCLUDE / EXCLUDE чек-лист коммитов (снимок на `3dc9cb356`, 2026-06-26)
+
+> ⚠ Ветку активно двигает сосед-агент — **SHA сместятся**. Перед сборкой PR ПЕРЕСНЯТЬ
+> список: `git log --oneline --no-merges origin/main..topic-model-binding`.
+> Правило: **INCLUDE** только «per-topic profile routing + model binding + изоляция»;
+> **EXCLUDE** всё, у чего есть свой апстрим-PR, и весь поток соседа-агента.
+
+**✅ INCLUDE — наша фича (foundation), cherry-pick в хронологическом порядке (снизу вверх):**
+- `54deaf089` feat: topic-level model binding — ядро
+- `8b4bf618f` fix: same-token Telegram/Slack adapter conflicts in multiplexed profiles — нужен для мульти-профиля
+- `5f3eb50c7` Fix: topic-specific model overrides during `/new`
+- `2ddf82486` Feature: persistent topic-scoped profile binding via `/profile` ← **ГЛАВНЫЙ**
+- `+` все наши коммиты изоляции из Шага 5 (Фазы 1–6)
+
+**🟡 CONDITIONAL — включать ТОЛЬКО если без них foundation не собирается/не работает:**
+- `22f8b6979` fix: `Platform.LOCAL` comparison (мелкий фикс)
+- `e37958ed5` fix: keep responses in originating thread (роутинг тредов)
+- per-platform model override стек: `4ee2c7d68`, `559d17b22`, `eb1af3a1e`,
+  `322e5ae7b`, `1a8b8b49c` — это **апстрим-PR #52515**; по умолчанию EXCLUDE (уедет
+  своим PR), но `/profile`-model-binding может на него опираться → проверить сборку,
+  при необходимости INCLUDE как зависимость и упомянуть #52515 в описании.
+
+**❌ EXCLUDE — свои апстрим-PR / постороннее / работа соседа-агента:**
+- clarify-стек (#49154): `03e5fe107`, `7a98d52e2`, `9f93d7e55`, `386457f99`, `3537584ab`
+- `5c9cd1158` delete-on-undo (#48401) · `314172a4c` `/commands` pagination (#48289)
+- `f88a67b63` channel_cwds (#43562) · `a53483c3f` MarkdownV2 truncate guard (#52096)
+- `b291d82e2` + `f5997c28d` русские переводы и тест-фиксы под них
+- `6b0956cd2` reaction emojis + voice echo (#49571/#50867)
+- поток соседа: `f8286f1fd` busy-input/stop-phrase · `fb4ddfad7` suggestion buttons (#51858)
+  · `37bc20f18` auth-sync (#52300) · `b8150075b` skill_route (#52247)
+  · `7c8d14502`+`4f799659e` checklist (#31106) · `143e36946` auto-name sessions
+  · `8fe735058` session-title mixin · `e61630ef6` zero-inbox (#23102)
+  · `734928a4c`+`9662a52c2`+`d38714772`+`3dc9cb356` topic icons + скриншот/фиксы
+
+> ⚠ Заметь: `4f799659e` — это коммит соседа, в который случайно попал наш план-док;
+> в PR он не идёт (EXCLUDE), а из истории `topic-model-binding` его почистим отдельно.
+
+**Проверка после cherry-pick:** `git log --oneline origin/main..profile-isolation-pr`
+должен содержать ТОЛЬКО INCLUDE-коммиты + наши изоляционные. Ни одного из EXCLUDE.
+
+### Шаг 8 — открыть PR
+
+```bash
+git push myfork profile-isolation-pr
+gh pr create --repo NousResearch/hermes-agent --base main \
+  --head VKirill:profile-isolation-pr \
+  --title "feat(telegram): full profile isolation for per-topic /profile routing" \
+  --body-file <(printf '...')   # тело: ссылка на #18510 как источник фичи/граблей,
+                                #  изоляция по слоям (Раздел 2.1), решение по кредам
+```
+- CI на fork-PR требует одобрения мейнтейнера (Раздел 6).
+- Перед открытием — пройтись по чек-листу Раздела 8.
+
+---
+
 ## 1. Главный вывд: машинерия изоляции УЖЕ написана, но заперта за `multiplex_profiles`
 
 Вся тяжёлая инфраструктура изоляции существует в коде ради multiplex-режима и
@@ -119,6 +295,36 @@ def _session_key_for_source(self, source):
 (исполнение тулзов, подпроцессы, import-time пути) — их upstream-PR уже нашёл и
 описал (см. раздел «Грабли»).
 
+### 1.4. Альтернативная стратегия изоляции из PR #20096 — и наш ГИБРИД
+
+PR #20096 («channel-based profile routing», донор, см. 4A) изолирует **иначе**:
+не через ContextVar home-override, а через **явный проброс `profile_name`** как
+параметра через `run.py → agent → memory_tool/system_prompt/skill_utils`. Каждый
+путь резолвит сам:
+```python
+# tools/memory_tool.py (из #20096)
+def get_memory_dir(profile_name="main") -> Path:
+    if not is_standard_profile(profile_name):
+        return get_hermes_home() / "profiles" / profile_name / "memories"
+    return get_hermes_home() / "memories"
+def get_soul_path(profile_name="main") -> Path: ...
+class MemoryStore:
+    def __init__(self, ..., profile_name="main"): self.profile_name = profile_name
+```
+**Плюс:** контекствара нет → терять нечего → **грабля G2 (запись в чужой SOUL) в
+принципе не возникает** на этих путях. **Минус:** больше «проводки» (profile_name
+параметром через ~10 файлов).
+
+**Наш выбор — ГИБРИД (best of both):**
+- ContextVar `_profile_runtime_scope` — для широкого охвата (config, sessions,
+  secret-scope) — Фаза 1, малый дифф.
+- **Явный `profile_name` (паттерн #20096)** — для путей, где ContextVar теряется и
+  цена ошибки максимальна: **память, SOUL, file-write тулзы** — Фазы 1/2. Надёжнее,
+  чем чинить пропагацию ContextVar по всем executor-путям.
+
+Итог: Фаза 2 перестаёт быть «почини ContextVar везде» и становится «протащи
+`profile_name` в файло-пишущие тулзы» — меньше риска, понятный дифф.
+
 ---
 
 ## 2. Целевой scope изоляции (что должно быть на профиль)
@@ -169,7 +375,8 @@ def _session_key_for_source(self, source):
 | 12 | Title generation | 4 | под scope |
 | 13 | Fail-closed strict auth | 4 | нет тихого фолбэка на main |
 | 14 | Исполнение тулзов (write_file/patch/terminal/code) | 2 | 🔴 главная грабля |
-| 15 | Подпроцессы env (+ **MCP**) | 2 | профильный env, не `os.environ` |
+| 15 | Подпроцессы env (+ **MCP** spawn) | 2 | профильный env, не `os.environ` |
+| 15a | **MCP-серверы профиля** (реестр соединений + видимость тулзов) | 3 | ✅ конфиг профиле-зависим + home/env проброшены; 🔴 `_servers` глобален по имени → ре-кей по **фингерпринту конфига** (дедуп идентичных, изоляция разных) + per-profile visibility — ОБЯЗАТЕЛЬНО (одноимённые серверы = норма) |
 | 16 | Skills / toolsets | 3 | динамический резолв, не import-time |
 | 17 | `/reload-mcp`, `/reload-skills` | 3 | против профильного home |
 | 18 | Process registry / background scoping | 5 | metadata несёт профиль |
@@ -184,7 +391,7 @@ def _session_key_for_source(self, source):
 | Грабля | Источник | Фаза | Как закрывается |
 |---|---|---|---|
 | G1: агент-кэш не бьётся на правку `SOUL.md` | 5.1.1 | 1 | раздельный session_key + identity-digest в сигнатуре кэша |
-| G2: ContextVar не долетает до исполнения тулзов → запись в чужой SOUL | 5.1.2 / 5.4.3 | 2 | явный проброс home/env во все пути тулзов и подпроцессов |
+| G2: ContextVar не долетает до исполнения тулзов → запись в чужой SOUL | 5.1.2 / 5.4.3 | 2 | **явный `profile_name` (паттерн #20096)** для памяти/SOUL/file-тулзов — корень, а не симптом; subprocess-**env** из #18510 |
 | G3: конфиг должен быть «минимальным», `agent.system_prompt` → фолбэк на main | 5.1.3 | 1 | проверка (е): полный декларативный конфиг работает |
 | G4: skills-leak через import-time `SKILLS_DIR` | 5.3 | 3 | динамический резолв home |
 | G5: background process — утечка `session_id` между профилями | 5.2 | 5 | profile identity в metadata процесса |
@@ -320,6 +527,13 @@ def _routed_profile_for_source(self, source) -> Optional[str]:
    `run.py:9468` или в общем пути перед `:6681`/`:16314`), а не только вокруг
    `_run_agent_inner`. Проверить ВСЕ сайты сборки `AIAgent`, ведущие к routed-сессии.
 
+6. **Память/SOUL — взять explicit-`profile_name` из #20096 (надёжнее ContextVar).**
+   Лифтнуть `get_memory_dir(profile_name)`, `get_soul_path(profile_name)`,
+   `is_standard_profile` (доноры: `tools/memory_tool.py`, `hermes_constants.py` из
+   #20096) и пробросить `profile_name` в `MemoryStore(...)`. Тогда память/SOUL
+   изолируются явным параметром и не зависят от того, долетел ли ContextVar (см. 1.4).
+   Тест-донор: `tests/gateway/test_profile_memory.py` (#20096).
+
 **Тесты Фазы 1 (написать):** привязать топик A→profileA, B→profileB; проверить
 что (а) `MEMORY.md` пишется в `profiles/<n>/memories/`, (б) session_key различен,
 (в) SOUL разный, (г) непривязанный топик пишет в глобальный home (zero-regression),
@@ -349,6 +563,12 @@ def _routed_profile_for_source(self, source) -> Optional[str]:
   `tools/mcp_tool.py:2943` уже умеет `set_hermes_home_override(home_override)` —
   убедиться, что для routed-сессии туда приходит профильный home, а env spawn'а
   берётся из secret-scope, а не из `os.environ`.
+- **Предпочтительный путь для файлов (из #20096): явный `profile_name`, а не починка
+  ContextVar.** Для file-write тулзов протащить профильный home/`profile_name`
+  параметром (как `get_memory_dir(profile_name)`/`get_soul_path(profile_name)`) —
+  тогда даже если ContextVar потерян в executor-треде, путь резолвится правильно.
+  Это снимает КОРЕНЬ G2, а не лечит симптом. Доноры #18510 (process_registry/
+  terminal/file_tools) использовать для subprocess-**env**; для путей файлов — паттерн #20096.
 - Эталонный тест-донор: `tests/test_subprocess_home_isolation.py` (572 строки).
 
 **Проверка приёмки Фазы 2:** в привязанном топике попросить агента
@@ -378,6 +598,68 @@ session_key. Проверить, что из привязанного топик
 объявить свои `toolsets`/`mcp_servers` в собственном `config.yaml`. Бридж
 gateway-тулзов — отдельная opt-in фича с security-ревью (НЕ в этом PR).
 
+**🔴 MCP-изоляция — отдельный сложный подпункт (проверено по коду).**
+Чтобы у каждого профиля были СВОИ индивидуальные MCP-серверы — мало объявить их в
+профильном `config.yaml`. Состояние кода:
+- ✅ **Источник конфига профиле-зависим:** `_load_mcp_config()` (`mcp_tool.py:3080`)
+  и `_enabled_mcp_servers(config)` (`agent/coding_context.py:566`) читают `mcp_servers`
+  через `load_config()`/`read_raw_config()` → под home-override это **профильный**
+  config. (Проверить, что `read_raw_config` уважает override.)
+- ✅ **Home/env в MCP-loop пробрасывается:** `_wrap_with_home_override()`
+  (`mcp_tool.py:2921`) переносит home-override в корутины общего MCP-loop; env запуска
+  собирается профильно (`_build_safe_env` + secret-scope), не из `os.environ`.
+- 🔴 **ГЛАВНАЯ ДЫРА — реестр соединений ГЛОБАЛЬНЫЙ по имени:**
+  `_servers: Dict[str, MCPServerTask]` (`mcp_tool.py:2444`) + `_server_connect_errors`
+  (`:2446`) + `_server_error_counts` (`:2465`) ключуются **только по `server_name`**,
+  на один процесс-глобальный MCP-loop. → Два профиля с **одноимённым** сервером
+  (оба `github`, разные токены) **коллизируют/делят одно соединение**.
+- 🔴 **Глобальный tool-registry:** MCP-тулзы регистрируются в общий `tools.registry`
+  по имени тула (`_register_server_tools`, `:1615/2406`) + глобальная карта
+  tool→server (`:4383`). Видимость на профиль держит профильный toolset
+  (`_enabled_mcp_servers` под home-override) — но сам реестр общий.
+
+**Что делать (новая работа — прямых доноров нет):**
+1. **Ключевать `_servers` (и error-карты) по ФИНГЕРПРИНТУ конфига**, а не по голому
+   имени. Фингерпринт = хэш разрешённого конфига сервера (command/args/env/url/
+   headers ПОСЛЕ интерполяции `${ENV}` в скоупе профиля). Тогда:
+   - одинаковое имя + ИДЕНТИЧНЫЙ конфиг у профилей → один фингерпринт → **одно общее
+     соединение** (эффективно — для общих серверов как `repowise`/`gitnexus`);
+   - одинаковое имя + РАЗНЫЙ конфиг (разные токены через профильные `.env`) → разные
+     фингерпринты → **раздельные соединения** (изоляция, как `github` work/personal).
+   Решает оба кейса автоматически. (Проще, но расточительнее: ключ `(profile, name)` —
+   плодит дубль-соединения даже для идентичных серверов.)
+2. **Гарантировать, что routed-агент видит/вызывает только MCP-тулзы своего профиля**
+   (фильтр по профильному toolset + неймспейс tool→server по фингерпринту/профилю,
+   чтобы одноимённые тулзы разных соединений не затирали друг друга в глобальном
+   `tools.registry`).
+3. `/reload-mcp` из топика — уже целимся на профильный home (см. выше).
+4. Фингерпринт/ключ удобно нести вместе с явным `profile_name` (паттерн #20096, 1.4).
+
+**Приёмка:** два профиля, у каждого MCP-сервер с **ОДИНАКОВЫМ именем** но разным
+токеном → каждый агент ходит в СВОЙ; списки тулзов на профиль не пересекаются.
+
+**Объём (пересмотрено):** одинаковые имена серверов у нескольких профилей —
+**НОРМА** (`github`/`gitnexus`/`repowise` на хосте, нужные 2–3 профилям). Текущий код
+из-за guard'а «имя уже в `_servers` → не переподключать» (`mcp_tool.py:4079/4184`)
+заставит профиль B молча использовать соединение/токен профиля A. Поэтому
+**фингерпринт-кеинг (пункт 1) ОБЯЗАТЕЛЕН**, не опция; visibility (пункт 2) тоже.
+Это работа сверх доноров #18510/#20096. Конфиг при этом простой: в `config.yaml`
+каждого профиля свой блок `mcp_servers` (имена могут совпадать).
+
+**Готовые рычаги конфига (используем как есть):** per-server флаг
+`mcp_servers.<name>.enabled: true|false`; `enabled_toolsets`/`disabled_toolsets`
+на профиль (`agent_init.py:179-180`); `mcp_servers.<name>.tools.include/exclude` —
+сузить набор тулзов сервера. Опц. enhancement (НЕ в MVP): наследование `mcp_servers`
+из главного конфига + per-profile allow-list, чтобы не дублировать определения.
+
+**Лёгкий режим топика + per-channel toolsets — донор PR #39169.** Для топиков,
+которым НЕ нужен полный профиль (одноразовый воркер): `channel_routes`-конфиг даёт
+**свежую сессию на сообщение**, **урезанный тулсет на канал** и **пропуск
+memory/context-файлов**. Доноры: `gateway/platforms/base.py` (+90),
+`gateway/run.py` (+148), `hermes_cli/config.py` (+8); тест
+`tests/gateway/test_channel_worker_routing.py`. Это комплемент к полному профилю:
+профиль = «специалист с памятью», channel_route = «stateless-воркер с парой тулзов».
+
 ### Фаза 4 — строгий auth, auxiliary client, provider/title/compression scoping
 
 Что делать (порт из #18510):
@@ -398,6 +680,10 @@ gateway-тулзов — отдельная opt-in фича с security-ревь
 должна резолвиться в изолированный профильный контекст (в #18510 это
 протестировано и работает). Сверься с уже имеющейся на ветке логикой
 topic-binding после `/new` (`slash_commands.py:269-277`).
+
+**Cron-ownership на профиль — донор PR #20096** (`cron/jobs.py`, +21): каждый
+профиль владеет своими cron-джобами, доставка резолвится в его контекст. Лифтнуть
+как образец привязки джоб к профилю.
 
 ### Фаза 6 — валидация и диагностика
 
@@ -448,6 +734,40 @@ gh api "repos/NousResearch/hermes-agent/pulls/18510/files" --paginate \
 > → профиль** оставляем наш (`_routed_profile_for_source` + стор). Не тащить
 > `topic_profiles`-конфиг и его валидацию из `base.py` как маршрутизатор —
 > только как образец canonicalize/symlink-guard для Фазы 6.
+
+### 4A. Дополнительные доноры — PR #20096 и #39169 (всплыли в issue #10143)
+
+**PR #20096 (`feat: channel-based profile routing`, @Burgunthy)** — 1541+/237−,
+24 файла, открыт, 0 ревью. Таргетит Discord, движок платформонезависим.
+**Иная стратегия изоляции — явный `profile_name` (см. 1.4).** Что брать:
+
+| Что | Файл-донор (#20096) | Куда |
+|---|---|---|
+| `get_memory_dir(profile_name)`, `get_soul_path`, `is_standard_profile`, `MemoryStore(profile_name=)` | `tools/memory_tool.py`, `hermes_constants.py` | Фаза 1 (память/SOUL) |
+| Движок `ProfileRoute`+specificity+forum-hierarchy | `gateway/profile_routing.py` (196) | референс (если захотим конфиг-роутинг рядом с `/profile`) |
+| `profile_name` passthrough через runner/agent | `gateway/run.py` (156/170), `agent/agent_init.py`, `agent/prompt_builder.py`, `agent/skill_utils.py` | Фаза 1/2 (явная изоляция) |
+| Cron-ownership на профиль | `cron/jobs.py` (+21) | Фаза 5 |
+| Тесты | `tests/gateway/test_profile_memory.py` (64), `test_profile_name_passthrough.py` (232), `test_profile_routing.py` (217) | Раздел 7 |
+| Тул управления профилями | `tools/profile_manager.py` (336) | бонус UX |
+
+**PR #39169 (`feat: channel-scoped gateway worker routing`, @hedaayat)** — 367+/8−,
+4 файла, открыт, обновлён 2026-06-23. НЕ полная изоляция — channel-level опции:
+
+| Что | Файл-донор (#39169) | Куда |
+|---|---|---|
+| `channel_routes`: fresh-сессия/сообщение, урезанный тулсет, skip memory/context | `gateway/platforms/base.py` (90), `gateway/run.py` (148), `hermes_cli/config.py` (8) | Фаза 3 (per-channel toolsets, ephemeral) |
+| Per-channel response splitters | `gateway/platforms/base.py` | бонус (оформление) |
+| Тест | `tests/gateway/test_channel_worker_routing.py` (121) | Раздел 7 |
+
+Снять патч любого файла:
+```bash
+gh api "repos/NousResearch/hermes-agent/pulls/20096/files" --paginate \
+  --jq '.[] | select(.filename=="gateway/profile_routing.py") | .patch'
+```
+
+> ВАЖНО: #20096/#39169 — **open, 0 ревью, разной свежести.** Майним куски, не мёрджим.
+> Резолвер «источник→профиль» оставляем наш (`/profile`-стор); из #20096 берём
+> **стратегию явной изоляции памяти/SOUL** + тесты; из #39169 — per-channel toolsets.
 
 ---
 
@@ -596,6 +916,9 @@ gh api "repos/NousResearch/hermes-agent/pulls/18510/files" --paginate \
   memory/sessions, конкурентные топики), `tests/test_subprocess_home_isolation.py`
   (Фаза 2), `tests/tools/test_skills_profile_isolation.py` (Фаза 3),
   `tests/hermes_cli/test_runtime_provider_resolution.py` (Фаза 4).
+- **Из #20096:** `tests/gateway/test_profile_memory.py`, `test_profile_name_passthrough.py`,
+  `test_profile_routing.py` (изоляция памяти/SOUL явным `profile_name`).
+  **Из #39169:** `tests/gateway/test_channel_worker_routing.py` (per-channel toolsets).
 - **Уже на ветке:** `tests/gateway/test_telegram_topic_mode.py` — не сломать;
   расширить кейсами привязки профиля.
 - **Команды:**
@@ -632,6 +955,9 @@ gh api "repos/NousResearch/hermes-agent/pulls/18510/files" --paginate \
       сохранена и описана.
 - [ ] Conventional Commits; в описании — ссылка на #18510 как на источник
       исходной фичи и граблей (мы делаем меньший scope поверх рантайм-`/profile`).
+- [ ] В описании PR: **`Closes #10143, #4321`** (канонические feature-запросы; 8
+      реакций, активный спрос) + упомянуть, что снимает спрос из #18423/#19809.
+      Указать #18510/#20096/#39169 как источники донорских кусков.
 - [ ] Прогон `pytest` целевых сьютов зелёный; приложить вывод.
 - [ ] Ручной Telegram smoke выполнен (пункты раздела 7), особенно Фаза-2 кейс.
 - [ ] Обновить `website/docs/user-guide/messaging/telegram.md` (per-topic profile

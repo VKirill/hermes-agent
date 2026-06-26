@@ -49,18 +49,21 @@ except ImportError:
 # Configuration
 # =============================================================================
 
-HERMES_DIR = get_hermes_home().resolve()
-CRON_DIR = HERMES_DIR / "cron"
-JOBS_FILE = CRON_DIR / "jobs.json"
-# Heartbeat file the in-process ticker touches on every loop iteration. The
-# gateway process and the (separate) ``hermes cron status`` process share it
-# so status can tell whether the ticker THREAD is alive, not just whether the
-# gateway PROCESS exists — a ticker that dies silently inside a live gateway
-# would otherwise report healthy (#32612, #32895).
-TICKER_HEARTBEAT_FILE = CRON_DIR / "ticker_heartbeat"
-# Last tick that completed WITHOUT raising. Distinguishing this from the plain
-# heartbeat lets status detect a ticker that is alive but failing every tick.
-TICKER_SUCCESS_FILE = CRON_DIR / "ticker_last_success"
+def __getattr__(name: str):
+    if name == "HERMES_DIR":
+        return get_hermes_home().resolve()
+    if name == "CRON_DIR":
+        return get_hermes_home().resolve() / "cron"
+    if name == "JOBS_FILE":
+        return get_hermes_home().resolve() / "cron" / "jobs.json"
+    if name == "TICKER_HEARTBEAT_FILE":
+        return get_hermes_home().resolve() / "cron" / "ticker_heartbeat"
+    if name == "TICKER_SUCCESS_FILE":
+        return get_hermes_home().resolve() / "cron" / "ticker_last_success"
+    if name == "OUTPUT_DIR":
+        return get_hermes_home().resolve() / "cron" / "output"
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
 # Default ticker loop interval (seconds). The single source of truth shared by
 # the in-process ticker (cron/scheduler_provider.py) and the staleness
 # threshold in `hermes cron status` (hermes_cli/cron.py), so the two never
@@ -72,7 +75,6 @@ TICKER_INTERVAL_SECONDS = 60
 # concurrent mark_job_run / advance_next_run calls can clobber each other.
 _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
-OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
 

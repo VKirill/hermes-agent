@@ -119,15 +119,22 @@ class ToolEntry:
 # ---------------------------------------------------------------------------
 
 _CHECK_FN_TTL_SECONDS = 30.0
-_check_fn_cache: Dict[Callable, tuple[float, bool]] = {}
+_check_fn_cache: Dict[tuple, tuple[float, bool]] = {}
 _check_fn_cache_lock = threading.Lock()
 
 
 def _check_fn_cached(fn: Callable) -> bool:
     """Return bool(fn()), TTL-cached across calls. Swallows exceptions as False."""
     now = time.monotonic()
+    try:
+        from hermes_constants import get_hermes_home
+        home_path = get_hermes_home()
+    except Exception:
+        home_path = None
+    cache_key = (fn, home_path)
+
     with _check_fn_cache_lock:
-        cached = _check_fn_cache.get(fn)
+        cached = _check_fn_cache.get(cache_key)
         if cached is not None:
             ts, value = cached
             if now - ts < _CHECK_FN_TTL_SECONDS:
@@ -137,7 +144,7 @@ def _check_fn_cached(fn: Callable) -> bool:
     except Exception:
         value = False
     with _check_fn_cache_lock:
-        _check_fn_cache[fn] = (now, value)
+        _check_fn_cache[cache_key] = (now, value)
     return value
 
 

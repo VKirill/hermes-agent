@@ -34,6 +34,63 @@ def reset_hermes_home_override(token: Token) -> None:
     _HERMES_HOME_OVERRIDE.reset(token)
 
 
+_TOPIC_HOME_OVERRIDE: ContextVar[str | object] = ContextVar(
+    "_TOPIC_HOME_OVERRIDE", default=_UNSET
+)
+
+
+def set_topic_home_override(path: str | Path | None) -> Token:
+    """Set a context-local topic home override and return its reset token."""
+    value: str | object = _UNSET if path is None else str(path)
+    return _TOPIC_HOME_OVERRIDE.set(value)
+
+
+def reset_topic_home_override(token: Token) -> None:
+    """Restore the previous context-local topic home override."""
+    _TOPIC_HOME_OVERRIDE.reset(token)
+
+
+def get_topic_home_override() -> str | None:
+    """Return the active context-local topic home override, if any."""
+    override = _TOPIC_HOME_OVERRIDE.get()
+    if override is _UNSET or not override:
+        return None
+    return str(override)
+
+
+_TERMINAL_CWD_OVERRIDE: ContextVar[str | object] = ContextVar(
+    "_TERMINAL_CWD_OVERRIDE", default=_UNSET
+)
+
+
+def set_terminal_cwd_override(path: str | Path | None) -> Token:
+    """Set a context-local terminal CWD override and return its reset token."""
+    value: str | object = _UNSET if path is None else str(path)
+    return _TERMINAL_CWD_OVERRIDE.set(value)
+
+
+def reset_terminal_cwd_override(token: Token) -> None:
+    """Restore the previous context-local terminal CWD override."""
+    _TERMINAL_CWD_OVERRIDE.reset(token)
+
+
+def get_terminal_cwd_override() -> str | None:
+    """Return the active context-local terminal CWD override, if any."""
+    override = _TERMINAL_CWD_OVERRIDE.get()
+    if override is _UNSET or not override:
+        return None
+    return str(override)
+
+
+def get_terminal_cwd() -> str | None:
+    """Return the active terminal CWD, checking context override first."""
+    override = get_terminal_cwd_override()
+    if override:
+        return override
+    return os.environ.get("TERMINAL_CWD")
+
+
+
 def get_hermes_home_override() -> str | None:
     """Return the active context-local Hermes home override, if any."""
     override = _HERMES_HOME_OVERRIDE.get()
@@ -515,6 +572,9 @@ def get_subprocess_home(env: dict[str, str] | None = None) -> str | None:
     * ``profile``: use ``{HERMES_HOME}/home`` when it exists, preserving the
       older strict per-profile tool-config isolation.
     """
+    topic_home = get_topic_home_override()
+    if topic_home:
+        return topic_home
     env = env or {}
     profile_home = _profile_home_path(env)
     mode = str(env.get("TERMINAL_HOME_MODE") or os.getenv("TERMINAL_HOME_MODE", "auto")).strip().lower() or "auto"

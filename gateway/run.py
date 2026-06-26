@@ -1456,6 +1456,29 @@ def _profile_runtime_scope(profile_home: "Path"):
         reset_hermes_home_override(home_token)
 
 
+@_contextmanager
+def _topic_runtime_scope(topic_home: Optional[str]):
+    """Scope both subprocess HOME and TERMINAL_CWD to a custom topic-specific directory."""
+    if not topic_home:
+        yield
+        return
+
+    from hermes_constants import (
+        set_topic_home_override,
+        reset_topic_home_override,
+        set_terminal_cwd_override,
+        reset_terminal_cwd_override,
+    )
+
+    home_token = set_topic_home_override(topic_home)
+    cwd_token = set_terminal_cwd_override(topic_home)
+    try:
+        yield
+    finally:
+        reset_terminal_cwd_override(cwd_token)
+        reset_topic_home_override(home_token)
+
+
 _DOCKER_VOLUME_SPEC_RE = re.compile(r"^(?P<host>.+):(?P<container>/[^:]+?)(?::(?P<options>[^:]+))?$")
 _DOCKER_MEDIA_OUTPUT_CONTAINER_PATHS = {"/output", "/outputs"}
 
@@ -2415,6 +2438,42 @@ def _remove_topic_profile(topic_key: str) -> None:
             atomic_json_write(path, data)
         except Exception as e:
             logger.warning("Failed to remove topic profile: %s", e)
+
+
+def _load_topic_workspaces() -> dict:
+    """Load the persistent topic-specific workspace overrides from ~/.hermes/topic_workspaces.json."""
+    import json
+    path = _hermes_home / "topic_workspaces.json"
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_topic_workspace(topic_key: str, workspace_path: str) -> None:
+    """Save a persistent topic-specific workspace override to ~/.hermes/topic_workspaces.json."""
+    path = _hermes_home / "topic_workspaces.json"
+    data = _load_topic_workspaces()
+    data[topic_key] = workspace_path
+    try:
+        atomic_json_write(path, data)
+    except Exception as e:
+        logger.warning("Failed to save topic workspace: %s", e)
+
+
+def _remove_topic_workspace(topic_key: str) -> None:
+    """Remove a persistent topic-specific workspace override from ~/.hermes/topic_workspaces.json."""
+    path = _hermes_home / "topic_workspaces.json"
+    data = _load_topic_workspaces()
+    if topic_key in data:
+        data.pop(topic_key)
+        try:
+            atomic_json_write(path, data)
+        except Exception as e:
+            logger.warning("Failed to remove topic workspace: %s", e)
 
 
 
@@ -8986,6 +9045,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return await self._handle_commands_command(event)
                 if _cmd_def_inner.name == "profile":
                     return await self._handle_profile_command(event)
+                if _cmd_def_inner.name == "workspace":
+                    return await self._handle_workspace_command(event)
                 if _cmd_def_inner.name == "update":
                     return await self._handle_update_command(event)
                 if _cmd_def_inner.name == "version":
@@ -16031,28 +16092,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         routed = self._routed_profile_for_source(source)
         multiplex = getattr(getattr(self, "config", None), "multiplex_profiles", False)
+        topic_home = self._resolve_topic_workspace_for_source(source)
         if not multiplex and routed is None:
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                channel_cwd=channel_cwd,
-            )
+            with _topic_runtime_scope(topic_home):
+                return await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                    channel_prompt=channel_prompt, moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    channel_cwd=channel_cwd,
+                )
 
         profile_home = self._resolve_profile_home_for_source(source)
         with _profile_runtime_scope(profile_home):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                channel_cwd=channel_cwd,
-            )
+            with _topic_runtime_scope(topic_home):
+                return await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
+                    channel_prompt=channel_prompt, moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    channel_cwd=channel_cwd,
+                )
 
     def _resolve_profile_home_for_source(self, source: SessionSource) -> "Path":
         """Resolve which profile's HERMES_HOME should serve this inbound source.
@@ -16068,6 +16132,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             from hermes_constants import get_hermes_home
             return get_hermes_home()
+
+    def _resolve_topic_workspace_for_source(self, source: SessionSource) -> Optional[str]:
+        """Resolve any topic-specific custom workspace/home path mapped to this source."""
+        try:
+            normalized = self._normalize_source_for_session_key(source)
+            key = _topic_profile_key(normalized)
+            path = (_load_topic_workspaces().get(key) or "").strip()
+            if path:
+                return os.path.expanduser(path)
+        except Exception:
+            pass
+        return None
 
     async def _run_agent_inner(
         self,

@@ -374,6 +374,73 @@ class GatewaySlashCommandsMixin:
 
         return "\n".join(lines)
 
+    async def _handle_workspace_command(self, event: MessageEvent) -> str:
+        """Handle /workspace command — switch and show active workspace for this topic.
+
+        Supports:
+          /workspace                              — show active workspace
+          /workspace <path>                       — pin topic to a workspace path
+          /workspace default/reset/clear          — clear topic workspace override
+        """
+        from gateway.run import (
+            _topic_profile_key,
+            _remove_topic_workspace,
+            _save_topic_workspace,
+            _load_topic_workspaces,
+        )
+
+        source = event.source
+        source = self._normalize_source_for_session_key(source)
+        topic_key = _topic_profile_key(source)
+
+        workspace_input = event.get_command_args().strip()
+
+        if workspace_input:
+            if workspace_input in ("default", "reset", "clear"):
+                try:
+                    _remove_topic_workspace(topic_key)
+                except Exception:
+                    pass
+                return "Привязка рабочей папки для топика сброшена. Используется стандартное поведение."
+
+            # Resolve/expand the directory path
+            expanded_path = os.path.expanduser(workspace_input)
+            abs_path = os.path.abspath(expanded_path)
+            
+            if not os.path.isdir(abs_path):
+                return f"⚠️ Путь '{workspace_input}' не найден или не является директорией."
+
+            # Save the workspace override
+            try:
+                _save_topic_workspace(topic_key, abs_path)
+            except Exception as e:
+                return f"⚠️ Не удалось сохранить привязку рабочей папки: {e}"
+            
+            return f"Для этого топика закреплена рабочая папка `{abs_path}`."
+
+        # No args: show active workspace
+        try:
+            topic_workspace = _load_topic_workspaces().get(topic_key)
+        except Exception:
+            topic_workspace = None
+
+        if topic_workspace:
+            return (
+                f"📂 **Рабочая папка топика**\n"
+                f"Закрепленный путь: `{topic_workspace}`\n\n"
+                f"Чтобы изменить путь:\n"
+                f"• `/workspace <путь>`\n"
+                f"Чтобы сбросить привязку:\n"
+                f"• `/workspace default`"
+            )
+        else:
+            return (
+                f"📂 **Рабочая папка топика**\n"
+                f"Рабочая папка не закреплена (используется стандартный путь).\n\n"
+                f"Чтобы закрепить путь:\n"
+                f"• `/workspace <путь>`"
+            )
+
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
         """Handle /whoami — show the user's slash command access on this scope.
 
