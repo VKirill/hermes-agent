@@ -7140,16 +7140,53 @@ class TelegramAdapter(BasePlatformAdapter):
     async def _flush_media_group_event(self, media_group_id: str) -> None:
         task = asyncio.current_task()
         try:
+            # Album assembly (this debounce + waiting for sibling photo
+            # downloads) runs BEFORE handle_message and its own typing loop, so
+            # without this the topic shows nothing while the album is gathered.
+            # Surface a "typing…" indicator: one send up front (the ~0.8s
+            # debounce sits well inside Telegram's ~5s typing lifetime, and each
+            # new album item reschedules this flush, refreshing it), plus a
+            # periodic refresh while waiting on slow sibling downloads up to the
+            # MAX_WAIT cap. Best-effort; never blocks the flush.
+            _typing_meta = None
+            _pending_event = self._media_group_events.get(media_group_id)
+            if _pending_event is not None:
+                try:
+                    from gateway.platforms.base import (
+                        _thread_metadata_for_source,
+                        _reply_anchor_for_event,
+                    )
+                    _typing_meta = _thread_metadata_for_source(
+                        _pending_event.source,
+                        _reply_anchor_for_event(_pending_event),
+                    )
+                    await self.send_typing(
+                        _pending_event.source.chat_id, metadata=_typing_meta
+                    )
+                except Exception:
+                    _typing_meta = None
+
             await asyncio.sleep(self.MEDIA_GROUP_WAIT_SECONDS)
             # Don't flush a partial album: if a sibling item's photo is still
             # downloading, wait for it (bounded by MEDIA_GROUP_MAX_WAIT_SECONDS).
             waited = 0.0
+            _next_typing_at = 2.0
             while (
                 self._media_group_pending.get(media_group_id, 0) > 0
                 and waited < self.MEDIA_GROUP_MAX_WAIT_SECONDS
             ):
                 await asyncio.sleep(0.1)
                 waited += 0.1
+                # Refresh the typing bubble during a long sibling-download wait
+                # so it doesn't expire before the album is ready.
+                if _typing_meta is not None and waited >= _next_typing_at:
+                    _next_typing_at += 2.0
+                    try:
+                        await self.send_typing(
+                            _pending_event.source.chat_id, metadata=_typing_meta
+                        )
+                    except Exception:
+                        pass
             event = self._media_group_events.pop(media_group_id, None)
             self._media_group_pending.pop(media_group_id, None)
             if event is not None:
