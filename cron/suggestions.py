@@ -42,22 +42,21 @@ from utils import atomic_replace
 
 logger = logging.getLogger(__name__)
 
-def _cron_dir():
-    if "CRON_DIR" in globals():
-        return globals()["CRON_DIR"]
+# Module-level attributes default to None; they can be overridden by tests/web_server
+CRON_DIR = None
+SUGGESTIONS_FILE = None
+
+
+def _cron_dir() -> Path:
+    if CRON_DIR is not None:
+        return CRON_DIR
     return get_hermes_home().resolve() / "cron"
 
-def _suggestions_file():
-    if "SUGGESTIONS_FILE" in globals():
-        return globals()["SUGGESTIONS_FILE"]
-    return _cron_dir() / "suggestions.json"
 
-def __getattr__(name: str):
-    if name == "CRON_DIR":
-        return _cron_dir()
-    if name == "SUGGESTIONS_FILE":
-        return _suggestions_file()
-    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+def _suggestions_file() -> Path:
+    if SUGGESTIONS_FILE is not None:
+        return SUGGESTIONS_FILE
+    return _cron_dir() / "suggestions.json"
 
 # In-process lock protecting load->modify->save cycles (the background review
 # fork and the main agent can both write).

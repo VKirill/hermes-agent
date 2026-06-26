@@ -49,50 +49,49 @@ except ImportError:
 # Configuration
 # =============================================================================
 
-def _hermes_dir():
-    if "HERMES_DIR" in globals():
-        return globals()["HERMES_DIR"]
+# Module-level attributes default to None; they can be overridden by tests/web_server
+HERMES_DIR = None
+CRON_DIR = None
+JOBS_FILE = None
+TICKER_HEARTBEAT_FILE = None
+TICKER_SUCCESS_FILE = None
+OUTPUT_DIR = None
+
+
+def _hermes_dir() -> Path:
+    if HERMES_DIR is not None:
+        return HERMES_DIR
     return get_hermes_home().resolve()
 
-def _cron_dir():
-    if "CRON_DIR" in globals():
-        return globals()["CRON_DIR"]
+
+def _cron_dir() -> Path:
+    if CRON_DIR is not None:
+        return CRON_DIR
     return _hermes_dir() / "cron"
 
-def _jobs_file():
-    if "JOBS_FILE" in globals():
-        return globals()["JOBS_FILE"]
+
+def _jobs_file() -> Path:
+    if JOBS_FILE is not None:
+        return JOBS_FILE
     return _cron_dir() / "jobs.json"
 
-def _ticker_heartbeat_file():
-    if "TICKER_HEARTBEAT_FILE" in globals():
-        return globals()["TICKER_HEARTBEAT_FILE"]
+
+def _ticker_heartbeat_file() -> Path:
+    if TICKER_HEARTBEAT_FILE is not None:
+        return TICKER_HEARTBEAT_FILE
     return _cron_dir() / "ticker_heartbeat"
 
-def _ticker_success_file():
-    if "TICKER_SUCCESS_FILE" in globals():
-        return globals()["TICKER_SUCCESS_FILE"]
+
+def _ticker_success_file() -> Path:
+    if TICKER_SUCCESS_FILE is not None:
+        return TICKER_SUCCESS_FILE
     return _cron_dir() / "ticker_last_success"
 
-def _output_dir():
-    if "OUTPUT_DIR" in globals():
-        return globals()["OUTPUT_DIR"]
-    return _cron_dir() / "output"
 
-def __getattr__(name: str):
-    if name == "HERMES_DIR":
-        return _hermes_dir()
-    if name == "CRON_DIR":
-        return _cron_dir()
-    if name == "JOBS_FILE":
-        return _jobs_file()
-    if name == "TICKER_HEARTBEAT_FILE":
-        return _ticker_heartbeat_file()
-    if name == "TICKER_SUCCESS_FILE":
-        return _ticker_success_file()
-    if name == "OUTPUT_DIR":
-        return _output_dir()
-    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+def _output_dir() -> Path:
+    if OUTPUT_DIR is not None:
+        return OUTPUT_DIR
+    return _cron_dir() / "output"
 
 
 # Default ticker loop interval (seconds). The single source of truth shared by
