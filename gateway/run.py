@@ -13520,10 +13520,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Read new config before shutting down, so we know what will be added/removed
             # Shutdown existing connections
-            await loop.run_in_executor(None, shutdown_mcp_servers)
+            import contextvars
+            ctx = contextvars.copy_context()
+            await loop.run_in_executor(None, lambda: ctx.run(shutdown_mcp_servers))
 
             # Reconnect by discovering tools (reads config.yaml fresh)
-            new_tools = await loop.run_in_executor(None, discover_mcp_tools)
+            new_tools = await loop.run_in_executor(None, lambda: ctx.run(discover_mcp_tools))
 
             # Compute what changed
             with _lock:

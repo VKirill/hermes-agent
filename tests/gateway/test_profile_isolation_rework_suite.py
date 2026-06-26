@@ -319,3 +319,42 @@ def test_g2_fallback_when_session_id_none(test_env):
     resolved_default = get_profile_home_for_session(None)
     assert resolved_default is None
 
+
+def test_reload_mcp_scoped(test_env):
+    """Test Tail 2: /reload-mcp under routed scope reloads config from correct profile's home directory."""
+    runner = GatewayRunner(config=GatewayConfig(platforms={}))
+    
+    homes_seen = []
+    
+    from hermes_constants import get_hermes_home
+    def fake_load_config():
+        homes_seen.append(get_hermes_home().resolve())
+        return {}
+        
+    def fake_shutdown():
+        homes_seen.append(get_hermes_home().resolve())
+        
+    def fake_discover():
+        homes_seen.append(get_hermes_home().resolve())
+        return []
+        
+    profile_home = test_env / "profiles" / "profilea"
+    
+    from gateway.run import _profile_runtime_scope
+    with _profile_runtime_scope(profile_home), \
+         patch("tools.mcp_tool._load_mcp_config", side_effect=fake_load_config), \
+         patch("tools.mcp_tool.shutdown_mcp_servers", side_effect=fake_shutdown), \
+         patch("tools.mcp_tool.discover_mcp_tools", side_effect=fake_discover):
+         
+         event = MagicMock()
+         event.source.platform = Platform.TELEGRAM
+         event.source.chat_id = "111"
+         event.source.thread_id = "222"
+         
+         asyncio.run(runner._execute_mcp_reload(event))
+         
+    assert len(homes_seen) > 0
+    for h in homes_seen:
+        assert h == profile_home.resolve()
+
+
