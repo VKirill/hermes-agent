@@ -368,13 +368,16 @@ _API_KEY_PROVIDER_AUX_MODELS: Dict[str, str] = _API_KEY_PROVIDER_AUX_MODELS_FALL
 # "exotic provider" branch checks this before falling back to the main model.
 _PROVIDER_VISION_MODELS: Dict[str, str] = {
     "xiaomi": "mimo-v2.5",
-    "zai": "glm-5v-turbo",
-    # NB: glm-5v-turbo is only reachable on z.ai's standard pay-as-you-go
-    # endpoint (api/paas/v4). A *coding-plan* GLM_API_KEY returns 429
-    # "Insufficient balance" for it, so deployments on a coding-plan key
-    # should pin `auxiliary.vision: {provider: gemini, ...}` in the GLM
-    # profile's config to route image analysis to the official Gemini API
-    # instead of dead-ending here.
+    # NB: "zai" intentionally absent. glm-5v-turbo returns 400 code 1211
+    # "Unknown Model" on api.z.ai (dead/renamed slug), and a coding-plan
+    # GLM key also 429s on the standard endpoint — so it is not a usable
+    # vision backend here. Without a zai entry, a text-only GLM main
+    # (glm-5.2) falls through the vision auto-chain to the official Gemini
+    # fallback instead of dead-ending. This also hardens against cross-topic
+    # runtime-main contamination: the process-global _RUNTIME_MAIN_PROVIDER
+    # set by a concurrent GLM turn (turn_context.set_runtime_main) can leak
+    # provider=zai into another topic's vision_analyze; falling through to
+    # Gemini keeps vision working instead of 1211-ing on the dead slug.
 }
 
 # Providers whose endpoint does not accept image input, even though the

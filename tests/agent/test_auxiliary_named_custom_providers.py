@@ -238,6 +238,11 @@ class TestResolveVisionProviderClientModelNormalization:
         })
         with (
             patch("agent.auxiliary_client._read_nous_auth", return_value=None),
+            # zai has no dedicated vision model anymore, so the auto path uses
+            # the (prefix-stripped) main model — treat it as vision-capable so
+            # the test exercises the zai client path rather than falling through
+            # to the aggregator chain.
+            patch("agent.auxiliary_client._main_model_supports_vision", return_value=True),
             patch("hermes_cli.auth.resolve_api_key_provider_credentials", return_value={
                 "api_key": "glm-key",
                 "base_url": "https://api.z.ai/api/paas/v4",
@@ -251,7 +256,10 @@ class TestResolveVisionProviderClientModelNormalization:
 
         assert provider == "zai"
         assert client is not None
-        assert model == "glm-5v-turbo"  # zai has dedicated vision model in _PROVIDER_VISION_MODELS
+        # "zai/glm-5.1" → "glm-5.1": the matching main-provider prefix is
+        # stripped (zai no longer has a dedicated vision model in
+        # _PROVIDER_VISION_MODELS, so the main model itself is used).
+        assert model == "glm-5.1"
 
 
 class TestVisionPathApiMode:
