@@ -96,9 +96,11 @@ import { extractPreviewTargets } from '@/lib/preview-targets'
 import { useEnterAnimation } from '@/lib/use-enter-animation'
 import { cn } from '@/lib/utils'
 import { playSpeechText, stopVoicePlayback } from '@/lib/voice-playback'
+import { $backgroundResume } from '@/store/background-delegation'
 import { $compactionActive } from '@/store/compaction'
 import type { ComposerAttachment } from '@/store/composer'
 import { notifyError } from '@/store/notifications'
+import { $activeSessionAwaitingInput } from '@/store/prompts'
 import { $connection } from '@/store/session'
 import { notifyThreadEditClose, notifyThreadEditOpen } from '@/store/thread-scroll'
 import { $voicePlayback } from '@/store/voice-playback'
@@ -193,9 +195,9 @@ export const Thread: FC<{
   const { t } = useI18n()
   const copy = t.assistant.thread
 
-  const [restoreConfirmTarget, setRestoreConfirmTarget] = useState<(RestoreMessageTarget & { messageId: string }) | null>(
-    null
-  )
+  const [restoreConfirmTarget, setRestoreConfirmTarget] = useState<
+    (RestoreMessageTarget & { messageId: string }) | null
+  >(null)
 
   const closeRestoreConfirm = useCallback(() => setRestoreConfirmTarget(null), [])
 
@@ -218,7 +220,9 @@ export const Thread: FC<{
 
   const messageComponents = useMemo(
     () => ({
-      AssistantMessage: () => <AssistantMessage onBranchInNewChat={onBranchInNewChat} onDismissError={onDismissError} />,
+      AssistantMessage: () => (
+        <AssistantMessage onBranchInNewChat={onBranchInNewChat} onDismissError={onDismissError} />
+      ),
       SystemMessage,
       UserEditComposer: () => <UserEditComposer cwd={cwd} gateway={gateway} sessionId={sessionId} />,
       UserMessage: () => (
@@ -243,7 +247,7 @@ export const Thread: FC<{
         clampToComposer={clampToComposer}
         components={messageComponents}
         emptyPlaceholder={emptyPlaceholder}
-        loadingIndicator={loading === 'response' ? <ResponseLoadingIndicator /> : null}
+        loadingIndicator={loading === 'response' ? <ResponseLoadingIndicator /> : <BackgroundResumeNotice />}
         sessionKey={sessionKey}
       />
       {loading === 'session' && <CenteredThreadSpinner />}
@@ -422,6 +426,36 @@ const ResponseLoadingIndicator: FC = () => {
   )
 }
 
+// Parked-background affordance: a top-level delegate_task runs in the
+// background, so the parent turn ends and the app goes idle while the subagent
+// keeps working and its result re-enters as a fresh turn later. Instead of a
+// spinner (reads as "stuck"), reuse the same compact, centered system-note
+// chrome as the steer / slash-status lines (SystemMessage above) so it sits in
+// the thread like every other meta line. Idle-only (gated upstream). Null when
+// nothing is parked.
+const BackgroundResumeNotice: FC = () => {
+  const { t } = useI18n()
+  const resume = useStore($backgroundResume)
+
+  if (!resume) {
+    return null
+  }
+
+  const label = resume.activity ?? t.assistant.thread.resumeWhenBackgroundDone(resume.count)
+
+  return (
+    <div
+      aria-live="polite"
+      className="flex max-w-[min(86%,44rem)] items-center gap-1.5 self-center px-2 py-0.5 text-[0.6875rem] leading-5 text-muted-foreground/55"
+      data-slot="aui_background-resume"
+      role="status"
+    >
+      <Codicon className="text-muted-foreground/55" name="sync" size="0.75rem" />
+      <span className="shimmer min-w-0 truncate">{label}</span>
+    </div>
+  )
+}
+
 // Seconds of no visible output (text or part count) before a still-running turn
 // is treated as stalled and the thinking indicator returns at the tail.
 const STREAM_STALL_S = 2
@@ -452,6 +486,10 @@ const StreamStallIndicator: FC = () => {
 
   const [stalled, setStalled] = useState(false)
   const compacting = useStore($compactionActive)
+  // A pending clarify / approval / sudo / secret means the turn is paused on the
+  // user, not working — so don't resurrect the "thinking" timer while they
+  // decide (matches the pet's awaitingInput pose taking priority over busy).
+  const awaitingInput = useStore($activeSessionAwaitingInput)
 
   useEffect(() => {
     setStalled(false)
@@ -460,7 +498,7 @@ const StreamStallIndicator: FC = () => {
     return () => window.clearTimeout(id)
   }, [activity])
 
-  const active = stalled || compacting
+  const active = (stalled || compacting) && !awaitingInput
   const elapsed = useElapsedSeconds(active)
 
   if (!active) {

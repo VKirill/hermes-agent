@@ -42,7 +42,13 @@ from utils import atomic_replace
 
 logger = logging.getLogger(__name__)
 
-# Module-level attributes default to None; they can be overridden by tests/web_server
+# Per-profile by design (issue #4707): suggestions live alongside the active
+# profile's cron store. Anchor on get_hermes_home() (profile home), not the
+# shared default root. See cron/jobs.py for the full rationale. Resolved
+# LAZILY (resolver functions, not import-time constants) so a long-lived
+# gateway that switches the active profile per turn picks up the current
+# profile home; the attributes default to None and may be overridden by
+# tests/web_server.
 CRON_DIR = None
 SUGGESTIONS_FILE = None
 

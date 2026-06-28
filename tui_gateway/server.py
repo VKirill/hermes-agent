@@ -4098,12 +4098,55 @@ def _schedule_mcp_late_refresh(sid: str, agent) -> None:
             info = _session_info(agent, session)
         # Emit outside the lock — write_json must not block under _sessions_lock.
         _emit("session.info", sid, info)
-
     threading.Thread(
         target=_wait_then_refresh,
         name=f"tui-mcp-late-refresh-{sid}",
         daemon=True,
     ).start()
+
+
+def _resolve_runtime_with_fallback(
+    resolve_kwargs: dict | None = None,
+) -> dict:
+    """Resolve runtime provider with init-time fallback on auth failure.
+
+    Mirrors the fallback pattern in ``cron/scheduler.py`` and
+    ``hermes_cli/cli_agent_setup_mixin.py``: when the primary provider
+    raises ``AuthError``, walk the configured ``fallback_providers`` /
+    ``fallback_model`` chain before giving up.
+    """
+    from hermes_cli.auth import AuthError
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+
+    kwargs = resolve_kwargs or {}
+    try:
+        return resolve_runtime_provider(**kwargs)
+    except AuthError as primary_exc:
+        fb_chain = _load_fallback_model() or []
+        for entry in fb_chain:
+            if not isinstance(entry, dict):
+                continue
+            fb_provider = (entry.get("provider") or "").strip()
+            if not fb_provider:
+                continue
+            try:
+                fb_kwargs: dict = {"requested": fb_provider}
+                if entry.get("base_url"):
+                    fb_kwargs["explicit_base_url"] = entry["base_url"]
+                if entry.get("api_key"):
+                    fb_kwargs["explicit_api_key"] = entry["api_key"]
+                runtime = resolve_runtime_provider(**fb_kwargs)
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "Primary auth failed (%s), falling back to %s",
+                    primary_exc,
+                    fb_provider,
+                )
+                return runtime
+            except Exception:
+                continue
+        raise
 
 
 def _make_agent(
@@ -4117,7 +4160,6 @@ def _make_agent(
     service_tier_override: str | None = None,
 ):
     from run_agent import AIAgent
-    from hermes_cli.runtime_provider import resolve_runtime_provider
 
     # MCP tool discovery runs in a background daemon thread at startup so a
     # dead server can't freeze the shell.  The agent snapshots its tool list
@@ -4186,11 +4228,9 @@ def _make_agent(
                 # Failing identity recovery, still hand the base_url to the
                 # direct-alias branch so pool/env credentials resolve for it.
                 resolve_kwargs["explicit_base_url"] = override_base_url
-        runtime = resolve_runtime_provider(
-            requested=requested_provider,
-            target_model=model or None,
-            **resolve_kwargs,
-        )
+        resolve_kwargs["requested"] = requested_provider
+        resolve_kwargs["target_model"] = model or None
+        runtime = _resolve_runtime_with_fallback(resolve_kwargs)
         # The switch already resolved concrete credentials/endpoint; honor them
         # so a custom/named endpoint survives the rebuild even if global
         # resolution would pick a different one.
@@ -4206,10 +4246,10 @@ def _make_agent(
             model = model_override
         if provider_override:
             requested_provider = provider_override
-        runtime = resolve_runtime_provider(
-            requested=requested_provider,
-            target_model=model or None,
-        )
+        runtime = _resolve_runtime_with_fallback({
+            "requested": requested_provider,
+            "target_model": model or None,
+        })
     _pr = _load_provider_routing()
     return AIAgent(
         model=model,
@@ -7670,14 +7710,17 @@ def _(rid, params: dict) -> dict:
     # stuck (a crash/desync that skipped the run loop's `finally`), force-clear it
     # so the session can't be permanently bricked at 4009 "session busy" — every
     # send/restore/resume would otherwise reject until a full backend restart.
-    # A genuinely live turn is left alone: its cooperative interrupt + `finally`
-    # release `running` the normal way; clearing it here would let a second turn
-    # race the first on the same session.
+    # Always tell the agent to interrupt when the session claims a run is active:
+    # stale flags are cleared below, and fresh turns clear the interrupt flag at
+    # entry. This keeps a stale/missing thread handle from making Stop a no-op.
     run_thread = session.get("_run_thread")
     run_thread_alive = run_thread is not None and run_thread.is_alive()
-    should_interrupt = bool(session.get("running")) and run_thread_alive
+    should_interrupt = bool(session.get("running"))
     if should_interrupt and hasattr(session["agent"], "interrupt"):
         session["agent"].interrupt()
+    with session["history_lock"]:
+        session["_turn_cancel_requested"] = True
+        session["queued_prompt"] = None
     if not run_thread_alive:
         with session["history_lock"]:
             if session.get("running"):
@@ -8008,6 +8051,7 @@ def _(rid, params: dict) -> dict:
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
         session["running"] = True
+        session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
 
@@ -8034,6 +8078,11 @@ def _(rid, params: dict) -> dict:
                 session["running"] = False
                 _clear_inflight_turn(session)
             return
+        with session["history_lock"]:
+            if session.get("_turn_cancel_requested") or not session.get("running"):
+                session["running"] = False
+                _clear_inflight_turn(session)
+                return
         _run_prompt_submit(rid, sid, session, text)
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
@@ -8394,7 +8443,39 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             result = agent.run_conversation(run_message, **run_kwargs)
             if "moa_one_shot_restore" in session:
                 _restore = session.pop("moa_one_shot_restore", None)
-                if _restore is None:
+                # Restore the model the user was on before the /moa one-shot.
+                # The one-shot did a real in-place agent.switch_model() to MoA
+                # (#53444), so undoing it must go back through the switch path —
+                # resetting session["model_override"] alone would leave the live
+                # agent's client pinned to MoA for the next turn.
+                if isinstance(_restore, dict):
+                    _prev_override = _restore.get("override")
+                    _prev_model = _restore.get("model")
+                    _prev_provider = _restore.get("provider")
+                    if _prev_override is None:
+                        session.pop("model_override", None)
+                    else:
+                        session["model_override"] = _prev_override
+                    if _prev_model:
+                        _raw = (
+                            f"{_prev_model} --provider {_prev_provider}"
+                            if _prev_provider
+                            else _prev_model
+                        )
+                        try:
+                            _apply_model_switch(
+                                sid,
+                                session,
+                                _raw,
+                                confirm_expensive_model=False,
+                                pin_session_override=bool(_prev_override),
+                            )
+                        except Exception as _moa_restore_exc:
+                            logger.warning(
+                                "MoA one-shot model restore failed: %s",
+                                _moa_restore_exc,
+                            )
+                elif _restore is None:
                     session.pop("model_override", None)
                 else:
                     session["model_override"] = _restore
@@ -8690,7 +8771,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 file=sys.stderr,
             )
 
-    threading.Thread(target=run, daemon=True).start()
+    run_thread = threading.Thread(target=run, daemon=True)
+    session["_run_thread"] = run_thread
+    run_thread.start()
 
 
 @method("clipboard.paste")
@@ -11171,38 +11254,54 @@ def _(rid, params: dict) -> dict:
 
         return _ok(rid, {"type": "send", "message": build_learn_prompt(arg)})
     if name == "moa":
+        # /moa is one-shot sugar only: run a single prompt through the default
+        # MoA preset, then restore the prior model. To *switch* to a MoA preset
+        # for the rest of the session, pick it from the model picker (MoA
+        # presets surface as a virtual "Mixture of Agents" provider).
         try:
-            from hermes_cli.moa_config import (
-                build_moa_turn_prompt, exact_moa_preset_name, moa_usage, normalize_moa_config
-            )
+            from hermes_cli.moa_config import moa_usage, normalize_moa_config
 
-            moa_cfg = normalize_moa_config(_load_cfg().get("moa") or {})
-            matched = exact_moa_preset_name(moa_cfg, arg) if arg else moa_cfg["default_preset"]
-            if matched:
-                if not session:
-                    return _err(rid, 4001, "no active session")
-                session["model_override"] = {
-                    "model": matched,
-                    "provider": "moa",
-                    "base_url": "moa://local",
-                    "api_key": "moa-virtual-provider",
-                    "api_mode": "chat_completions",
-                }
-                session["moa_active_preset"] = matched
-                return _ok(rid, {"type": "exec", "output": f"Model switched to MoA preset: {matched}."})
             if not arg:
                 return _err(rid, 4004, moa_usage())
             if not session:
                 return _err(rid, 4001, "no active session")
+            sid = params.get("session_id", "")
+            moa_cfg = normalize_moa_config(_load_cfg().get("moa") or {})
             preset = moa_cfg["default_preset"]
-            session["moa_one_shot_restore"] = session.get("model_override")
-            session["model_override"] = {
-                "model": preset,
-                "provider": "moa",
-                "base_url": "moa://local",
-                "api_key": "moa-virtual-provider",
-                "api_mode": "chat_completions",
+            # Record the live model identity so it can be restored after the
+            # one-shot turn, then swap the agent's client in place (#53444:
+            # setting session["model_override"] alone never switched the
+            # already-built agent, so the turn silently ran on the old model).
+            agent = session.get("agent")
+            session["moa_one_shot_restore"] = {
+                "override": session.get("model_override"),
+                "model": getattr(agent, "model", None) if agent else None,
+                "provider": getattr(agent, "provider", None) if agent else None,
             }
+            if agent is not None:
+                # Live agent: swap its client in place so THIS turn runs MoA.
+                try:
+                    _apply_model_switch(
+                        sid,
+                        session,
+                        f"{preset} --provider moa",
+                        confirm_expensive_model=False,
+                        pin_session_override=True,
+                    )
+                except Exception as exc:
+                    session.pop("moa_one_shot_restore", None)
+                    return _err(rid, 5030, f"moa unavailable: {exc}")
+            else:
+                # No agent built yet (lazy/fresh session): the override is
+                # consumed by the first build, so the turn runs MoA without an
+                # in-place switch.
+                session["model_override"] = {
+                    "provider": "moa",
+                    "model": preset,
+                    "base_url": "moa://local",
+                    "api_key": "moa-virtual-provider",
+                    "api_mode": "chat_completions",
+                }
             return _ok(
                 rid,
                 {

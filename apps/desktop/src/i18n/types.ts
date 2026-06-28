@@ -301,6 +301,12 @@ export interface Translations {
       toolViewDesc: string
       translucencyTitle: string
       translucencyDesc: string
+      embedsTitle: string
+      embedsDesc: string
+      embedsAsk: string
+      embedsAlways: string
+      embedsOff: string
+      embedsReset: (count: number) => string
       product: string
       productDesc: string
       technical: string
@@ -1561,6 +1567,14 @@ export interface Translations {
     truncated: string
     noInlineTitle: string
     noInlineBody: (mimeType: string) => string
+    edit: string
+    editing: string
+    unsavedChanges: string
+    saveFailed: (message: string) => string
+    diskChangedTitle: string
+    diskChangedBody: string
+    overwrite: string
+    discardReload: string
     console: {
       deselect: string
       select: string
@@ -1622,6 +1636,7 @@ export interface Translations {
       loadingSession: string
       showEarlier: string
       loadingResponse: string
+      resumeWhenBackgroundDone: (count: number) => string
       thinking: string
       today: (time: string) => string
       yesterday: (time: string) => string
@@ -1669,10 +1684,8 @@ export interface Translations {
       loadingQuestion: string
       other: string
       placeholder: string
-      shortcutSuffix: string
-      back: string
       skip: string
-      send: string
+      continueLabel: string
     }
     tool: {
       code: string
