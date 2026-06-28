@@ -3089,7 +3089,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def session_store(self):
         from hermes_constants import get_hermes_home
         current_home = get_hermes_home().resolve()
-        print("GETTER current_home:", current_home)
         return self._get_or_create_store_for_home(current_home)
 
     @session_store.setter
