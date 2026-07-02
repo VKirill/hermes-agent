@@ -299,18 +299,67 @@ class GatewaySlashCommandsMixin:
         return EphemeralReply(f"{header}{_tip_line}")
 
     async def _handle_profile_command(self, event: MessageEvent) -> str:
-        """Handle /profile — show active profile name and home directory."""
+        """Handle /profile command — switch and show the active profile for this topic.
+
+        Supports (restored topic->profile routing, ported from feat/profile-isolation-pr):
+          /profile                       — show active profile + list available profiles to tap
+          /profile <name>                — pin this topic to a profile
+          /profile default/reset/clear   — clear this topic's profile binding
+        """
         from hermes_constants import display_hermes_home
-        from hermes_cli.profiles import get_active_profile_name
+        from hermes_cli.profiles import list_profiles, get_active_profile_name
+        from gateway.run import _topic_profile_key, _remove_topic_profile, _save_topic_profile
 
-        display = display_hermes_home()
-        profile_name = get_active_profile_name()
+        source = event.source
+        source = self._normalize_source_for_session_key(source)
+        topic_key = _topic_profile_key(source)
+        session_key = self._session_key_for_source(source)
 
+        profile_input = (event.get_command_args() or "").strip()
+
+        try:
+            valid_profiles = {p.name for p in list_profiles()}
+        except Exception:
+            valid_profiles = {"default"}
+
+        if profile_input:
+            if profile_input in ("default", "reset", "clear"):
+                try:
+                    _remove_topic_profile(topic_key)
+                except Exception:
+                    pass
+                event.source.profile = None
+                self._evict_cached_agent(session_key)
+                return (
+                    "Cleared the topic profile binding. Now using the global "
+                    f"active profile '{self._active_profile_name()}'."
+                )
+
+            if profile_input not in valid_profiles:
+                available = ", ".join(f"`{name}`" for name in sorted(valid_profiles))
+                return f"Unknown profile '{profile_input}'. Available profiles: {available}."
+
+            try:
+                _save_topic_profile(topic_key, profile_input)
+            except Exception:
+                pass
+            event.source.profile = profile_input
+            self._evict_cached_agent(session_key)
+            return f"Pinned this topic to profile `{profile_input}`."
+
+        # No args: show the active profile + the list of profiles this topic can switch to.
+        topic_profile = event.source.profile or get_active_profile_name()
         lines = [
-            t("gateway.profile.header", profile=profile_name),
-            t("gateway.profile.home", home=display),
+            t("gateway.profile.header", profile=topic_profile),
+            t("gateway.profile.home", home=display_hermes_home()),
+            "",
+            "Available profiles (tap to switch):",
         ]
-
+        for name in sorted(valid_profiles):
+            bullet = "*" if name == topic_profile else "-"
+            lines.append(f"{bullet} `/profile {name}`")
+        lines.append("")
+        lines.append("To clear the binding: `/profile default`")
         return "\n".join(lines)
 
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
