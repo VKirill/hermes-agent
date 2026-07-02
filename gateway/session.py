@@ -1116,10 +1116,24 @@ class SessionStore:
         to (``source.profile`` — set by the /p/<profile>/ URL prefix or
         per-credential adapter), falling back to the active profile name.
         """
+        # Explicit routed profile wins (set by /p/<profile>/, a per-credential adapter,
+        # or the /profile topic binding applied upstream).
+        if source is not None and getattr(source, "profile", None):
+            return source.profile
+        # Restored /profile topic routing: consult the persistent topic->profile map so a
+        # bound topic namespaces its session key by that profile even when multiplex is off.
+        # This is the single authoritative seam, so every key generated for a bound topic
+        # (sessions AND per-topic model overrides in topic_models.json) resolves per profile.
+        if source is not None:
+            try:
+                from gateway.run import _load_topic_profiles, _topic_profile_key
+                bound = _load_topic_profiles().get(_topic_profile_key(source))
+                if bound:
+                    return bound
+            except Exception:
+                pass
         if not getattr(self.config, "multiplex_profiles", False):
             return None
-        if source is not None and source.profile:
-            return source.profile
         try:
             from hermes_cli.profiles import get_active_profile_name
             return get_active_profile_name() or "default"
