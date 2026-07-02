@@ -1660,6 +1660,19 @@ class GatewaySlashCommandsMixin:
                                 exc_info=True,
                             )
 
+                        # Persist the FULL config (incl. api_key/base_url/api_mode) to the
+                        # per-topic map (topic_models.json) so the exact provider survives
+                        # restarts WITHOUT re-resolution — which under a profile scope can
+                        # pick the wrong provider. Ported from feat/profile-isolation-pr.
+                        try:
+                            from gateway.run import _save_topic_model
+                            _save_topic_model(
+                                _session_key,
+                                _self._session_model_overrides[_session_key],
+                            )
+                        except Exception:
+                            logger.debug("Failed to persist topic model override", exc_info=True)
+
                         # Evict cached agent so the next turn creates a fresh
                         # agent from the override rather than relying on the
                         # stale cache signature to trigger a rebuild.
@@ -1906,6 +1919,18 @@ class GatewaySlashCommandsMixin:
                 logger.debug(
                     "Failed to persist session model override", exc_info=True
                 )
+
+            # Persist the FULL config (incl. api_key/base_url/api_mode) to the per-topic
+            # map (topic_models.json) so the exact provider survives restarts WITHOUT
+            # re-resolution — which under a profile scope can pick the wrong provider.
+            # Ported from feat/profile-isolation-pr.
+            try:
+                from gateway.run import _save_topic_model
+                _save_topic_model(
+                    session_key, self._session_model_overrides[session_key]
+                )
+            except Exception:
+                logger.debug("Failed to persist topic model override", exc_info=True)
 
             # Evict cached agent so the next turn creates a fresh agent from the
             # override rather than relying on cache signature mismatch detection.
