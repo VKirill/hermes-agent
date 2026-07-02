@@ -1264,6 +1264,61 @@ from hermes_constants import get_hermes_home
 from utils import atomic_json_write, atomic_yaml_write, base_url_host_matches, is_truthy_value
 _hermes_home = get_hermes_home()
 
+
+# --- Restored /profile topic routing (ported from feat/profile-isolation-pr) -------
+# Binds a Telegram forum topic (or any source) to a Hermes profile via the persistent
+# map at ~/.hermes/topic_profiles.json. A bound turn runs scoped to that profile's home
+# and secrets (see the _run_agent gate below). Unbound topics are untouched.
+def _topic_profile_key(source) -> str:
+    """Profile-namespace-independent key ``platform:chat_type:chat_id:thread_id``.
+
+    Matches the keys persisted in ``~/.hermes/topic_profiles.json``.
+    """
+    if not source:
+        return ""
+    platform = getattr(source, "platform", None)
+    platform_str = platform.value if platform else ""
+    chat_type = getattr(source, "chat_type", "dm") or "dm"
+    chat_id = getattr(source, "chat_id", "") or ""
+    thread_id = getattr(source, "thread_id", "") or ""
+    return f"{platform_str}:{chat_type}:{chat_id}:{thread_id}"
+
+
+def _load_topic_profiles() -> dict:
+    """Load persistent topic->profile bindings from ~/.hermes/topic_profiles.json."""
+    import json
+    path = _hermes_home / "topic_profiles.json"
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_topic_profile(topic_key: str, profile_name: str) -> None:
+    """Persist a topic->profile binding to ~/.hermes/topic_profiles.json."""
+    path = _hermes_home / "topic_profiles.json"
+    data = _load_topic_profiles()
+    data[topic_key] = profile_name
+    try:
+        atomic_json_write(path, data)
+    except Exception as e:
+        logger.warning("Failed to save topic profile: %s", e)
+
+
+def _remove_topic_profile(topic_key: str) -> None:
+    """Remove a topic->profile binding from ~/.hermes/topic_profiles.json."""
+    path = _hermes_home / "topic_profiles.json"
+    data = _load_topic_profiles()
+    if topic_key in data:
+        data.pop(topic_key)
+        try:
+            atomic_json_write(path, data)
+        except Exception as e:
+            logger.warning("Failed to remove topic profile: %s", e)
+
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
 from dotenv import load_dotenv  # noqa: F401  # backward-compat for tests that monkeypatch this symbol
@@ -3359,6 +3414,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     def _session_key_for_source(self, source: SessionSource) -> str:
         """Resolve the current session key for a source, honoring gateway config when available."""
+        # Restored /profile topic routing: a topic bound to a profile (persisted in
+        # ~/.hermes/topic_profiles.json) sets source.profile early so the whole turn —
+        # session namespace AND runtime home/secrets — resolve to that profile.
+        # Unbound topics are left untouched (zero regression).
+        try:
+            if not (getattr(source, "profile", "") or "").strip():
+                _bound = _load_topic_profiles().get(_topic_profile_key(source))
+                if _bound:
+                    source.profile = _bound
+        except Exception:
+            pass
         if hasattr(self, "session_store") and self.session_store is not None:
             try:
                 session_key = self.session_store._generate_session_key(source)
@@ -16079,7 +16145,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
+        _routed_profile = (getattr(source, "profile", "") or "").strip()
+        if not _routed_profile:
+            # Restored /profile topic routing: honor a topic->profile binding even when
+            # multiplex_profiles is off, so bound topics scope into their profile's home
+            # + secrets. Self-contained so routing works regardless of call ordering.
+            try:
+                _bound = _load_topic_profiles().get(_topic_profile_key(source))
+                if _bound:
+                    source.profile = _routed_profile = _bound
+                    logger.info(
+                        "Topic profile routing: %s -> profile=%s",
+                        _topic_profile_key(source), _bound,
+                    )
+            except Exception:
+                pass
+        if not _routed_profile and not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
                 session_key=session_key, run_generation=run_generation,
