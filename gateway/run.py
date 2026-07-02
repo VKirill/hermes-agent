@@ -3747,6 +3747,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if resolved_session_key:
             self._rehydrate_session_model_override(resolved_session_key)
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
+        if override is None and resolved_session_key:
+            # Persistent per-topic model fallback (topic_models.json): survives /new and
+            # gateway restarts even when evicted from the in-memory dict (ported from
+            # feat/profile-isolation-pr). Key is profile-namespaced (agent:<profile>:...).
+            try:
+                _persistent_model = _load_topic_models().get(resolved_session_key)
+            except Exception:
+                _persistent_model = None
+            if _persistent_model:
+                override = _persistent_model
+                self._session_model_overrides[resolved_session_key] = _persistent_model
         if override:
             override_model = override.get("model", model)
             override_runtime = {
