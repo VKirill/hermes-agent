@@ -3744,13 +3744,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 resolved_session_key = None
 
         model = _resolve_gateway_model(user_config)
+        override = None
         if resolved_session_key:
-            self._rehydrate_session_model_override(resolved_session_key)
-        override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
-        if override is None and resolved_session_key:
-            # Persistent per-topic model fallback (topic_models.json): survives /new and
-            # gateway restarts even when evicted from the in-memory dict (ported from
-            # feat/profile-isolation-pr). Key is profile-namespaced (agent:<profile>:...).
+            # Persistent per-topic model (topic_models.json) is AUTHORITATIVE for a bound
+            # topic: it carries the full provider config and is what /model writes now, so a
+            # topic keeps its OWN model across /new AND gateway restarts — never silently
+            # falling back to the global default or a stale state.db override.
             try:
                 _persistent_model = _load_topic_models().get(resolved_session_key)
             except Exception:
@@ -3758,6 +3757,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _persistent_model:
                 override = _persistent_model
                 self._session_model_overrides[resolved_session_key] = _persistent_model
+            else:
+                # No per-topic model set — honor an in-memory / state.db /model override.
+                self._rehydrate_session_model_override(resolved_session_key)
+                override = self._session_model_overrides.get(resolved_session_key)
         if override:
             override_model = override.get("model", model)
             override_runtime = {
