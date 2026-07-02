@@ -1319,6 +1319,46 @@ def _remove_topic_profile(topic_key: str) -> None:
         except Exception as e:
             logger.warning("Failed to remove topic profile: %s", e)
 
+
+# --- Per-topic model overrides (ported from feat/profile-isolation-pr) --------------
+# Persistent per-session (per-topic) model/provider overrides in ~/.hermes/topic_models.json,
+# keyed by session_key (e.g. agent:main:telegram:dm:<chat>:<thread>). Loaded into
+# _session_model_overrides at startup so each topic keeps its own model across restarts.
+def _load_topic_models() -> dict:
+    """Load persistent topic-specific model overrides from ~/.hermes/topic_models.json."""
+    import json
+    path = _hermes_home / "topic_models.json"
+    if path.exists():
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_topic_model(session_key: str, model_data: dict) -> None:
+    """Persist a topic-specific model override to ~/.hermes/topic_models.json."""
+    path = _hermes_home / "topic_models.json"
+    data = _load_topic_models()
+    data[session_key] = model_data
+    try:
+        atomic_json_write(path, data)
+    except Exception as e:
+        logger.warning("Failed to save topic model: %s", e)
+
+
+def _remove_topic_model(session_key: str) -> None:
+    """Remove a topic-specific model override from ~/.hermes/topic_models.json."""
+    path = _hermes_home / "topic_models.json"
+    data = _load_topic_models()
+    if session_key in data:
+        data.pop(session_key)
+        try:
+            atomic_json_write(path, data)
+        except Exception as e:
+            logger.warning("Failed to remove topic model: %s", e)
+
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
 from dotenv import load_dotenv  # noqa: F401  # backward-compat for tests that monkeypatch this symbol
@@ -2901,6 +2941,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Per-session model overrides from /model command.
         # Key: session_key, Value: dict with model/provider/api_key/base_url/api_mode
         self._session_model_overrides: Dict[str, Dict[str, str]] = {}
+        # Restore persistent per-topic model overrides (~/.hermes/topic_models.json) so each
+        # topic keeps its own model across restarts (ported from feat/profile-isolation-pr).
+        try:
+            self._session_model_overrides.update(_load_topic_models())
+        except Exception as e:
+            logger.warning("Failed to load topic models at startup: %s", e)
         # Per-session reasoning effort overrides from /reasoning.
         # Key: session_key, Value: parsed reasoning config dict.
         self._session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
