@@ -832,7 +832,7 @@ def init_agent(
                 client_kwargs["default_headers"] = build_nvidia_nim_headers(effective_base)
             elif base_url_host_matches(effective_base, "api.routermint.com"):
                 client_kwargs["default_headers"] = _ra()._routermint_headers()
-            elif base_url_host_matches(effective_base, "api.githubcopilot.com"):
+            elif base_url_host_matches(effective_base, "githubcopilot.com"):
                 from hermes_cli.models import copilot_default_headers
 
                 client_kwargs["default_headers"] = copilot_default_headers()
@@ -977,6 +977,34 @@ def init_agent(
         # client_kwargs is the same dict object as agent._client_kwargs, so
         # this mutation is reflected in the client built just below.
         agent._apply_user_default_headers()
+
+        try:
+            from hermes_cli.config import (
+                apply_custom_provider_extra_headers_to_client_kwargs,
+                apply_custom_provider_tls_to_client_kwargs,
+                get_compatible_custom_providers,
+                load_config,
+            )
+
+            _cp_config = load_config()
+            _cp_entries = get_compatible_custom_providers(_cp_config)
+            _cp_base_url = str(client_kwargs.get("base_url") or agent.base_url or "")
+            apply_custom_provider_tls_to_client_kwargs(
+                client_kwargs,
+                _cp_base_url,
+                _cp_entries,
+            )
+            # Per-provider extra HTTP headers (providers.<name>.extra_headers /
+            # custom_providers[].extra_headers) — proxies, gateways, custom
+            # auth. Applied last so the most specific config level wins.
+            # SECURITY: values may carry credentials — never log them.
+            apply_custom_provider_extra_headers_to_client_kwargs(
+                client_kwargs,
+                _cp_base_url,
+                _cp_entries,
+            )
+        except Exception:
+            logger.debug("custom-provider TLS resolution skipped", exc_info=True)
 
         agent.api_key = client_kwargs.get("api_key", "")
         agent.base_url = client_kwargs.get("base_url", agent.base_url)
@@ -1171,6 +1199,11 @@ def init_agent(
     # continuation row that must remain open after the helper is torn down;
     # those callers explicitly set this flag to False.
     agent._end_session_on_close = True
+    # When True, this agent NEVER persists to the canonical session store
+    # (state.db) or the JSON snapshot, regardless of session_id. Set on the
+    # background skill/memory review fork so its harness turn can't leak into
+    # the user's real session and hijack the next live turn. Default False.
+    agent._persist_disabled = False
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,
@@ -1316,6 +1349,12 @@ def init_agent(
     if not isinstance(_agent_section, dict):
         _agent_section = {}
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+
+    # Intent-ack continuation config: "auto" (default — codex_responses only,
+    # the historical gate), true (all api_modes), false (never), or a list of
+    # model-name substrings.  Resolved against the active api_mode/model in the
+    # conversation loop's intent-ack block.
+    agent._intent_ack_continuation = _agent_section.get("intent_ack_continuation", "auto")
 
     # Universal task-completion guidance toggle.  Default True.  Surfaced
     # as a separate flag from tool_use_enforcement because the guidance
@@ -1669,6 +1708,12 @@ def init_agent(
             abort_on_summary_failure=compression_abort_on_summary_failure,
             max_tokens=agent.max_tokens,
         )
+    _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
+    if callable(_bind_session_state):
+        try:
+            _bind_session_state(session_db=session_db, session_id=agent.session_id)
+        except Exception:
+            pass
     agent.compression_enabled = compression_enabled
     agent.compression_in_place = compression_in_place
 

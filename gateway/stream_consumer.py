@@ -32,6 +32,10 @@ from gateway.config import (
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
     DEFAULT_STREAMING_CURSOR as _DEFAULT_STREAMING_CURSOR,
 )
+from gateway.response_filters import (
+    is_intentional_silence_response as _is_intentional_silence_response,
+    is_partial_silence_marker as _is_partial_silence_marker,
+)
 
 logger = logging.getLogger("gateway.stream_consumer")
 
@@ -121,6 +125,7 @@ class GatewayStreamConsumer:
         on_new_message: Optional[callable] = None,
         on_before_finalize: Optional[Callable[[], Any]] = None,
         initial_reply_to_id: Optional[str] = None,
+        run_still_current: Optional[Callable[[], bool]] = None,
     ):
         self.adapter = adapter
         self.chat_id = chat_id
@@ -175,6 +180,7 @@ class GatewayStreamConsumer:
         # streaming, even if the final edit (cursor removal etc.)
         # subsequently failed.
         self._final_content_delivered = False
+        self._delivered_commentary_texts: list[str] = []
         # Cache adapter lifecycle capability: only platforms that need an
         # explicit finalize call (e.g. DingTalk AI Cards) force us to make
         # a redundant final edit.  Everyone else keeps the fast path.
@@ -183,6 +189,11 @@ class GatewayStreamConsumer:
         self._adapter_requires_finalize: bool = (
             getattr(adapter, "REQUIRES_EDIT_FINALIZE", False) is True
         )
+
+        # Session staleness guard — when set to False (e.g. after /new or
+        # /stop), the run() loop will abandon the stream early instead of
+        # continuing to edit and deliver stale deltas.
+        self._run_still_current = run_still_current or (lambda: True)
 
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
@@ -203,11 +214,6 @@ class GatewayStreamConsumer:
         self._draft_failures = 0
         self._before_finalize_notified = False
 
-    def _metadata_for_adapter(self, metadata: Optional[dict] = None) -> dict:
-        meta = dict(metadata or self.metadata or {})
-        meta["is_agent"] = True
-        return meta
-
     def _metadata_for_send(
         self,
         *,
@@ -225,7 +231,7 @@ class GatewayStreamConsumer:
         legacy send path, while fresh/fallback final sends can still use richer
         final-message delivery.
         """
-        meta = self._metadata_for_adapter()
+        meta = dict(self.metadata) if self.metadata else {}
         if expect_edits:
             meta["expect_edits"] = True
         if final:
@@ -246,20 +252,6 @@ class GatewayStreamConsumer:
     def message_id(self) -> str | None:
         """The Discord/chat message ID of the last-sent or edited message."""
         return self._message_id
-
-    @property
-    def message_ids(self) -> tuple[str, ...]:
-        """All visible platform message ids that make up the streamed reply."""
-        ids: list[str] = []
-        for mid in self._preview_message_ids:
-            text = str(mid).strip()
-            if text and text != "__no_edit__" and text not in ids:
-                ids.append(text)
-        if self._message_id:
-            text = str(self._message_id).strip()
-            if text and text != "__no_edit__" and text not in ids:
-                ids.append(text)
-        return tuple(ids)
 
     @property
     def final_content_delivered(self) -> bool:
@@ -305,10 +297,20 @@ class GatewayStreamConsumer:
                     param.kind is inspect.Parameter.VAR_KEYWORD
                     for param in params.values()
                 ):
-                    kwargs["metadata"] = self._metadata_for_adapter()
+                    kwargs["metadata"] = self.metadata
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)
+
+    def has_delivered_text(self, text: str) -> bool:
+        """Return True if *text* was already delivered as visible chat content."""
+        target = self._clean_for_display(text or "").strip()
+        if not target:
+            return False
+        visible_prefix = self._visible_prefix().strip()
+        if visible_prefix == target:
+            return True
+        return any(sent.strip() == target for sent in self._delivered_commentary_texts)
 
     def on_segment_break(self) -> None:
         """Finalize the current stream segment and start a fresh message."""
@@ -392,12 +394,17 @@ class GatewayStreamConsumer:
         self._think_buffer = ""
 
         while buf:
+            # Case-insensitive matching: models emit mixed-case tag
+            # variants (<Think>, <THINKING>, …). Match against a
+            # lowercased view of the buffer with lowercased tag names so
+            # every case variant is caught with a single canonical form.
+            lower_buf = buf.lower()
             if self._in_think_block:
                 # Look for the earliest closing tag
                 best_idx = -1
                 best_len = 0
                 for tag in self._CLOSE_THINK_TAGS:
-                    idx = buf.find(tag)
+                    idx = lower_buf.find(tag.lower())
                     if idx != -1 and (best_idx == -1 or idx < best_idx):
                         best_idx = idx
                         best_len = len(tag)
@@ -420,9 +427,10 @@ class GatewayStreamConsumer:
                 best_idx = -1
                 best_len = 0
                 for tag in self._OPEN_THINK_TAGS:
+                    tag_lower = tag.lower()
                     search_start = 0
                     while True:
-                        idx = buf.find(tag, search_start)
+                        idx = lower_buf.find(tag_lower, search_start)
                         if idx == -1:
                             break
                         # Block-boundary check (mirrors cli.py logic)
@@ -458,15 +466,55 @@ class GatewayStreamConsumer:
                     # No opening tag — check for a partial tag at the tail
                     held_back = 0
                     for tag in self._OPEN_THINK_TAGS:
+                        tag_lower = tag.lower()
                         for i in range(1, len(tag)):
-                            if buf.endswith(tag[:i]) and i > held_back:
+                            if lower_buf.endswith(tag_lower[:i]) and i > held_back:
                                 held_back = i
                     if held_back:
                         self._accumulated += buf[:-held_back]
                         self._think_buffer = buf[-held_back:]
                     else:
-                        self._accumulated += buf
+                        # No (partial) open tag — but the model may have
+                        # emitted an orphan close tag like </think> on its
+                        # own (e.g. when a thinking-mode toggle drops the
+                        # matched open, or when upstream stripping is
+                        # incomplete). Strip those before accumulating so
+                        # they never reach the user.
+                        self._accumulated += self._strip_orphan_close_tags(buf)
                     return
+
+    @classmethod
+    def _strip_orphan_close_tags(cls, text: str) -> str:
+        """Remove any close tags from *text* that have no matching open.
+
+        Mirrors ``agent/think_scrubber.py::StreamingThinkScrubber.
+        _strip_orphan_close_tags`` so the progressive-display filter
+        behaves the same as the post-stream final-response scrubber.
+        An orphan close tag is always noise — stripped along with any
+        trailing whitespace so surrounding prose flows naturally.
+        """
+        if "</" not in text:
+            return text
+        text_lower = text.lower()
+        out: list[str] = []
+        i = 0
+        while i < len(text):
+            matched = False
+            if text_lower[i:i + 2] == "</":
+                for tag in cls._CLOSE_THINK_TAGS:
+                    tag_lower = tag.lower()
+                    tag_len = len(tag_lower)
+                    if text_lower[i:i + tag_len] == tag_lower:
+                        j = i + tag_len
+                        while j < len(text) and text[j] in " \t\n\r":
+                            j += 1
+                        i = j
+                        matched = True
+                        break
+            if not matched:
+                out.append(text[i])
+                i += 1
+        return "".join(out)
 
     def _flush_think_buffer(self) -> None:
         """Flush any held-back partial-tag buffer into accumulated text.
@@ -475,7 +523,9 @@ class GatewayStreamConsumer:
         was held back waiting for a possible opening tag is not lost.
         """
         if self._think_buffer and not self._in_think_block:
-            self._accumulated += self._think_buffer
+            # Strip any orphan close tags that may have been held back —
+            # see _filter_and_accumulate for context.
+            self._accumulated += self._strip_orphan_close_tags(self._think_buffer)
             self._think_buffer = ""
 
     async def run(self) -> None:
@@ -512,6 +562,12 @@ class GatewayStreamConsumer:
 
         try:
             while True:
+                # Abandon the stream early if the session has been reset
+                # (e.g. /new or /stop). Prevents stale deltas from being
+                # delivered after the user has already moved on.
+                if not self._run_still_current():
+                    return
+
                 # Drain all available items from the queue
                 got_done = False
                 got_segment_break = False
@@ -538,6 +594,22 @@ class GatewayStreamConsumer:
                 if got_done:
                     self._flush_think_buffer()
 
+                    # Intentional-silence suppression.  When the agent chose
+                    # not to reply it emits a bare control marker (NO_REPLY /
+                    # [SILENT] / …).  The gateway's whole-response filter
+                    # (gateway/run.py) suppresses this on the non-streaming
+                    # path, but by the time it runs the stream consumer has
+                    # already edited the raw marker onto the screen.  Detect
+                    # the exact-marker final buffer here and retract any
+                    # preview instead of finalizing it, so the marker never
+                    # reaches the chat.  Substantive prose that merely mentions
+                    # a marker is NOT suppressed (see is_intentional_silence_response).
+                    if _is_intentional_silence_response(
+                        self._clean_for_display(self._accumulated)
+                    ):
+                        await self._suppress_silence_marker()
+                        return
+
                 # Decide whether to flush an edit
                 now = time.monotonic()
                 elapsed = now - self._last_edit_time
@@ -558,6 +630,24 @@ class GatewayStreamConsumer:
                     )
 
                 current_update_visible = False
+                # Hold back mid-stream edits while the buffer so far could
+                # still resolve to an intentional-silence marker.  Without
+                # this, a partial marker (e.g. "NO_REPLY" streamed as
+                # "NO"→"NO_REPLY") would flash onto the screen on an interval
+                # tick before got_done can suppress it.  Only defers display —
+                # got_done above always resolves the buffer (suppress if it's
+                # an exact marker, otherwise fall through and flush normally),
+                # so genuine prose that merely starts marker-like is never lost.
+                if (
+                    should_edit
+                    and not got_done
+                    and not got_segment_break
+                    and commentary_text is None
+                    and _is_partial_silence_marker(
+                        self._clean_for_display(self._accumulated)
+                    )
+                ):
+                    should_edit = False
                 if should_edit and self._accumulated:
                     # Split overflow: if accumulated text exceeds the platform
                     # limit, split into properly sized chunks.
@@ -798,35 +888,18 @@ class GatewayStreamConsumer:
     # treated identically whichever path delivered the text.
     _MEDIA_RE = MEDIA_TAG_CLEANUP_RE
 
-    # Strip SUGGESTION:{...} markers from streamed text. The marker is
-    # post-processed by _deliver_suggestion_from_response after the stream
-    # completes; hiding it during streaming prevents raw JSON from flashing
-    # to the user before the interactive button message is sent.
-    _SUGGESTION_RE = re.compile(r"SUGGESTION:\s*\{.*?\}\s*$", re.DOTALL)
-
     @staticmethod
     def _clean_for_display(text: str) -> str:
-        """Strip MEDIA: directives, SUGGESTION markers, and internal markers from text before display.
+        """Strip MEDIA: directives and internal markers from text before display.
 
         The streaming path delivers raw text chunks that may include
-        ``MEDIA:<path>`` tags, ``[[audio_as_voice]]`` directives, and
-        ``SUGGESTION:{...}`` markers meant for the platform adapter's
-        post-processing.  The actual media files are delivered separately
-        via ``_deliver_media_from_response()`` and suggestion buttons via
-        ``_deliver_suggestion_from_response()`` after the stream finishes
-        — we just need to hide the raw directives from the user.
+        ``MEDIA:<path>`` tags and ``[[audio_as_voice]]`` directives meant for
+        the platform adapter's post-processing.  The actual media files are
+        delivered separately via ``_deliver_media_from_response()`` after the
+        stream finishes — we just need to hide the raw directives from the
+        user.
         """
-        if "MEDIA:" not in text and "[[audio_as_voice]]" not in text and "SUGGESTION:" not in text:
-            return text
-        cleaned = text.replace("[[audio_as_voice]]", "")
-        cleaned = GatewayStreamConsumer._MEDIA_RE.sub("", cleaned)
-        # Strip SUGGESTION:{...} marker — delivered as interactive buttons
-        # after streaming completes (via _deliver_suggestion_from_response).
-        cleaned = GatewayStreamConsumer._SUGGESTION_RE.sub("", cleaned)
-        # Collapse excessive blank lines left behind by removed tags
-        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
-        # Strip trailing whitespace/newlines but preserve leading content
-        return cleaned.rstrip()
+        return _BasePlatformAdapter.strip_media_directives_for_display(text)
 
     async def _send_new_chunk(
         self,
@@ -1073,7 +1146,7 @@ class GatewayStreamConsumer:
         try:
             supported = self.adapter.supports_draft_streaming(
                 chat_type=self.cfg.chat_type or None,
-                metadata=self._metadata_for_adapter(),
+                metadata=self.metadata,
             )
         except Exception:
             logger.debug("supports_draft_streaming probe raised", exc_info=True)
@@ -1107,7 +1180,7 @@ class GatewayStreamConsumer:
                 chat_id=self.chat_id,
                 draft_id=self._draft_id,
                 content=text,
-                metadata=self._metadata_for_adapter(),
+                metadata=self.metadata,
             )
         except Exception as e:
             logger.debug(
@@ -1154,7 +1227,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=tail,
-                metadata=self._metadata_for_adapter(),
+                metadata=self.metadata,
             )
             if result.success:
                 self._already_sent = True
@@ -1187,12 +1260,10 @@ class GatewayStreamConsumer:
         if not text.strip():
             return False
         try:
-            meta = self._metadata_for_adapter()
-            meta["is_commentary"] = True
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=meta,
+                metadata=self.metadata,
             )
             # Note: do NOT set _already_sent = True here.
             # Commentary messages are interim status updates (e.g. "Using browser
@@ -1204,6 +1275,10 @@ class GatewayStreamConsumer:
                 # stale tool bubble above it so the next tool starts a
                 # new bubble below.
                 self._notify_new_message()
+                # Record the exact delivered text so run.py can confirm whether
+                # an interim "preview" actually carried the final response, vs.
+                # unrelated commentary delivered during a session split (#14238).
+                self._delivered_commentary_texts.append(text)
             return result.success
         except Exception as e:
             logger.error("Commentary send error: %s", e)
@@ -1288,7 +1363,7 @@ class GatewayStreamConsumer:
             return False
         try:
             try:
-                result = fn(text, metadata=self._metadata_for_adapter())
+                result = fn(text, metadata=self.metadata)
             except TypeError:
                 # Adapter / test double whose hook doesn't accept the metadata
                 # keyword — fall back to the positional-only form.
@@ -1369,6 +1444,49 @@ class GatewayStreamConsumer:
         if is_turn_final:
             self._final_response_sent = True
         return True
+
+    async def _suppress_silence_marker(self) -> None:
+        """Retract any streamed preview when the final reply is a silence marker.
+
+        The agent chose not to respond and emitted a bare control marker.  Any
+        preview message the consumer already put on screen (a partial marker
+        flushed on an interval tick, or a preamble before a tool boundary) must
+        be removed so the raw marker is never left visible.  Deletion reuses the
+        same best-effort ``delete_message`` path as :meth:`_try_fresh_final`.
+
+        Crucially, the delivery flags (``_final_response_sent`` /
+        ``_final_content_delivered``) are left **False**: nothing was delivered.
+        The gateway then does not mistake the marker for a delivered reply, and
+        its own whole-response filter turns the marker into "" so no fallback
+        send happens either.  ``_already_sent`` is likewise cleared so the
+        gateway's ``already_sent`` short-circuits do not fire.
+        """
+        stale_ids = set(self._preview_message_ids)
+        if self._message_id and self._message_id != "__no_edit__":
+            stale_ids.add(self._message_id)
+        delete_fn = getattr(self.adapter, "delete_message", None)
+        if delete_fn is not None:
+            for stale_id in stale_ids:
+                if not stale_id or stale_id == "__no_edit__":
+                    continue
+                try:
+                    await delete_fn(self.chat_id, stale_id)
+                except Exception as e:
+                    logger.debug(
+                        "Silence-marker preview cleanup failed (%s): %s",
+                        stale_id, e,
+                    )
+        self._preview_message_ids = set()
+        self._message_id = None
+        self._accumulated = ""
+        self._last_sent_text = ""
+        self._already_sent = False
+        self._final_response_sent = False
+        self._final_content_delivered = False
+        logger.info(
+            "Suppressed streamed intentional-silence marker (chat=%s)",
+            self.chat_id,
+        )
 
     async def _send_or_edit(
         self, text: str, *, finalize: bool = False, is_turn_final: bool = True,

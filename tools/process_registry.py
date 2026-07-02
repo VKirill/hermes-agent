@@ -39,7 +39,6 @@ import subprocess
 import threading
 import time
 import uuid
-from pathlib import Path
 
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
@@ -54,12 +53,12 @@ logger = logging.getLogger(__name__)
 
 # Checkpoint file for crash recovery (gateway only)
 CHECKPOINT_PATH = get_hermes_home() / "processes.json"
-_IMPORT_CHECKPOINT_PATH = CHECKPOINT_PATH
 
 # Limits
 MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
+MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
 
 # Watch pattern rate limiting — PER SESSION.
 # Hard rule: at most ONE watch-match notification every WATCH_MIN_INTERVAL_SECONDS.
@@ -75,24 +74,6 @@ WATCH_STRIKE_LIMIT = 3            # Strikes in a row → disable watch + promote
 WATCH_GLOBAL_MAX_PER_WINDOW = 15
 WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
-
-
-def _checkpoint_path_for_home(home: str | Path | None = None) -> Path:
-    """Return the checkpoint path for the active Hermes home.
-
-    Tests historically monkeypatch ``CHECKPOINT_PATH`` directly.  Preserve
-    that contract; otherwise derive the path from the current/profile home so
-    routed profile process metadata is not persisted in the gateway home.
-    """
-    configured = Path(CHECKPOINT_PATH)
-    if configured != _IMPORT_CHECKPOINT_PATH:
-        return configured
-    base = Path(home).expanduser() if home else get_hermes_home()
-    return base / "processes.json"
-
-
-def _checkpoint_path_overridden() -> bool:
-    return Path(CHECKPOINT_PATH) != _IMPORT_CHECKPOINT_PATH
 
 
 def format_uptime_short(seconds: int) -> str:
@@ -113,8 +94,6 @@ class ProcessSession:
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
     session_key: str = ""                       # Gateway session key (for reset protection)
-    agent_profile: str = ""                     # Routed gateway profile name
-    agent_hermes_home: str = ""                 # Routed profile HERMES_HOME
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
     env_ref: Any = None                         # Reference to the environment object
@@ -217,7 +196,15 @@ class ProcessRegistry:
         self._global_watch_window_hits: int = 0
         self._global_watch_tripped_until: float = 0.0
         self._global_watch_suppressed_during_trip: int = 0
-        self._checkpoint_paths: set[Path] = {_checkpoint_path_for_home()}
+        # Live-output sink set by a driver (e.g. the desktop gateway): called from
+        # reader threads with (session, chunk) to stream output to a UI in
+        # real time, instead of polling the output tail.
+        self.on_output = None
+        # Close-view sink set by a driver (desktop gateway): called with
+        # (session_or_none, process_id) when the agent asks to close a read-only
+        # terminal tab. Distinct from kill — the process keeps running; only the
+        # UI view is dropped (the user can reopen it from the status stack).
+        self.on_close = None
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -226,6 +213,17 @@ class ProcessRegistry:
         while lines and any(noise in lines[0] for noise in ProcessRegistry._SHELL_NOISE_SUBSTRINGS):
             lines.pop(0)
         return "\n".join(lines)
+
+    def _emit_output(self, session: ProcessSession, chunk: str) -> None:
+        """Forward a freshly-read chunk to the live-output sink, if one is set.
+        Called from reader threads; never raise into the read loop."""
+        sink = self.on_output
+        if sink is None or not chunk:
+            return
+        try:
+            sink(session, chunk)
+        except Exception:
+            pass
 
     def _check_watch_patterns(self, session: ProcessSession, new_text: str) -> None:
         """Scan new output for watch patterns and queue notifications.
@@ -311,8 +309,6 @@ class ProcessRegistry:
                 self.completion_queue.put({
                     "session_id": session.id,
                     "session_key": session.session_key,
-                    "agent_profile": session.agent_profile,
-                    "agent_hermes_home": session.agent_hermes_home,
                     "command": session.command,
                     "type": "watch_disabled",
                     "suppressed": session._watch_suppressed,
@@ -344,8 +340,6 @@ class ProcessRegistry:
         self.completion_queue.put({
             "session_id": session.id,
             "session_key": session.session_key,
-            "agent_profile": session.agent_profile,
-            "agent_hermes_home": session.agent_hermes_home,
             "command": session.command,
             "type": "watch_match",
             "pattern": matched_pattern,
@@ -693,8 +687,6 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
-        agent_profile: str = "",
-        agent_hermes_home: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -711,8 +703,6 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
-            agent_profile=agent_profile,
-            agent_hermes_home=agent_hermes_home,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
@@ -836,8 +826,6 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
-        agent_profile: str = "",
-        agent_hermes_home: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -933,13 +921,33 @@ class ProcessRegistry:
     # ----- Reader / Poller Threads -----
 
     def _reader_loop(self, session: ProcessSession):
-        """Background thread: read stdout from a local Popen process."""
+        """Background thread: read stdout from a local Popen process.
+
+        IMPORTANT: avoid ``TextIOWrapper.read(4096)`` here. On pipes that call can
+        block until EOF (or a large buffer fills), which makes "live" output land
+        in one burst at process exit. ``buffer.read1(4096)`` yields incremental
+        chunks as bytes become available, then we decode to text.
+        """
         first_chunk = True
         try:
+            stdout = session.process.stdout
+            if stdout is None:
+                return
+
+            raw_read = getattr(getattr(stdout, "buffer", None), "read1", None)
             while True:
-                chunk = session.process.stdout.read(4096)
-                if not chunk:
-                    break
+                if raw_read is not None:
+                    raw = raw_read(4096)
+                    if not raw:
+                        break
+                    chunk = raw.decode("utf-8", errors="replace")
+                else:
+                    # Fallback for mocked/alternate streams without a buffered raw
+                    # interface. This may be less "live", but keeps compatibility.
+                    chunk = stdout.read(4096)
+                    if not chunk:
+                        break
+
                 if first_chunk:
                     chunk = self._clean_shell_noise(chunk)
                     first_chunk = False
@@ -948,6 +956,7 @@ class ProcessRegistry:
                     if len(session.output_buffer) > session.max_output_chars:
                         session.output_buffer = session.output_buffer[-session.max_output_chars:]
                 self._check_watch_patterns(session, chunk)
+                self._emit_output(session, chunk)
         except Exception as e:
             logger.debug("Process stdout reader ended: %s", e)
         finally:
@@ -986,6 +995,7 @@ class ProcessRegistry:
                             session.output_buffer = session.output_buffer[-session.max_output_chars:]
                     if delta:
                         self._check_watch_patterns(session, delta)
+                        self._emit_output(session, delta)
 
                 # Check if process is still running
                 check = env.execute(
@@ -1034,6 +1044,7 @@ class ProcessRegistry:
                             if len(session.output_buffer) > session.max_output_chars:
                                 session.output_buffer = session.output_buffer[-session.max_output_chars:]
                         self._check_watch_patterns(session, text)
+                        self._emit_output(session, text)
                 except EOFError:
                     break
                 except Exception:
@@ -1075,8 +1086,6 @@ class ProcessRegistry:
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
-                "agent_profile": session.agent_profile,
-                "agent_hermes_home": session.agent_hermes_home,
                 "command": session.command,
                 "exit_code": session.exit_code,
                 "completion_reason": session.completion_reason,
@@ -1165,51 +1174,6 @@ class ProcessRegistry:
         with self._lock:
             session = self._running.get(session_id) or self._finished.get(session_id)
         return self._refresh_detached_session(session)
-
-    @staticmethod
-    def _normalize_home(value: str) -> str:
-        value = str(value or "").strip()
-        if not value:
-            return ""
-        try:
-            return str(Path(value).expanduser().resolve(strict=False))
-        except Exception:
-            return value
-
-    def _current_scope(self) -> tuple[bool, str, str]:
-        try:
-            from gateway.session_context import get_session_env
-            active_profile = get_session_env("HERMES_SESSION_AGENT_PROFILE", "")
-            active_home = get_session_env("HERMES_SESSION_AGENT_HERMES_HOME", "")
-        except Exception:
-            active_profile = ""
-            active_home = ""
-
-        active_home = self._normalize_home(active_home)
-        active_profile = str(active_profile or "").strip()
-        is_routed = bool(active_profile or active_home)
-        return is_routed, active_home, active_profile
-
-    def _in_current_scope(self, session: ProcessSession) -> bool:
-        is_routed, active_home, active_profile = self._current_scope()
-        session_home = self._normalize_home(session.agent_hermes_home)
-        session_profile = str(session.agent_profile or "").strip()
-        if not session_profile:
-            parts = str(session.session_key or "").split(":", 2)
-            if len(parts) >= 2 and parts[0] == "agent" and parts[1] not in {"", "main", "cron"}:
-                session_profile = parts[1]
-        if is_routed:
-            if active_home:
-                return bool(session_home and session_home == active_home)
-            return False
-        return not bool(session_home or session_profile)
-
-    def _get_for_current_scope(self, session_id: str) -> Optional[ProcessSession]:
-        """Return a process only when it belongs to the active profile scope."""
-        session = self.get(session_id)
-        if session is None or not self._in_current_scope(session):
-            return None
-        return session
 
     def _reconcile_local_exit(self, session: "ProcessSession") -> None:
         """Reconcile session.exited against the real child process state.
@@ -1350,6 +1314,7 @@ class ProcessRegistry:
 
         result = {
             "session_id": session.id,
+            "command": session.command,
             "status": "exited" if session.exited else "running",
             "output": "\n".join(selected),
             "total_lines": total_lines,
@@ -1409,6 +1374,7 @@ class ProcessRegistry:
                 self._completion_consumed.add(session_id)
                 result = {
                     "status": "exited",
+                    "command": session.command,
                     "exit_code": session.exit_code,
                     "completion_reason": session.completion_reason,
                     "termination_source": session.termination_source,
@@ -1421,6 +1387,7 @@ class ProcessRegistry:
             if _is_interrupted():
                 result = {
                     "status": "interrupted",
+                    "command": session.command,
                     "output": strip_ansi(session.output_buffer[-1000:]),
                     "note": "User sent a new message -- wait interrupted",
                 }
@@ -1435,6 +1402,7 @@ class ProcessRegistry:
 
         result = {
             "status": "timeout",
+            "command": session.command,
             "output": strip_ansi(session.output_buffer[-1000:]),
         }
         if timeout_note:
@@ -1465,24 +1433,10 @@ class ProcessRegistry:
                     if session.pid:
                         os.kill(session.pid, signal.SIGTERM)
             elif session.process:
-                # Local process -- kill the process tree
-                try:
-                    if _IS_WINDOWS:
-                        session.process.terminate()
-                    else:
-                        import psutil
-                        try:
-                            parent = psutil.Process(session.process.pid)
-                            for child in parent.children(recursive=True):
-                                try:
-                                    child.terminate()
-                                except psutil.NoSuchProcess:
-                                    pass
-                            parent.terminate()
-                        except psutil.NoSuchProcess:
-                            pass
-                except (ProcessLookupError, PermissionError):
-                    session.process.kill()
+                # Local process -- kill the process tree. On Windows this
+                # must be taskkill /T /F; Popen.terminate() only kills the
+                # shell wrapper and leaves Git Bash descendants behind.
+                self._terminate_host_pid(session.process.pid, session.host_start_time)
             elif session.env_ref and session.pid:
                 # Non-local -- kill inside sandbox
                 session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
@@ -1558,6 +1512,37 @@ class ProcessRegistry:
         """Send data + newline to a running process's stdin (like pressing Enter)."""
         return self.write_stdin(session_id, data + "\n")
 
+    def request_close_terminal(self, session_id: str) -> dict:
+        """Ask the desktop GUI to close the read-only terminal tab mirroring this
+        background process.
+
+        This does NOT kill the process — it only drops the view. Output keeps
+        streaming into the (capped) buffer and the user can reopen the tab from
+        the status stack. Desktop-only: returns an error if no UI close sink is
+        wired (e.g. CLI / messaging)."""
+        sink = self.on_close
+        if sink is None:
+            return {
+                "status": "error",
+                "error": "close_terminal is only available in the Hermes desktop app.",
+            }
+        # The session may already be finished (or pruned) — the tab can still
+        # linger and be closed, so a missing session is not an error here.
+        session = self.get(session_id)
+        try:
+            sink(session, session_id)
+        except Exception as e:
+            return {"status": "error", "error": str(e)}
+        return {
+            "status": "ok",
+            "closed": session_id,
+            "note": (
+                "Closed the read-only terminal tab. The process was not killed; "
+                "its output remains available and the user can reopen the tab "
+                "from the status stack."
+            ),
+        }
+
     def close_stdin(self, session_id: str) -> dict:
         """Close a running process's stdin / send EOF without killing the process."""
         session = self.get(session_id)
@@ -1594,16 +1579,28 @@ class ProcessRegistry:
         except Exception:
             return 0
 
-    def list_sessions(self, task_id: str = None) -> list:
-        """List all running and recently-finished processes."""
+    def list_sessions(self, task_id: str = None, session_key: str = None) -> list:
+        """List all running and recently-finished processes.
+
+        When ``task_id`` is given, processes for that task are included. When
+        ``session_key`` is also given, session-scoped background processes
+        (``background: true``) registered under that gateway session are
+        surfaced too, even if they belong to a different task — so the agent
+        can discover a forgotten preview server that is blocking session
+        reset (#29177). Such cross-task entries are flagged with
+        ``"session_scoped": true``.
+        """
         with self._lock:
             all_sessions = list(self._running.values()) + list(self._finished.values())
 
         all_sessions = [self._refresh_detached_session(s) for s in all_sessions]
-        all_sessions = [s for s in all_sessions if self._in_current_scope(s)]
 
-        if task_id:
-            all_sessions = [s for s in all_sessions if s.task_id == task_id]
+        if task_id or session_key:
+            all_sessions = [
+                s for s in all_sessions
+                if (task_id and s.task_id == task_id)
+                or (session_key and s.session_key == session_key)
+            ]
 
         result = []
         for s in all_sessions:
@@ -1617,6 +1614,11 @@ class ProcessRegistry:
                 "status": "exited" if s.exited else "running",
                 "output_preview": s.output_buffer[-200:] if s.output_buffer else "",
             }
+            # Flag processes surfaced only because they share the gateway
+            # session (not the current task) — these are the long-lived
+            # background processes a user may have forgotten about (#29177).
+            if task_id and session_key and s.task_id != task_id and s.session_key == session_key:
+                entry["session_scoped"] = True
             # Trigger metadata so a goal-loop judge can decide to wait on this
             # process's OWN signal (a watch-pattern match or completion), not
             # just its exit. A watcher with watch_patterns may never exit.
@@ -1648,17 +1650,35 @@ class ProcessRegistry:
                 for s in self._running.values()
             )
 
-    def has_active_for_session(self, session_key: str) -> bool:
-        """Check if there are active processes for a gateway session key."""
+    def has_active_for_session(
+        self, session_key: str, max_active_age: Optional[float] = None,
+    ) -> bool:
+        """Check if there are active processes for a gateway session key.
+
+        When *max_active_age* is set (seconds), processes that started more
+        than that many seconds ago are **ignored** — they are still running
+        but are considered stale and must not block session idle / daily
+        reset.  This prevents a forgotten ``http.server`` (or any long-lived
+        preview process) from permanently freezing the session lifecycle.
+
+        Args:
+            session_key: Gateway session key to check.
+            max_active_age: If set, ignore processes older than this many
+                seconds.  ``None`` retains the legacy behaviour (any running
+                process blocks).
+        """
         with self._lock:
             sessions = list(self._running.values())
 
         for session in sessions:
             self._refresh_detached_session(session)
 
+        now = time.time()
         with self._lock:
             return any(
-                s.session_key == session_key and not s.exited
+                s.session_key == session_key
+                and not s.exited
+                and (max_active_age is None or (now - s.started_at) < max_active_age)
                 for s in self._running.values()
             )
 
@@ -1731,16 +1751,11 @@ class ProcessRegistry:
 
     # ----- Checkpoint (crash recovery) -----
 
-    @staticmethod
-    def _checkpoint_path_for_session(session: ProcessSession) -> Path:
-        home = str(session.agent_hermes_home or "").strip()
-        return _checkpoint_path_for_home(home or None)
-
     def _write_checkpoint(self):
         """Write running process metadata to checkpoint file atomically."""
         try:
             with self._lock:
-                entries_by_path: Dict[Path, list[dict]] = {}
+                entries = []
                 for s in self._running.values():
                     if not s.exited:
                         # Lazily backfill the kernel start time for host PIDs so
@@ -1748,8 +1763,7 @@ class ProcessRegistry:
                         # for sessions spawned before this field existed.
                         if s.host_start_time is None and s.pid_scope == "host" and s.pid:
                             s.host_start_time = self._safe_host_start_time(s.pid)
-                        path = self._checkpoint_path_for_session(s)
-                        entries_by_path.setdefault(path, []).append({
+                        entries.append({
                             "session_id": s.id,
                             "command": s.command,
                             "pid": s.pid,
@@ -1759,8 +1773,6 @@ class ProcessRegistry:
                             "started_at": s.started_at,
                             "task_id": s.task_id,
                             "session_key": s.session_key,
-                            "agent_profile": s.agent_profile,
-                            "agent_hermes_home": s.agent_hermes_home,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
                             "watcher_user_id": s.watcher_user_id,
@@ -1771,62 +1783,26 @@ class ProcessRegistry:
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
                         })
-                if _checkpoint_path_overridden():
-                    paths = set(entries_by_path) or {Path(CHECKPOINT_PATH)}
-                else:
-                    paths = set(self._checkpoint_paths) | set(entries_by_path)
-                if not paths:
-                    paths = {_checkpoint_path_for_home()}
-                self._checkpoint_paths = paths
             
             # Atomic write to avoid corruption on crash
             from utils import atomic_json_write
-            for path in paths:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                atomic_json_write(path, entries_by_path.get(path, []))
+            atomic_json_write(CHECKPOINT_PATH, entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
-    def recover_from_checkpoint(self, checkpoint_paths: list[str | Path] | None = None) -> int:
+    def recover_from_checkpoint(self) -> int:
         """
         On gateway startup, probe PIDs from checkpoint file.
 
         Returns the number of processes recovered as detached.
         """
-        paths: list[Path] = [_checkpoint_path_for_home()]
-        if not _checkpoint_path_overridden():
-            from hermes_constants import get_default_hermes_root
-            try:
-                root = get_default_hermes_root()
-                profiles_dir = root / "profiles"
-                if profiles_dir.exists():
-                    for p_dir in profiles_dir.iterdir():
-                        if p_dir.is_dir() and (p_dir / "processes.json").exists():
-                            paths.append(p_dir / "processes.json")
-            except Exception:
-                pass
-        if checkpoint_paths and not _checkpoint_path_overridden():
-            paths.extend(Path(path) for path in checkpoint_paths)
-
-        seen_paths: set[Path] = set()
-        entries: list[dict] = []
-        for path in paths:
-            if path in seen_paths:
-                continue
-            seen_paths.add(path)
-            if not path.exists():
-                continue
-            try:
-                loaded = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if isinstance(loaded, list):
-                entries.extend(entry for entry in loaded if isinstance(entry, dict))
-
-        if not entries:
+        if not CHECKPOINT_PATH.exists():
             return 0
 
-        self._checkpoint_paths |= seen_paths
+        try:
+            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return 0
 
         recovered = 0
         for entry in entries:
@@ -1864,31 +1840,26 @@ class ProcessRegistry:
                     )
                 continue
 
-            raw_agent_profile = str(entry.get("agent_profile", "") or "").strip()
-            raw_agent_home = str(entry.get("agent_hermes_home", "") or "").strip()
-            legacy_profile_without_home = bool(raw_agent_profile and not raw_agent_home)
             session = ProcessSession(
                 id=entry["session_id"],
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
                 session_key=entry.get("session_key", ""),
-                agent_profile="" if legacy_profile_without_home else raw_agent_profile,
-                agent_hermes_home=raw_agent_home,
                 pid=pid,
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,
                 cwd=entry.get("cwd"),
                 started_at=entry.get("started_at", time.time()),
                 detached=True,  # Can't read output, but can report status + kill
-                watcher_platform="" if legacy_profile_without_home else entry.get("watcher_platform", ""),
-                watcher_chat_id="" if legacy_profile_without_home else entry.get("watcher_chat_id", ""),
-                watcher_user_id="" if legacy_profile_without_home else entry.get("watcher_user_id", ""),
-                watcher_user_name="" if legacy_profile_without_home else entry.get("watcher_user_name", ""),
-                watcher_thread_id="" if legacy_profile_without_home else entry.get("watcher_thread_id", ""),
-                watcher_message_id="" if legacy_profile_without_home else entry.get("watcher_message_id", ""),
-                watcher_interval=0 if legacy_profile_without_home else entry.get("watcher_interval", 0),
-                notify_on_complete=False if legacy_profile_without_home else entry.get("notify_on_complete", False),
-                watch_patterns=[] if legacy_profile_without_home else entry.get("watch_patterns", []),
+                watcher_platform=entry.get("watcher_platform", ""),
+                watcher_chat_id=entry.get("watcher_chat_id", ""),
+                watcher_user_id=entry.get("watcher_user_id", ""),
+                watcher_user_name=entry.get("watcher_user_name", ""),
+                watcher_thread_id=entry.get("watcher_thread_id", ""),
+                watcher_message_id=entry.get("watcher_message_id", ""),
+                watcher_interval=entry.get("watcher_interval", 0),
+                notify_on_complete=entry.get("notify_on_complete", False),
+                watch_patterns=entry.get("watch_patterns", []),
             )
             with self._lock:
                 self._running[session.id] = session
@@ -1901,8 +1872,6 @@ class ProcessRegistry:
                     "session_id": session.id,
                     "check_interval": session.watcher_interval,
                     "session_key": session.session_key,
-                    "agent_profile": session.agent_profile,
-                    "agent_hermes_home": session.agent_hermes_home,
                     "platform": session.watcher_platform,
                     "chat_id": session.watcher_chat_id,
                     "user_id": session.watcher_user_id,
@@ -2176,6 +2145,31 @@ PROCESS_SCHEMA = {
 }
 
 
+def _redact_process_result(result: dict) -> dict:
+    """Redact secrets from background-process output before it reaches the
+    model, session.db, and CLI display.
+
+    Mirrors the foreground ``terminal`` redaction (terminal_tool.py) so the
+    two surfaces can't diverge — issue #43025 (background output was returned
+    verbatim). Respects ``security.redact_secrets`` (no force): output fields
+    pass through ``redact_terminal_output`` which picks ``code_file`` based on
+    the recorded command (env dumps get the ENV-assignment pass). The command
+    string itself is also redacted in case it carried an inline credential.
+    """
+    if not isinstance(result, dict):
+        return result
+    from agent.redact import redact_sensitive_text, redact_terminal_output
+
+    command = result.get("command") or ""
+    for field in ("output", "output_preview"):
+        value = result.get(field)
+        if isinstance(value, str) and value:
+            result[field] = redact_terminal_output(value, command)
+    if isinstance(result.get("command"), str) and result["command"]:
+        result["command"] = redact_sensitive_text(result["command"], code_file=True)
+    return result
+
+
 def _handle_process(args, **kw):
     task_id = kw.get("task_id")
     action = args.get("action", "")
@@ -2183,23 +2177,28 @@ def _handle_process(args, **kw):
     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
 
     if action == "list":
-        return json.dumps({"processes": process_registry.list_sessions(task_id=task_id)}, ensure_ascii=False)
+        # Surface session-scoped background processes (e.g. a forgotten
+        # preview server) in addition to this task's own — they share the
+        # gateway session_key and can block session reset (#29177).
+        try:
+            from tools.approval import get_current_session_key
+            session_key = get_current_session_key(default="") or ""
+        except Exception:
+            session_key = ""
+        return json.dumps(
+            {"processes": process_registry.list_sessions(task_id=task_id, session_key=session_key or None)},
+            ensure_ascii=False,
+        )
     elif action in {"poll", "log", "wait", "kill", "write", "submit", "close"}:
         if not session_id:
             return tool_error(f"session_id is required for {action}")
-        scoped = process_registry._get_for_current_scope(session_id)
-        if scoped is None:
-            return json.dumps({
-                "status": "not_found",
-                "error": "No process with ID in current profile scope",
-            }, ensure_ascii=False)
         if action == "poll":
-            return json.dumps(process_registry.poll(session_id), ensure_ascii=False)
+            return json.dumps(_redact_process_result(process_registry.poll(session_id)), ensure_ascii=False)
         elif action == "log":
-            return json.dumps(process_registry.read_log(
-                session_id, offset=args.get("offset", 0), limit=args.get("limit", 200)), ensure_ascii=False)
+            return json.dumps(_redact_process_result(process_registry.read_log(
+                session_id, offset=args.get("offset", 0), limit=args.get("limit", 200))), ensure_ascii=False)
         elif action == "wait":
-            return json.dumps(process_registry.wait(session_id, timeout=args.get("timeout")), ensure_ascii=False)
+            return json.dumps(_redact_process_result(process_registry.wait(session_id, timeout=args.get("timeout"))), ensure_ascii=False)
         elif action == "kill":
             return json.dumps(process_registry.kill_process(session_id), ensure_ascii=False)
         elif action == "write":
