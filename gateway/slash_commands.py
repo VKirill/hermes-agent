@@ -225,9 +225,10 @@ class GatewaySlashCommandsMixin:
             "session_key": session_key,
         })
 
-        # Resolve session config info to surface to the user
+        # Resolve session config info to surface to the user (pass source so the footer
+        # shows THIS topic's model, not the global default).
         try:
-            session_info = self._format_session_info()
+            session_info = self._format_session_info(source)
         except Exception:
             session_info = ""
 

@@ -11853,7 +11853,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, source: Optional["SessionSource"] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway
@@ -11925,6 +11925,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     pass
             except Exception:
                 pass
+
+        # Per-topic override wins over the global config for DISPLAY, so /new (and /profile)
+        # show the model this topic actually runs — not the global default. Mirrors the
+        # per-turn resolution (topic_models.json authoritative, then in-memory /model).
+        if source is not None:
+            try:
+                _rsk = self._session_key_for_source(source)
+            except Exception:
+                _rsk = None
+            if _rsk:
+                _ov = None
+                try:
+                    _ov = _load_topic_models().get(_rsk)
+                except Exception:
+                    _ov = None
+                if _ov is None:
+                    _ov = self._session_model_overrides.get(_rsk)
+                if _ov and _ov.get("model"):
+                    model = _ov.get("model")
+                    provider = _ov.get("provider") or provider
+                    base_url = _ov.get("base_url") or base_url
 
         # Resolve runtime credentials for probing
         try:
