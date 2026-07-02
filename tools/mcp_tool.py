@@ -4944,11 +4944,15 @@ def shutdown_mcp_servers():
             servers_snapshot = list(_servers.values())
             _servers.clear()
 
-    # Fast path: nothing to shut down.
+    # Fast path: nothing to shut down. Do not call _stop_mcp_loop() while
+    # holding _lock: the loop-stop path also touches shared MCP state, and doing
+    # it under the lock can deadlock shutdown.
     if not servers_snapshot:
+        _should_stop_loop = False
         with _lock:
-            if not _servers:
-                _stop_mcp_loop()
+            _should_stop_loop = not _servers
+        if _should_stop_loop:
+            _stop_mcp_loop()
         return
 
     async def _shutdown():
@@ -4977,9 +4981,11 @@ def shutdown_mcp_servers():
             except BaseException as exc:
                 logger.debug("Error during MCP shutdown: %s", exc)
 
+    _should_stop_loop = False
     with _lock:
-        if not _servers:
-            _stop_mcp_loop()
+        _should_stop_loop = not _servers
+    if _should_stop_loop:
+        _stop_mcp_loop()
 
 
 def _kill_orphaned_mcp_children(include_active: bool = False) -> None:
