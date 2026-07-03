@@ -378,6 +378,7 @@ def _handle_send(args):
     # instead of send_photo so the original bytes survive (e.g. info-graph
     # JPGs where Telegram's sendPhoto recompresses to 1280px).
     force_document_attachments = "[[as_document]]" in message
+    silent = bool(args.get("silent"))
 
     media_files, cleaned_message = BasePlatformAdapter.extract_media(message)
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
@@ -441,6 +442,7 @@ def _handle_send(args):
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document_attachments,
+                silent=silent,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -634,6 +636,7 @@ async def _send_via_adapter(
     thread_id=None,
     media_files=None,
     force_document=False,
+    silent=False,
 ):
     """Send a message via a live gateway adapter, with a standalone fallback
     for out-of-process callers (e.g. cron running separately from the gateway).
@@ -691,6 +694,7 @@ async def _send_via_adapter(
                 thread_id=thread_id,
                 media_files=media_files,
                 force_document=force_document,
+                silent=silent,
             )
         except asyncio.CancelledError:
             raise
@@ -718,7 +722,7 @@ async def _send_via_adapter(
     }
 
 
-async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False):
+async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None, media_files=None, force_document=False, silent=False):
     """Route a message to the appropriate platform sender.
 
     Long messages are automatically chunked to fit within platform limits
@@ -799,6 +803,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             thread_id=thread_id,
             disable_link_previews=disable_link_previews,
             force_document=force_document,
+            silent=silent,
             base_url=_extra.get("base_url"),
             base_file_url=_extra.get("base_file_url"),
             local_mode=bool(_extra.get("local_mode")),
@@ -1016,7 +1021,7 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, base_url=None, base_file_url=None, local_mode=False):
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, base_url=None, base_file_url=None, local_mode=False, silent=False):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1122,6 +1127,11 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                 )
             if effective_thread_id is not None:
                 thread_kwargs["message_thread_id"] = effective_thread_id
+        if silent:
+            # Тихая доставка: без звука/вибрации у получателя (значок непрочитанного
+            # остаётся). Применяется и к тексту, и к медиа — thread_kwargs является
+            # базой для text_kwargs и media_kwargs ниже.
+            thread_kwargs["disable_notification"] = True
         # disable_web_page_preview is only valid for send_message, not
         # send_photo/send_video/etc.  Keep it separate so media sends
         # don't inherit an invalid parameter (issue #27012).

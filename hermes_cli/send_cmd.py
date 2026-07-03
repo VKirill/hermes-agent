@@ -355,6 +355,8 @@ def cmd_send(args: argparse.Namespace) -> None:
         "target": target,
         "message": message,
     }
+    if getattr(args, "silent", False):
+        tool_args["silent"] = True
 
     result = send_message_tool(tool_args)
     exit_code = _emit_result(
@@ -449,6 +451,11 @@ def register_send_subparser(subparsers) -> argparse.ArgumentParser:
         help="List available targets. Optional positional filter: `hermes send --list telegram`.",
     )
 
+    parser.add_argument(
+        "--silent",
+        action="store_true",
+        help="Deliver silently (Telegram disable_notification: no sound/vibration for the recipient)",
+    )
     parser.add_argument(
         "-q",
         "--quiet",
