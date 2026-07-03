@@ -789,7 +789,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # limit (issue #28557). Pass the whole message in one call; media attaches
     # after all text chunks.
     if platform == Platform.TELEGRAM:
-        disable_link_previews = bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews"))
+        _extra = getattr(pconfig, "extra", {}) or {}
+        disable_link_previews = bool(_extra.get("disable_link_previews"))
         return await _send_telegram(
             pconfig.token,
             chat_id,
@@ -798,6 +799,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             thread_id=thread_id,
             disable_link_previews=disable_link_previews,
             force_document=force_document,
+            base_url=_extra.get("base_url"),
+            base_file_url=_extra.get("base_file_url"),
+            local_mode=bool(_extra.get("local_mode")),
         )
 
     # --- Discord: chunked delivery via the registry's standalone_sender_fn.
@@ -1012,7 +1016,7 @@ def _is_telegram_thread_not_found(error: Exception) -> bool:
     return "thread not found" in str(error).lower()
 
 
-async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False):
+async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False, force_document=False, base_url=None, base_file_url=None, local_mode=False):
     """Send via Telegram Bot API (one-shot, no polling needed).
 
     Applies markdown→MarkdownV2 formatting (same as the gateway adapter)
@@ -1052,7 +1056,20 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             _tg_proxy = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=["api.telegram.org"])
         except Exception:
             _tg_proxy = None
-        if _tg_proxy:
+        # A locally-hosted telegram-bot-api server (extra.base_url) is where
+        # Hermes private DM topics live: the cloud Bot API knows nothing about
+        # them and silently drops direct_messages_topic_id, so a standalone
+        # send that bypasses the local server lands in the chat root («Все»)
+        # instead of the topic. Mirror the gateway adapter and use the same
+        # base_url/base_file_url/local_mode when configured. No proxy in this
+        # branch — the local server is on loopback.
+        _bot_kwargs = {"token": token}
+        if base_url:
+            _bot_kwargs["base_url"] = base_url
+            _bot_kwargs["base_file_url"] = base_file_url or base_url.replace("/bot", "/file/bot")
+            _bot_kwargs["local_mode"] = bool(local_mode)
+            bot = Bot(**_bot_kwargs)
+        elif _tg_proxy:
             try:
                 from telegram.request import HTTPXRequest
                 logger.info("send_message: standalone Telegram send routed through proxy %s", _tg_proxy)
@@ -1076,27 +1093,45 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         media_files = media_files or []
         thread_kwargs = {}
         if thread_id is not None:
-            # Reuse the gateway adapter's General-topic mapping: in Telegram
-            # forum supergroups, the General topic is addressed as
-            # message_thread_id="1" on incoming updates, but Bot API
-            # sendMessage rejects message_thread_id=1 with "Message thread
-            # not found". The adapter's helper maps "1" to None for that
-            # reason; the send_message tool needs the same mapping or a
-            # send to a forum group's General topic always errors out
-            # (see issue #22267).
+            # Bot API 10.0+ three-mode topic routing (#22773): private DM chats
+            # (positive chat_id) with a numeric topic id must use
+            # direct_messages_topic_id — a bare message_thread_id is rejected /
+            # mis-routed by Bot API 10.0 and lands in General (Lobby).
+            # Forum/supergroup targets (negative chat_id) continue to use
+            # message_thread_id as before.
             try:
-                from plugins.platforms.telegram.adapter import TelegramAdapter
-                effective_thread_id = TelegramAdapter._message_thread_id_for_send(
-                    str(thread_id)
-                )
-            except Exception:
-                # Fallback: explicit mapping in case the adapter import
-                # fails (e.g. python-telegram-bot missing in this venv).
-                effective_thread_id = (
-                    None if str(thread_id) == "1" else int(thread_id)
-                )
-            if effective_thread_id is not None:
-                thread_kwargs["message_thread_id"] = effective_thread_id
+                _is_private_chat = int(str(chat_id)) > 0
+            except (TypeError, ValueError):
+                _is_private_chat = False
+            try:
+                _numeric_topic = int(str(thread_id))
+            except (TypeError, ValueError):
+                _numeric_topic = None
+            if _is_private_chat and _numeric_topic is not None:
+                # Bot API DM topic (mode 2): route via direct_messages_topic_id.
+                thread_kwargs["direct_messages_topic_id"] = _numeric_topic
+            else:
+                # Reuse the gateway adapter's General-topic mapping: in Telegram
+                # forum supergroups, the General topic is addressed as
+                # message_thread_id="1" on incoming updates, but Bot API
+                # sendMessage rejects message_thread_id=1 with "Message thread
+                # not found". The adapter's helper maps "1" to None for that
+                # reason; the send_message tool needs the same mapping or a
+                # send to a forum group's General topic always errors out
+                # (see issue #22267).
+                try:
+                    from plugins.platforms.telegram.adapter import TelegramAdapter
+                    effective_thread_id = TelegramAdapter._message_thread_id_for_send(
+                        str(thread_id)
+                    )
+                except Exception:
+                    # Fallback: explicit mapping in case the adapter import
+                    # fails (e.g. python-telegram-bot missing in this venv).
+                    effective_thread_id = (
+                        None if str(thread_id) == "1" else int(thread_id)
+                    )
+                if effective_thread_id is not None:
+                    thread_kwargs["message_thread_id"] = effective_thread_id
         # disable_web_page_preview is only valid for send_message, not
         # send_photo/send_video/etc.  Keep it separate so media sends
         # don't inherit an invalid parameter (issue #27012).
