@@ -832,6 +832,14 @@ class TelegramAdapter(BasePlatformAdapter):
             if reply_to_message_id is None:
                 reply_to_message_id = cls._metadata_reply_to_message_id(metadata)
             if reply_to_message_id is None:
+                # Verified live 2026-07-03 (local telegram-bot-api 10.1):
+                # message_thread_id routes private DM lanes correctly, while
+                # direct_messages_topic_id is silently ignored (message lands
+                # in the chat root). Prefer the thread id; keep the direct
+                # topic id only as a last resort when no thread id exists.
+                mt = cls._message_thread_id_for_send(thread_id)
+                if mt is not None:
+                    return {"message_thread_id": mt}
                 direct_topic_id = cls._metadata_direct_messages_topic_id(metadata)
                 if direct_topic_id is not None:
                     return {
@@ -841,7 +849,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 return {}
             return {"message_thread_id": cls._message_thread_id_for_send(thread_id)}
         direct_topic_id = cls._metadata_direct_messages_topic_id(metadata)
-        if direct_topic_id is not None:
+        if direct_topic_id is not None and cls._message_thread_id_for_send(thread_id) is None:
             return {
                 "message_thread_id": None,
                 "direct_messages_topic_id": int(direct_topic_id),

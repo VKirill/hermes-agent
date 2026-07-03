@@ -1462,15 +1462,21 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 and _looks_like_int(str(thread_id))
             )
             if is_private_dm_topic:
-                # Routed via direct_messages_topic_id (mode 2), no bare thread_id.
+                # Verified LIVE 2026-07-03 on this deployment (local
+                # telegram-bot-api 10.1): direct_messages_topic_id is silently
+                # IGNORED for private DM lanes (message lands in the chat root,
+                # «Все»), while a bare message_thread_id routes correctly.
+                # Pass thread_id via metadata explicitly: DeliveryRouter then
+                # skips its DM-topic anchor requirement and the adapter sends
+                # message_thread_id.
                 route_thread_id = None
                 route_metadata = {
-                    "direct_messages_topic_id": str(thread_id),
+                    "thread_id": str(thread_id),
                     "job_id": job["id"],
                 }
                 # Media metadata mirrors the text routing so attachments land in
-                # the same DM topic instead of the General lane (#22773).
-                media_metadata = {"direct_messages_topic_id": str(thread_id)}
+                # the same DM topic instead of the General lane.
+                media_metadata = {"thread_id": str(thread_id)}
             else:
                 route_thread_id = str(thread_id) if thread_id is not None else None
                 route_metadata = {"job_id": job["id"]}

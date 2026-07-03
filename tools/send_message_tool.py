@@ -1093,45 +1093,35 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         media_files = media_files or []
         thread_kwargs = {}
         if thread_id is not None:
-            # Bot API 10.0+ three-mode topic routing (#22773): private DM chats
-            # (positive chat_id) with a numeric topic id must use
-            # direct_messages_topic_id — a bare message_thread_id is rejected /
-            # mis-routed by Bot API 10.0 and lands in General (Lobby).
-            # Forum/supergroup targets (negative chat_id) continue to use
-            # message_thread_id as before.
+            # Topic routing, verified LIVE on this deployment 2026-07-03
+            # (local telegram-bot-api 10.1, private DM topics):
+            #   message_thread_id=<topic>        → lands in the topic  ✓
+            #   direct_messages_topic_id=<topic> → silently ignored, lands
+            #                                      in the chat root («Все») ✗
+            # The earlier #22773-inspired special case that routed private
+            # numeric topics via direct_messages_topic_id was therefore
+            # reverted: ALL numeric topics (private DM lanes and forum
+            # supergroups alike) use message_thread_id. The requirement that
+            # actually matters for private DM topics is the ENDPOINT: they
+            # only exist on the local Bot API server (extra.base_url) — the
+            # cloud API rejects the thread and the retry-without-thread
+            # fallback would misroute to the chat root.
+            #
+            # General-topic mapping: forum General is message_thread_id="1"
+            # on incoming updates, but sends must omit it (issue #22267).
             try:
-                _is_private_chat = int(str(chat_id)) > 0
-            except (TypeError, ValueError):
-                _is_private_chat = False
-            try:
-                _numeric_topic = int(str(thread_id))
-            except (TypeError, ValueError):
-                _numeric_topic = None
-            if _is_private_chat and _numeric_topic is not None:
-                # Bot API DM topic (mode 2): route via direct_messages_topic_id.
-                thread_kwargs["direct_messages_topic_id"] = _numeric_topic
-            else:
-                # Reuse the gateway adapter's General-topic mapping: in Telegram
-                # forum supergroups, the General topic is addressed as
-                # message_thread_id="1" on incoming updates, but Bot API
-                # sendMessage rejects message_thread_id=1 with "Message thread
-                # not found". The adapter's helper maps "1" to None for that
-                # reason; the send_message tool needs the same mapping or a
-                # send to a forum group's General topic always errors out
-                # (see issue #22267).
-                try:
-                    from plugins.platforms.telegram.adapter import TelegramAdapter
-                    effective_thread_id = TelegramAdapter._message_thread_id_for_send(
-                        str(thread_id)
-                    )
-                except Exception:
-                    # Fallback: explicit mapping in case the adapter import
-                    # fails (e.g. python-telegram-bot missing in this venv).
-                    effective_thread_id = (
-                        None if str(thread_id) == "1" else int(thread_id)
-                    )
-                if effective_thread_id is not None:
-                    thread_kwargs["message_thread_id"] = effective_thread_id
+                from plugins.platforms.telegram.adapter import TelegramAdapter
+                effective_thread_id = TelegramAdapter._message_thread_id_for_send(
+                    str(thread_id)
+                )
+            except Exception:
+                # Fallback: explicit mapping in case the adapter import
+                # fails (e.g. python-telegram-bot missing in this venv).
+                effective_thread_id = (
+                    None if str(thread_id) == "1" else int(thread_id)
+                )
+            if effective_thread_id is not None:
+                thread_kwargs["message_thread_id"] = effective_thread_id
         # disable_web_page_preview is only valid for send_message, not
         # send_photo/send_video/etc.  Keep it separate so media sends
         # don't inherit an invalid parameter (issue #27012).
