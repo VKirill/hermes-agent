@@ -433,16 +433,23 @@ def _handle_send(args):
 
     try:
         from model_tools import _run_async
+        # Pass ``silent`` only when set: keeps the call signature identical to
+        # upstream for the default loud path (and standalone senders that don't
+        # know the kwarg).
+        send_kwargs = dict(
+            thread_id=thread_id,
+            media_files=media_files,
+            force_document=force_document_attachments,
+        )
+        if silent:
+            send_kwargs["silent"] = True
         result = _run_async(
             _send_to_platform(
                 platform,
                 pconfig,
                 chat_id,
                 cleaned_message,
-                thread_id=thread_id,
-                media_files=media_files,
-                force_document=force_document_attachments,
-                silent=silent,
+                **send_kwargs,
             )
         )
         if used_home_channel and isinstance(result, dict) and result.get("success"):
@@ -664,11 +671,13 @@ async def _send_via_adapter(
             adapter = None
         if adapter is not None:
             try:
-                metadata = {"is_agent": True}
+                metadata = {}
                 if thread_id:
                     metadata["thread_id"] = thread_id
                 if platform_name == "ntfy" and chat_id:
                     metadata["publish_topic"] = chat_id
+                if not metadata:
+                    metadata = None
                 result = await adapter.send(chat_id=chat_id, content=chunk, metadata=metadata)
             except asyncio.CancelledError:
                 raise
@@ -687,14 +696,18 @@ async def _send_via_adapter(
 
     if entry is not None and entry.standalone_sender_fn is not None:
         try:
+            standalone_kwargs = dict(
+                thread_id=thread_id,
+                media_files=media_files,
+                force_document=force_document,
+            )
+            if silent:
+                standalone_kwargs["silent"] = True
             result = await entry.standalone_sender_fn(
                 pconfig,
                 chat_id,
                 chunk,
-                thread_id=thread_id,
-                media_files=media_files,
-                force_document=force_document,
-                silent=silent,
+                **standalone_kwargs,
             )
         except asyncio.CancelledError:
             raise
