@@ -4237,6 +4237,68 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_update_prompt failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    async def send_suggestion(
+        self,
+        chat_id: str,
+        suggestion_text: str,
+        can_auto_execute: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a next-step suggestion with inline action buttons.
+
+        The base delivery pipeline calls this when a ``SUGGESTION:{...}``
+        marker was stripped from the agent's response (see
+        ``gateway.suggestion_parser``). Mirrors the Slack adapter's
+        suggestion block: "do" / "explain" inject a synthetic internal
+        message back into the topic's session, "dismiss" just removes
+        the buttons.
+        """
+        if not self._bot:
+            return SendResult(success=False, error="Not connected")
+        try:
+            row = []
+            if can_auto_execute:
+                row.append(InlineKeyboardButton("▶️ Сделать", callback_data="sg:do"))
+            row.append(InlineKeyboardButton("✏️ Объяснить", callback_data="sg:explain"))
+            row.append(InlineKeyboardButton("✕", callback_data="sg:dismiss"))
+            keyboard = InlineKeyboardMarkup([row])
+
+            thread_id = self._metadata_thread_id(metadata)
+            reply_to_id = self._reply_to_message_id_for_send(None, metadata, reply_to_mode=self._reply_to_mode)
+            send_kwargs = dict(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                reply_markup=keyboard,
+                reply_to_message_id=reply_to_id,
+                **self._thread_kwargs_for_send(
+                    chat_id,
+                    thread_id,
+                    metadata,
+                    reply_to_message_id=reply_to_id,
+                    reply_to_mode=self._reply_to_mode,
+                ),
+                **self._link_preview_kwargs(),
+            )
+            try:
+                msg = await self._send_message_with_thread_fallback(
+                    text=self.format_message(suggestion_text),
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    **send_kwargs,
+                )
+            except Exception as md_err:
+                if "parse" not in str(md_err).lower():
+                    raise
+                # MarkdownV2 escaping failed on this suggestion — deliver
+                # plain rather than dropping the buttons entirely.
+                msg = await self._send_message_with_thread_fallback(
+                    text=suggestion_text,
+                    parse_mode=None,
+                    **send_kwargs,
+                )
+            return SendResult(success=True, message_id=str(msg.message_id))
+        except Exception as e:
+            logger.warning("[%s] send_suggestion failed: %s", self.name, e)
+            return SendResult(success=False, error=str(e))
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
@@ -5018,6 +5080,46 @@ class TelegramAdapter(BasePlatformAdapter):
                 query_thread_id=query_thread_id,
                 query_user_name=query_user_name,
             )
+            return
+
+        # --- Suggestion buttons (sg:verb) ---
+        if data.startswith("sg:"):
+            verb = data.split(":", 1)[1]
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ Не авторизован.")
+                return
+            prompt_map = {
+                "do": "Выполни предложенный следующий шаг из твоего предыдущего ответа.",
+                "explain": "Объясни, что ты сделал в предыдущем ответе — какие инструменты использовал и почему.",
+            }
+            prompt = prompt_map.get(verb)
+            await query.answer(text="✕ Скрыто" if verb == "dismiss" else ("▶️ Выполняю…" if verb == "do" else "✏️"))
+            # Remove the buttons so the suggestion can't be double-tapped;
+            # the suggestion text itself stays visible in the chat.
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass  # non-fatal — worst case the buttons stay
+            if not prompt:
+                return
+            from gateway.session import SessionSource
+            source = SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id=str(query_chat_id),
+                chat_type=str(query_chat_type or "private"),
+                user_id=caller_id,
+                user_name=query_user_name,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+            )
+            event = MessageEvent(text=prompt, source=source, internal=True)
+            await self.handle_message(event)
             return
 
         # --- Exec approval callbacks (ea:choice:id) ---
