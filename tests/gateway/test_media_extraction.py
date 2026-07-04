@@ -103,6 +103,37 @@ def extract_media_tags_broken(result_messages):
 class TestMediaExtraction:
     """Tests for MEDIA tag extraction from tool results."""
 
+    def test_two_inline_media_tags_on_one_line_stay_separate(self):
+        """Multiple space-separated MEDIA: tags on one line must extract as
+        separate files. The multi-word-path continuation used to expand
+        across the second ``MEDIA:`` token (lazy-quantifier backtracking is
+        explored before the greedy ``\\S+`` gives characters back), merging
+        both into one nonexistent path that was then silently skipped."""
+        from gateway.platforms.base import BasePlatformAdapter
+
+        media, cleaned = BasePlatformAdapter.extract_media(
+            "MEDIA:/tmp/a.png MEDIA:/tmp/b.png Подпись альбома"
+        )
+        assert [p for p, _ in media] == ["/tmp/a.png", "/tmp/b.png"]
+        assert cleaned.strip() == "Подпись альбома"
+
+    def test_three_inline_media_tags_on_one_line(self):
+        from gateway.platforms.base import BasePlatformAdapter
+
+        media, _ = BasePlatformAdapter.extract_media(
+            "MEDIA:/tmp/a.jpg MEDIA:/tmp/b.jpg MEDIA:/tmp/c.jpg"
+        )
+        assert [p for p, _ in media] == ["/tmp/a.jpg", "/tmp/b.jpg", "/tmp/c.jpg"]
+
+    def test_multiword_path_still_extracts_after_inline_fix(self):
+        """The (?!MEDIA:) guard must not break genuine paths with spaces."""
+        from gateway.platforms.base import BasePlatformAdapter
+
+        media, _ = BasePlatformAdapter.extract_media(
+            "MEDIA:/tmp/My Documents/photo one.png готово"
+        )
+        assert [p for p, _ in media] == ["/tmp/My Documents/photo one.png"]
+
     def test_gateway_auto_append_ignores_media_examples_in_skill_docs(self):
         """Skill/documentation examples must not be appended as real attachments."""
         from gateway.run import _collect_auto_append_media_tags

@@ -1466,9 +1466,15 @@ _MEDIA_EXT_ALTERNATION = "|".join(
 # Path anchors: ``~/`` (Unix home-relative), ``/`` (Unix absolute),
 # ``X:\\`` or ``X:/`` (Windows drive-letter absolute — #34632).
 MEDIA_TAG_CLEANUP_RE = re.compile(
+    # The multi-word-path continuation must not expand across a following
+    # ``MEDIA:`` token: backtracking explores the newest choice point first,
+    # so the lazy continuation grows over " MEDIA:/next.png" BEFORE the
+    # greedy \S+ gives characters back — two inline tags on one line would
+    # otherwise merge into a single nonexistent path and the media would be
+    # silently skipped.
     r'''[`"']?MEDIA:\s*'''
     r'''(?P<path>`[^`\n]+`|"[^"\n]+"|'[^'\n]+'|'''
-    r'''(?:~/|/|[A-Za-z]:[/\\])\S+(?:[^\S\n]+\S+)*?\.(?:''' + _MEDIA_EXT_ALTERNATION + r'''))'''
+    r'''(?:~/|/|[A-Za-z]:[/\\])\S+(?:[^\S\n]+(?!MEDIA:)\S+)*?\.(?:''' + _MEDIA_EXT_ALTERNATION + r'''))'''
     r'''(?=[\s`"',;:)\]}]|$)[`"']?''',
     re.IGNORECASE,
 )
