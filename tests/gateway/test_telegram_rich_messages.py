@@ -1139,3 +1139,86 @@ async def test_try_edit_rich_records_streamed_final_for_reply_recovery(monkeypat
     result = await adapter._try_edit_rich("12345", "5724", "Готово. Основной бот живой.")
     assert result is not None and result.success
     assert rich_sent_store.lookup("12345", "5724") == "Готово. Основной бот живой."
+
+
+MEDIA_BLOCK_CONTENT = (
+    "Вот сгенерированные варианты:\n\n"
+    '![](https://example.com/one.jpg "Вариант 1")\n\n'
+    "И немного текста после."
+)
+COLLAGE_CONTENT = (
+    "Сравнение кадров:\n\n"
+    "<tg-collage>\n\n"
+    "![](https://example.com/a.jpg)\n"
+    "![](https://example.com/b.jpg)\n\n"
+    "</tg-collage>"
+)
+FOOTNOTE_CONTENT = (
+    "Утверждение со сноской[^src].\n\n"
+    "[^src]: Источник: отчёт за Q2."
+)
+
+
+@pytest.mark.asyncio
+async def test_media_block_routes_to_rich_send():
+    """A standalone ![](https://...) media block must go rich — the legacy
+    MarkdownV2 path renders it as an escaped link instead of an embedded
+    photo."""
+    adapter = _make_adapter()
+
+    result = await adapter.send("12345", MEDIA_BLOCK_CONTENT)
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_awaited_once()
+    api_kwargs = _rich_api_kwargs(adapter)
+    assert '![](https://example.com/one.jpg "Вариант 1")' in api_kwargs["rich_message"]["markdown"]
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_collage_wrapper_routes_to_rich_send():
+    adapter = _make_adapter()
+
+    result = await adapter.send("12345", COLLAGE_CONTENT)
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_awaited_once()
+    assert "<tg-collage>" in _rich_api_kwargs(adapter)["rich_message"]["markdown"]
+
+
+@pytest.mark.asyncio
+async def test_footnote_definition_routes_to_rich_send():
+    adapter = _make_adapter()
+
+    result = await adapter.send("12345", FOOTNOTE_CONTENT)
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_inline_image_reference_in_prose_stays_legacy():
+    """An image reference mid-sentence is NOT a media block (spec: media must
+    be a separate block) — such prose must stay on the legacy path."""
+    adapter = _make_adapter()
+
+    result = await adapter.send(
+        "12345", "Смотри картинку ![](https://example.com/x.jpg) в середине текста"
+    )
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_not_called()
+    adapter._bot.send_message.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_media_block_with_local_path_stays_legacy():
+    """file:// and bare local paths are rejected by the endpoint (only
+    http/https) — don't waste a doomed rich roundtrip on them."""
+    adapter = _make_adapter()
+
+    result = await adapter.send("12345", "![](file:///tmp/local.jpg)")
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_not_called()
+    adapter._bot.send_message.assert_called()

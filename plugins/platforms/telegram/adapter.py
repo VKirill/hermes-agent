@@ -1156,6 +1156,22 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return inspect.iscoroutinefunction(getattr(self._bot, "do_api_request", None))
 
+    # Bot API 10.1 rich media blocks. A standalone-line ``![caption](https://…)``
+    # embeds the photo/video/audio into the message body; <tg-collage> /
+    # <tg-slideshow> wrap several such blocks into an in-message collage or
+    # slider; ``[^id]: …`` lines define footnotes. The legacy MarkdownV2 path
+    # degrades all of these (media renders as an escaped link, footnotes as
+    # literal brackets), so they route to sendRichMessage like tables do.
+    # Spec constraints honoured here: media must be its own block (line) and
+    # only http(s) URLs are accepted by the endpoint.
+    _RICH_MEDIA_BLOCK_RE = re.compile(
+        r"(?m)^\s*!\[[^\]\n]*\]\(\s*https?://\S+?(?:\s+\"[^\"\n]*\")?\s*\)\s*$"
+    )
+    _RICH_MEDIA_WRAPPER_RE = re.compile(
+        r"(?im)^\s*</?tg-(?:collage|slideshow)>\s*$|<tg-map\b"
+    )
+    _RICH_FOOTNOTE_DEF_RE = re.compile(r"(?m)^\[\^[^\]\n]+\]:\s")
+
     _RICH_DETAILS_RE = re.compile(r"<details\b[^>]*>.*?</details>", re.IGNORECASE | re.DOTALL)
     _RICH_MATH_IN_DETAILS_RE = re.compile(
         r"(\$\$.*?\$\$|"
@@ -1222,6 +1238,12 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         if "$$" in content:
             return True
+        if self._RICH_MEDIA_BLOCK_RE.search(content):
+            return True
+        if self._RICH_MEDIA_WRAPPER_RE.search(content):
+            return True
+        if self._RICH_FOOTNOTE_DEF_RE.search(content):
+            return True
         return False
 
     def _content_is_pipe_table_primary(self, content: str) -> bool:
@@ -1242,6 +1264,12 @@ class TelegramAdapter(BasePlatformAdapter):
         if re.search(r"(?m)^<details\b|^</details>|^<summary\b|^</summary>", content):
             return False
         if "$$" in content:
+            return False
+        if self._RICH_MEDIA_BLOCK_RE.search(content):
+            return False
+        if self._RICH_MEDIA_WRAPPER_RE.search(content):
+            return False
+        if self._RICH_FOOTNOTE_DEF_RE.search(content):
             return False
         return True
 
