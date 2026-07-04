@@ -267,10 +267,21 @@ def build_auth_env(agent) -> Dict[str, str]:
     )
     token = token.strip() if isinstance(token, str) else ""
 
+    # CLAUDE_SDK_USE_CLI_LOGIN=1: don't inject any token — let the spawned CLI
+    # authenticate with its own login (Keychain / ~/.claude). Env-token Bearer
+    # auth is billed to Anthropic "extra usage", while the CLI's own session
+    # auth draws from the plan allowance (subscription).
+    if os.environ.get("CLAUDE_SDK_USE_CLI_LOGIN", "").strip().lower() in ("1", "true", "yes"):
+        token = ""
+
     env: Dict[str, str] = {k: v for k, v in os.environ.items()}
     # Clear both, then set exactly one, so precedence is unambiguous.
     env.pop("ANTHROPIC_API_KEY", None)
     env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
+    # Never let the child CLI believe it's nested inside another Claude Code
+    # session (breaks when Hermes itself was launched from one).
+    env.pop("CLAUDECODE", None)
+    env.pop("CLAUDE_CODE_ENTRYPOINT", None)
 
     if token:
         if _is_oauth_token(token):
@@ -1121,6 +1132,12 @@ async def _collect_query(
 # Public entry point — called from AIAgent._anthropic_messages_create.
 # ---------------------------------------------------------------------------
 def create_claude_agent_message(agent, api_kwargs: dict) -> _SDKMessage:
+    if os.environ.get("HERMES_SDK_DEBUG"):
+        try:
+            with open("/tmp/hermes-sdk-debug.log", "a") as _f:
+                _f.write(f"create_claude_agent_message called; mode={getattr(agent, '_claude_agent_sdk_mode', None)}\n")
+        except Exception:
+            pass
     """Run one Hermes "turn" through the Claude Agent SDK.
 
     Returns an object shaped like a native Anthropic ``Message`` so that
@@ -1165,6 +1182,21 @@ def create_claude_agent_message(agent, api_kwargs: dict) -> _SDKMessage:
     }
     if system_prompt is not None:
         opt_kwargs["system_prompt"] = system_prompt
+
+    if os.environ.get("HERMES_SDK_DEBUG"):
+        import json as _json
+        _dbg = {k: (str(v)[:300] if k == "system_prompt" else v) for k, v in opt_kwargs.items() if k != "env"}
+        _env = opt_kwargs.get("env") or {}
+        _dbg["_env_auth"] = {
+            k: ("SET" if _env.get(k) else "-")
+            for k in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+        }
+        _dbg["_env_anthropic_keys"] = sorted(k for k in _env if "ANTHROPIC" in k or "CLAUDE" in k)
+        try:
+            with open("/tmp/hermes-sdk-debug.log", "a") as _f:
+                _f.write(_json.dumps(_dbg, ensure_ascii=False, default=str) + "\n")
+        except Exception:
+            pass
 
     # Anchor the SDK session to the agent's logical working directory — the
     # per-session project dir on multi-session gateways (desktop Projects),
@@ -1373,6 +1405,20 @@ def _build_options(sdk, opt_kwargs: Dict[str, Any]):
     """Construct ClaudeAgentOptions, dropping keys unsupported by the installed SDK."""
     ClaudeAgentOptions = sdk.ClaudeAgentOptions
     kwargs = {k: v for k, v in opt_kwargs.items() if v is not None}
+    if os.environ.get("HERMES_SDK_DEBUG"):
+        import json as _json
+        _dbg = {k: (str(v)[:200] if k in ("system_prompt", "mcp_servers", "hooks") else v)
+                for k, v in kwargs.items() if k != "env"}
+        _env = kwargs.get("env") or {}
+        _dbg["_HOME"] = _env.get("HOME", "(unset)")
+        _dbg["_auth_vars"] = {k: (v[:12] + "…" if isinstance(v, str) and len(v) > 12 else v)
+                             for k, v in _env.items()
+                             if any(s in k for s in ("ANTHROPIC", "CLAUDE")) }
+        try:
+            with open("/tmp/hermes-sdk-debug.log", "a") as _f:
+                _f.write("FINAL " + _json.dumps(_dbg, ensure_ascii=False, default=str) + "\n")
+        except Exception:
+            pass
     while True:
         try:
             return ClaudeAgentOptions(**kwargs)
