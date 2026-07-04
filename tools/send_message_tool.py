@@ -1211,6 +1211,70 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
                     else:
                         raise
 
+        # Albums: two or more still images in one send are bundled into
+        # sendMediaGroup chunks (max 10 per album) so they arrive as a single
+        # slider instead of N separate messages. GIFs keep the per-file path
+        # (media groups cannot carry animations) and [[as_document]] batches
+        # skip grouping so original bytes survive Telegram's recompression.
+        _ALBUM_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+        album_paths: list = []
+        if not force_document:
+            _non_album: list = []
+            for media_path, is_voice in media_files:
+                _ext = os.path.splitext(media_path)[1].lower()
+                if (_ext in _ALBUM_EXTS and not is_voice
+                        and os.path.exists(media_path)):
+                    album_paths.append(media_path)
+                else:
+                    _non_album.append((media_path, is_voice))
+            if len(album_paths) >= 2:
+                media_files = _non_album
+            else:
+                album_paths = []
+
+        if album_paths:
+            from contextlib import ExitStack
+
+            from telegram import InputMediaPhoto
+
+            async def _send_album_chunk(paths, kwargs):
+                # Open fresh handles per attempt: a retry cannot reuse
+                # handles the failed attempt already consumed.
+                with ExitStack() as stack:
+                    group = [
+                        InputMediaPhoto(media=stack.enter_context(open(p, "rb")))
+                        for p in paths
+                    ]
+                    return await bot.send_media_group(
+                        chat_id=int_chat_id, media=group, **kwargs
+                    )
+
+            for _start in range(0, len(album_paths), 10):
+                chunk_paths = album_paths[_start:_start + 10]
+                group_kwargs = dict(thread_kwargs)
+                try:
+                    try:
+                        msgs = await _send_album_chunk(chunk_paths, group_kwargs)
+                    except Exception as group_err:
+                        if _is_telegram_thread_not_found(group_err) and group_kwargs.get("message_thread_id"):
+                            logger.warning(
+                                "Thread %s not found for media group, retrying without message_thread_id",
+                                group_kwargs["message_thread_id"],
+                            )
+                            group_kwargs.pop("message_thread_id", None)
+                            msgs = await _send_album_chunk(chunk_paths, group_kwargs)
+                        else:
+                            raise
+                    if msgs:
+                        last_msg = msgs[-1]
+                except Exception as album_err:
+                    logger.warning(
+                        "send_media_group failed (%s); falling back to per-file send for %d image(s)",
+                        _sanitize_error_text(album_err),
+                        len(chunk_paths),
+                    )
+                    media_files = list(media_files) + [(p, False) for p in chunk_paths]
+
         for media_path, is_voice in media_files:
             if not os.path.exists(media_path):
                 warning = f"Media file not found, skipping: {media_path}"
