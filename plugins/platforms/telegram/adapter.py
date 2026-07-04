@@ -8119,10 +8119,19 @@ class TelegramAdapter(BasePlatformAdapter):
                     except Exception:
                         reply_to_text = None
 
-        # Per-channel/topic ephemeral prompt
-        from gateway.platforms.base import resolve_channel_prompt
+        # Per-channel/topic ephemeral prompt and working directory. Keys
+        # mirror each other: exact match on the topic (thread) id first,
+        # then the chat id as the parent fallback — so one chat-level entry
+        # can set a default cwd for every topic while specific topics
+        # override it (same semantics as Discord threads/parent channels).
+        from gateway.platforms.base import resolve_channel_prompt, resolve_channel_cwd
         _chat_id_str = str(chat.id)
         _channel_prompt = resolve_channel_prompt(
+            self.config.extra,
+            thread_id_str or _chat_id_str,
+            _chat_id_str if thread_id_str else None,
+        )
+        _channel_cwd = resolve_channel_cwd(
             self.config.extra,
             thread_id_str or _chat_id_str,
             _chat_id_str if thread_id_str else None,
@@ -8139,6 +8148,7 @@ class TelegramAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             auto_skill=topic_skill,
             channel_prompt=_channel_prompt,
+            channel_cwd=_channel_cwd,
             timestamp=message.date,
         )
 
