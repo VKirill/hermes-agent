@@ -128,6 +128,15 @@ def _check_profile_hard_guards(resolved_path: str, profile_home: Optional[Path])
         allowed_roots = []
         allowed_roots.append(Path(os.getcwd()).resolve())
 
+        # Kanban task workspace — always writable by the worker that owns it,
+        # even after the worker cd's to client directories for reading.
+        kanban_ws = os.environ.get("HERMES_KANBAN_WORKSPACE")
+        if kanban_ws:
+            try:
+                allowed_roots.append(Path(kanban_ws).resolve())
+            except Exception:
+                pass
+
         tcwd = _configured_terminal_cwd()
         if tcwd:
             allowed_roots.append(Path(tcwd).resolve())
@@ -180,6 +189,13 @@ def _check_profile_hard_guards(resolved_path: str, profile_home: Optional[Path])
             if inside_root_foreign:
                 cwd_like = set()
                 cwd_like.add(str(Path(os.getcwd()).resolve()))
+                # Kanban task workspace is also an active workspace.
+                kanban_ws2 = os.environ.get("HERMES_KANBAN_WORKSPACE")
+                if kanban_ws2:
+                    try:
+                        cwd_like.add(str(Path(kanban_ws2).resolve()))
+                    except Exception:
+                        pass
                 try:
                     from tools.terminal_tool import _active_environments, _env_lock
                     with _env_lock:
