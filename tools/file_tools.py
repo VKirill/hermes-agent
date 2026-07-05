@@ -99,10 +99,12 @@ def _check_profile_hard_guards(resolved_path: str, profile_home: Optional[Path])
             if parts and parts[0] != profile_home.name:
                 return f"Refusing to write to another profile's home directory: {parts[0]}"
 
-        # Block any write inside the default hermes root unless it is inside the active profile home
-        if resolved_target.is_relative_to(root):
-            if not resolved_target.is_relative_to(profile_home.resolve()):
-                return f"Refusing to write to path outside profile home: {resolved_path}"
+        # Writes inside the default hermes root are checked against the same
+        # allowed-roots set as outside writes (deferred below) — a kanban task
+        # workspace lives under <root>/kanban/... and is a legitimate write
+        # target for the worker that owns it. Everything else inside the root
+        # that is not the profile home is refused after the allowed-roots pass.
+        inside_root_foreign = resolved_target.is_relative_to(root) and not resolved_target.is_relative_to(profile_home.resolve())
 
         # Block any write outside profile_home, except:
         # 1. Inside profile_home
@@ -171,7 +173,27 @@ def _check_profile_hard_guards(resolved_path: str, profile_home: Optional[Path])
             pass
 
         if any(resolved_target.is_relative_to(ar) for ar in allowed_roots):
+            # Foreign paths inside the hermes root are only allowed when they
+            # are an active workspace/CWD (e.g. the worker's kanban task
+            # workspace) — never other profiles' homes (blocked above) or
+            # arbitrary root internals via the config allowlist.
+            if inside_root_foreign:
+                cwd_like = set()
+                cwd_like.add(str(Path(os.getcwd()).resolve()))
+                try:
+                    from tools.terminal_tool import _active_environments, _env_lock
+                    with _env_lock:
+                        for env in _active_environments.values():
+                            if getattr(env, "cwd", None):
+                                cwd_like.add(str(Path(env.cwd).resolve()))
+                except Exception:
+                    pass
+                if not any(resolved_target.is_relative_to(Path(c)) for c in cwd_like):
+                    return f"Refusing to write to path outside profile home: {resolved_path}"
             return None
+
+        if inside_root_foreign:
+            return f"Refusing to write to path outside profile home: {resolved_path}"
 
         return f"Refusing to write to path outside profile home: {resolved_path}"
     except Exception as e:
