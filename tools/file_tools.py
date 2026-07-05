@@ -154,6 +154,22 @@ def _check_profile_hard_guards(resolved_path: str, profile_home: Optional[Path])
         except Exception:
             pass
 
+        # Config-driven extra write roots (shared client/workspace trees that
+        # several routed profiles legitimately write into, e.g. a marketing
+        # department writing client artifacts). Explicit opt-in per profile:
+        #   file_tools:
+        #     allowed_write_roots: ["/path/to/shared"]
+        try:
+            from hermes_cli.config import load_config_readonly, cfg_get
+            extra = cfg_get(load_config_readonly(), "file_tools", "allowed_write_roots", default=[]) or []
+            for r in extra:
+                try:
+                    allowed_roots.append(Path(str(r)).expanduser().resolve())
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         if any(resolved_target.is_relative_to(ar) for ar in allowed_roots):
             return None
 
