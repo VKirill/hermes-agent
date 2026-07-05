@@ -5073,7 +5073,12 @@ class BasePlatformAdapter(ABC):
                 _cleaned, _suggestion = extract_suggestion(text_content)
                 if _suggestion:
                     text_content = _cleaned
-                    if not hasattr(self, "send_suggestion"):
+                    # Interactive buttons only make sense when Hermes can
+                    # auto-execute the next step (▶️ Сделать). Without can_do the
+                    # row degrades to Объяснить + ✕ — pure noise — so fold the
+                    # suggestion into the response text instead of a buttoned
+                    # follow-up. Also the fallback for platforms without buttons.
+                    if not hasattr(self, "send_suggestion") or not _suggestion.can_do:
                         _line = f"\n\n⚡ Next: {_suggestion.next or _suggestion.learn}"
                         if _suggestion.reason:
                             _line += f" — {_suggestion.reason}"
@@ -5157,10 +5162,11 @@ class BasePlatformAdapter(ABC):
                             ttl_seconds=_ephemeral_ttl,
                         )
 
-                # Deliver interactive suggestion buttons if a marker was
-                # stripped from the response and this platform supports it.
-                # Runs even if text_content was empty (marker-only response).
-                if _suggestion and hasattr(self, "send_suggestion"):
+                # Deliver interactive suggestion buttons only when the step is
+                # auto-executable (▶️ Сделать); otherwise it was already folded
+                # into text_content above. Runs even if text_content was empty
+                # (marker-only response).
+                if _suggestion and hasattr(self, "send_suggestion") and _suggestion.can_do:
                     try:
                         _next = _suggestion.next or _suggestion.learn
                         _suggestion_text = f"⚡ Next: {_next}"
