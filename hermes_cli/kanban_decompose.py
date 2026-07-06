@@ -235,13 +235,23 @@ def _first_non_deprecated_profile(deprecated_assignees: set[str]) -> Optional[st
     return None
 
 
-def _resolve_orchestrator_profile(cfg: dict, deprecated_assignees: set[str] | None = None) -> str:
+def _resolve_orchestrator_profile(
+    cfg: dict,
+    deprecated_assignees: set[str] | None = None,
+    board_override: str | None = None,
+) -> str:
     """Resolve which profile owns the root/orchestration task after fan-out.
 
-    Falls back to the active default profile when ``kanban.orchestrator_profile``
-    is unset, so a task is never stranded for lack of an orchestrator.
+    Precedence: per-board ``board.json`` override → global
+    ``kanban.orchestrator_profile`` → the active default profile (so a task
+    is never stranded for lack of an orchestrator). The per-board override
+    lets a dev board be led by a dev profile while the marketing board keeps
+    its own lead.
     """
     deprecated_assignees = deprecated_assignees or set()
+    board_override = (board_override or "").strip()
+    if board_override and _profile_exists_and_not_deprecated(board_override, deprecated_assignees):
+        return board_override
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get("orchestrator_profile") or "").strip()
     if explicit and _profile_exists_and_not_deprecated(explicit, deprecated_assignees):
@@ -256,9 +266,20 @@ def _resolve_orchestrator_profile(cfg: dict, deprecated_assignees: set[str] | No
     return _first_non_deprecated_profile(deprecated_assignees) or active
 
 
-def _resolve_default_assignee(cfg: dict, deprecated_assignees: set[str] | None = None) -> str:
-    """Resolve which profile catches child tasks the orchestrator can't route."""
+def _resolve_default_assignee(
+    cfg: dict,
+    deprecated_assignees: set[str] | None = None,
+    board_override: str | None = None,
+) -> str:
+    """Resolve which profile catches child tasks the orchestrator can't route.
+
+    Precedence: per-board ``board.json`` override → global
+    ``kanban.default_assignee`` → the active default profile.
+    """
     deprecated_assignees = deprecated_assignees or set()
+    board_override = (board_override or "").strip()
+    if board_override and _profile_exists_and_not_deprecated(board_override, deprecated_assignees):
+        return board_override
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get("default_assignee") or "").strip()
     if explicit and _profile_exists_and_not_deprecated(explicit, deprecated_assignees):
@@ -331,6 +352,20 @@ def _normalize_assignee_choice(
     return chosen
 
 
+def _current_board_metadata() -> dict:
+    """Return the current board's ``board.json`` for per-board orchestration
+    overrides (``orchestrator_profile`` / ``default_assignee``).
+
+    The current board is resolved from ``HERMES_KANBAN_BOARD`` (the dispatcher
+    pins it per tick). Never raises — a missing/malformed file yields ``{}`` so
+    resolution falls through to the global config.
+    """
+    try:
+        return kb.read_board_metadata(kb.get_current_board()) or {}
+    except Exception:
+        return {}
+
+
 def decompose_task(
     task_id: str,
     *,
@@ -355,8 +390,15 @@ def decompose_task(
 
     cfg = _load_config()
     deprecated_assignees = _deprecated_assignees_from_config(cfg)
-    orchestrator = _resolve_orchestrator_profile(cfg, deprecated_assignees)
-    default_assignee = _resolve_default_assignee(cfg, deprecated_assignees)
+    board_meta = _current_board_metadata()
+    orchestrator = _resolve_orchestrator_profile(
+        cfg, deprecated_assignees,
+        (board_meta.get("orchestrator_profile") or "").strip(),
+    )
+    default_assignee = _resolve_default_assignee(
+        cfg, deprecated_assignees,
+        (board_meta.get("default_assignee") or "").strip(),
+    )
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
     roster, valid_names = _build_roster(deprecated_assignees)
