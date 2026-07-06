@@ -372,7 +372,57 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument("--workflow", default=None, choices=["aif"],
+                          help="Opt the card into the AIF stage machine: one "
+                               "card walks spec→plan→implement→verify→review→"
+                               "verified, each stage worked by its role "
+                               "profile. Assignee is forced to the entry "
+                               "stage's role.")
+    p_create.add_argument("--workflow-step", default=None, metavar="STAGE",
+                          help="Entry stage for --workflow aif (default "
+                               "planning; 'spec' adds the specifier "
+                               "pre-stage).")
+    p_create.add_argument("--human-gates", action="store_true",
+                          dest="human_gates",
+                          help="For --workflow aif: pause at the plan_ready "
+                               "and done-approval human gates (default: "
+                               "auto mode skips them; review PASS is the "
+                               "acceptance authority).")
+    p_create.add_argument("--delegation", default=None,
+                          choices=["subagents", "skills"],
+                          help="aif delegation mode for this card: "
+                               "'subagents' = coordinator/sidecar quality "
+                               "mode, 'skills' = inline speed mode. Omit to "
+                               "use board.json / kanban.use_subagents config "
+                               "(default subagents).")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
+
+    # --- workflow human gate actions (AIF stage machine) ---
+    p_approve = sub.add_parser(
+        "approve",
+        help="Approve an AIF workflow card waiting at the done gate "
+             "(done → verified, terminal)",
+    )
+    p_approve.add_argument("task_id")
+
+    p_reqch = sub.add_parser(
+        "request-changes",
+        help="Send an AIF workflow card at the done gate back to "
+             "implementing (rework)",
+    )
+    p_reqch.add_argument("task_id")
+    p_reqch.add_argument("--reason", default=None,
+                         help="What must change — recorded as a comment for "
+                              "the implementer. Quote multi-word reasons.")
+
+    p_gate = sub.add_parser(
+        "gate-action",
+        help="Apply a plan_ready gate action to an AIF workflow card: "
+             "start_implementation | request_replanning",
+    )
+    p_gate.add_argument("task_id")
+    p_gate.add_argument("action",
+                        choices=["start_implementation", "request_replanning"])
 
     # --- swarm ---
     p_swarm = sub.add_parser(
@@ -962,6 +1012,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "approve":  _cmd_wf_approve,
+            "request-changes": _cmd_wf_request_changes,
+            "gate-action": _cmd_workflow_action,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -1353,6 +1406,15 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            workflow=getattr(args, "workflow", None),
+            workflow_step=getattr(args, "workflow_step", None),
+            auto_mode=(
+                False if getattr(args, "human_gates", False) else None
+            ),
+            use_subagents=(
+                None if getattr(args, "delegation", None) is None
+                else getattr(args, "delegation") == "subagents"
+            ),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2021,6 +2083,44 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
+
+
+def _cmd_wf_approve(args: argparse.Namespace) -> int:
+    args._wf_action = "approve_done"
+    return _cmd_workflow_action(args)
+
+
+def _cmd_wf_request_changes(args: argparse.Namespace) -> int:
+    args._wf_action = "request_changes"
+    return _cmd_workflow_action(args)
+
+
+def _cmd_workflow_action(args: argparse.Namespace) -> int:
+    """Apply an AIF workflow human gate action (approve / request-changes /
+    plan_ready actions). Thin CLI over kb.apply_workflow_human_event."""
+    action = getattr(args, "_wf_action", None) or getattr(args, "action", None)
+    reason = (getattr(args, "reason", None) or "").strip() or None
+    with kb.connect_closing() as conn:
+        if reason:
+            kb.add_comment(
+                conn, args.task_id, _profile_author(),
+                f"REQUEST CHANGES: {reason}",
+            )
+        try:
+            ok = kb.apply_workflow_human_event(conn, args.task_id, action)
+        except ValueError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 1
+        if not ok:
+            print(
+                f"kanban: could not apply {action} to {args.task_id}",
+                file=sys.stderr,
+            )
+            return 1
+        task = kb.get_task(conn, args.task_id)
+    step = getattr(task, "current_step_key", None) or "?"
+    print(f"{args.task_id}: {action} → {task.status} (stage {step})")
+    return 0
 
 
 def _cmd_promote(args: argparse.Namespace) -> int:

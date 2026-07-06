@@ -676,6 +676,7 @@ def write_board_metadata(
     default_workdir: Optional[str] = None,
     orchestrator_profile: Optional[str] = None,
     default_assignee: Optional[str] = None,
+    use_subagents: Optional[bool] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
@@ -686,6 +687,10 @@ def write_board_metadata(
     consumed by the decomposer (see ``kanban_decompose``): a non-empty value
     pins that board's orchestrator/default; an empty string clears the
     override so resolution falls back to the global ``kanban.*`` config.
+
+    ``use_subagents`` pins the board's aif delegation mode (True =
+    coordinator/sidecar subagents, False = inline skills); see
+    :func:`resolve_use_subagents` for the task → board → config precedence.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta = read_board_metadata(slug)
@@ -714,6 +719,8 @@ def write_board_metadata(
                 meta[_key] = _clean
             else:
                 meta.pop(_key, None)  # empty clears the per-board override
+    if use_subagents is not None:
+        meta["use_subagents"] = bool(use_subagents)
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
@@ -931,6 +938,13 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # ---- AIF workflow fields (see SCHEMA_SQL comments / kanban_workflow) ----
+    auto_mode: Optional[bool] = None
+    review_iteration_count: int = 0
+    max_review_iterations: Optional[int] = None
+    rework_requested: bool = False
+    manual_review_required: bool = False
+    use_subagents: Optional[bool] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1014,6 +1028,39 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            auto_mode=(
+                bool(row["auto_mode"])
+                if "auto_mode" in keys and row["auto_mode"] is not None
+                else None
+            ),
+            review_iteration_count=(
+                int(row["review_iteration_count"])
+                if "review_iteration_count" in keys
+                and row["review_iteration_count"] is not None
+                else 0
+            ),
+            max_review_iterations=(
+                int(row["max_review_iterations"])
+                if "max_review_iterations" in keys
+                and row["max_review_iterations"] is not None
+                else None
+            ),
+            rework_requested=(
+                bool(row["rework_requested"])
+                if "rework_requested" in keys and row["rework_requested"] is not None
+                else False
+            ),
+            manual_review_required=(
+                bool(row["manual_review_required"])
+                if "manual_review_required" in keys
+                and row["manual_review_required"] is not None
+                else False
+            ),
+            use_subagents=(
+                bool(row["use_subagents"])
+                if "use_subagents" in keys and row["use_subagents"] is not None
+                else None
             ),
         )
 
@@ -1192,7 +1239,37 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- ---- AIF workflow columns (kanban_workflow.py; port of aif-handoff) ----
+    -- Human-gate skip toggle for workflow tasks. NULL = auto (the Hermes
+    -- department default); 0 = human gates at plan_ready and done-approval.
+    auto_mode            INTEGER,
+    -- Convergence counter for the review gate: how many rework cycles the
+    -- verify/review gates have already sent this card through. Reset on
+    -- clean transitions (CLEAN_STATE_RESET), NOT on auto-rework.
+    review_iteration_count INTEGER NOT NULL DEFAULT 0,
+    -- Per-task override of the rework cap. NULL = kanban.max_review_iterations
+    -- config, then DEFAULT_MAX_REVIEW_ITERATIONS.
+    max_review_iterations INTEGER,
+    -- JSON {strategy, iteration, findings[]} — blocking findings carried
+    -- across review rounds so convergence (still/resolved/new by stable id)
+    -- can be PROVEN rather than guessed. NULL when no round is in flight.
+    auto_review_state    TEXT,
+    -- 1 while the card is back in implementing due to request_changes /
+    -- review-gate rework; cleared by CLEAN_STATE_RESET on clean transitions.
+    rework_requested     INTEGER NOT NULL DEFAULT 0,
+    -- 1 when the convergence gate stopped (max_iterations /
+    -- new_blockers_after_rework / malformed_review_output) and a human must
+    -- decide. The card also sits in blocked/needs_input; this flag is the
+    -- machine-readable "why" for dashboards and diagnostics.
+    manual_review_required INTEGER NOT NULL DEFAULT 0,
+    -- Optional stage toggles (NULL = config default): run the plan-improve
+    -- pass after planning / the verify stage before review.
+    run_plan_improve     INTEGER,
+    run_post_verify      INTEGER,
+    -- Worker delegation mode for aif skills: 1 = spawn coordinator/sidecar
+    -- subagents (quality), 0 = execute skills inline (speed). NULL = config.
+    use_subagents        INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2003,6 +2080,54 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    # AIF workflow columns (kanban_workflow.py; port of aif-handoff).
+    # NULL-able toggles fall through to config defaults, so legacy rows keep
+    # the behaviour they had before the columns existed; the two counters
+    # start at 0 which is correct for cards that never met a review gate.
+    if "auto_mode" not in cols:
+        _add_column_if_missing(conn, "tasks", "auto_mode", "auto_mode INTEGER")
+    if "review_iteration_count" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "review_iteration_count",
+            "review_iteration_count INTEGER NOT NULL DEFAULT 0",
+        )
+    if "max_review_iterations" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "max_review_iterations", "max_review_iterations INTEGER"
+        )
+    if "auto_review_state" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "auto_review_state", "auto_review_state TEXT"
+        )
+    if "rework_requested" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "rework_requested",
+            "rework_requested INTEGER NOT NULL DEFAULT 0",
+        )
+    if "manual_review_required" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "manual_review_required",
+            "manual_review_required INTEGER NOT NULL DEFAULT 0",
+        )
+    if "run_plan_improve" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "run_plan_improve", "run_plan_improve INTEGER"
+        )
+    if "run_post_verify" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "run_post_verify", "run_post_verify INTEGER"
+        )
+    if "use_subagents" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "use_subagents", "use_subagents INTEGER"
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -2424,6 +2549,10 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    workflow: Optional[str] = None,
+    workflow_step: Optional[str] = None,
+    auto_mode: Optional[bool] = None,
+    use_subagents: Optional[bool] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2447,8 +2576,37 @@ def create_task(
     each name to ``hermes --skills ...``. Use this to pin a task to a
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
+
+    ``workflow='aif'`` opts the card into the AIF stage machine
+    (:mod:`hermes_cli.kanban_workflow`): ``workflow_step`` picks the entry
+    stage (default ``planning``) and the assignee is FORCED to the stage's
+    role profile — the stage owns the role, and every advance rewrites the
+    assignee so the dispatcher routes stages without knowing about
+    workflows. ``auto_mode`` (workflow tasks only) toggles the human gates
+    at plan_ready / done-approval; ``None`` means auto (department default).
     """
     assignee = _canonical_assignee(assignee)
+    workflow = (workflow or "").strip() or None
+    workflow_step_normalized: Optional[str] = None
+    if workflow is not None:
+        from hermes_cli import kanban_workflow as _kwf
+        if workflow != _kwf.AIF_WORKFLOW_ID:
+            raise ValueError(
+                f"workflow must be {_kwf.AIF_WORKFLOW_ID!r} or None, got {workflow!r}"
+            )
+        workflow_step_normalized = _kwf.normalize_entry_stage(workflow_step)
+        stage_assignee = _kwf.stage_role(workflow_step_normalized)
+        if stage_assignee is None:
+            raise ValueError(
+                f"workflow_step {workflow_step_normalized!r} is not a "
+                "dispatchable entry stage"
+            )
+        # Stage owns the role: an explicitly-passed assignee is overridden,
+        # not honoured — a workflow card assigned off-role would deadlock
+        # (its completion handler expects the stage's role to advance it).
+        assignee = stage_assignee
+    elif workflow_step:
+        raise ValueError("workflow_step requires workflow='aif'")
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -2661,8 +2819,10 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        workflow_template_id, current_step_key, auto_mode,
+                        use_subagents
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2685,6 +2845,12 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        workflow,
+                        workflow_step_normalized,
+                        (None if auto_mode is None or workflow is None
+                         else (1 if auto_mode else 0)),
+                        (None if use_subagents is None
+                         else (1 if use_subagents else 0)),
                     ),
                 )
                 for pid in parents:
@@ -2704,6 +2870,8 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "workflow": workflow,
+                        "workflow_step": workflow_step_normalized,
                     },
                 )
             return task_id
@@ -4001,6 +4169,368 @@ class HallucinatedCardsError(ValueError):
         )
 
 
+# ---------------------------------------------------------------------------
+# AIF workflow stage machine (port of aif-handoff; logic in kanban_workflow)
+# ---------------------------------------------------------------------------
+
+_WORKFLOW_ROW_COLUMNS = (
+    "id, status, assignee, workflow_template_id, current_step_key, "
+    "auto_mode, review_iteration_count, max_review_iterations, "
+    "auto_review_state, rework_requested, manual_review_required, "
+    "run_plan_improve, run_post_verify, current_run_id"
+)
+
+
+def _workflow_defaults() -> dict:
+    """Config-level workflow defaults (per-task columns override these)."""
+    from hermes_cli import kanban_workflow as _kwf
+    defaults = {
+        "max_review_iterations": _kwf.DEFAULT_MAX_REVIEW_ITERATIONS,
+        "auto_review_strategy": _kwf.STRATEGY_FULL_RE_REVIEW,
+        "run_plan_improve": False,
+        "run_post_verify": True,
+        # subagents = quality (coordinator/sidecar delegation inside the
+        # worker session, lee-to's AGENT_USE_SUBAGENTS); skills = speed
+        # (the worker executes its aif skill inline).
+        "use_subagents": True,
+    }
+    try:
+        from hermes_cli.config import load_config
+        kan = (load_config() or {}).get("kanban") or {}
+    except Exception:
+        return defaults
+    try:
+        raw_cap = kan.get("max_review_iterations")
+        if raw_cap is not None and int(raw_cap) >= 1:
+            defaults["max_review_iterations"] = int(raw_cap)
+    except (TypeError, ValueError):
+        pass
+    strategy = str(kan.get("auto_review_strategy") or "").strip()
+    if strategy in _kwf.VALID_REVIEW_STRATEGIES:
+        defaults["auto_review_strategy"] = strategy
+    if kan.get("run_plan_improve") is not None:
+        defaults["run_plan_improve"] = bool(kan.get("run_plan_improve"))
+    if kan.get("run_post_verify") is not None:
+        defaults["run_post_verify"] = bool(kan.get("run_post_verify"))
+    if kan.get("use_subagents") is not None:
+        defaults["use_subagents"] = bool(kan.get("use_subagents"))
+    return defaults
+
+
+def resolve_use_subagents(
+    conn: sqlite3.Connection, task_id: str, *, board: Optional[str] = None
+) -> bool:
+    """Delegation mode for a task's aif skills: task column → board.json
+    ``use_subagents`` → ``kanban.use_subagents`` config → True (quality)."""
+    row = conn.execute(
+        "SELECT use_subagents FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is not None and row["use_subagents"] is not None:
+        return bool(row["use_subagents"])
+    try:
+        meta = read_board_metadata(board or get_current_board())
+        if meta.get("use_subagents") is not None:
+            return bool(meta.get("use_subagents"))
+    except Exception:
+        pass
+    return bool(_workflow_defaults()["use_subagents"])
+
+
+def _get_workflow_row(conn: sqlite3.Connection, task_id: str):
+    """Return the tasks row (workflow columns) or None when not a live
+    AIF-workflow card (missing, non-workflow, or already verified)."""
+    from hermes_cli import kanban_workflow as _kwf
+    row = conn.execute(
+        f"SELECT {_WORKFLOW_ROW_COLUMNS} FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    if not _kwf.is_workflow_task(dict(row)):
+        return None
+    if (row["current_step_key"] or "") == _kwf.STAGE_VERIFIED:
+        return None
+    return row
+
+
+def _insert_workflow_comment(conn: sqlite3.Connection, task_id: str, body: str) -> None:
+    """Comment insert usable inside an open write_txn (add_comment opens
+    its own transaction, so it must not be called from here)."""
+    conn.execute(
+        "INSERT INTO task_comments (task_id, author, body, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (task_id, "workflow", body, int(time.time())),
+    )
+
+
+def _apply_stage_patch(
+    conn: sqlite3.Connection,
+    task_id: str,
+    patch,
+    *,
+    run_outcome: str,
+    run_summary: Optional[str] = None,
+    run_metadata: Optional[dict] = None,
+) -> None:
+    """Apply a non-terminal :class:`kanban_workflow.StagePatch` in one txn."""
+    with write_txn(conn):
+        _end_run(
+            conn, task_id,
+            outcome=run_outcome, status=run_outcome,
+            summary=run_summary, metadata=run_metadata,
+        )
+        sets = [
+            "status = ?", "current_step_key = ?",
+            "claim_lock = NULL", "claim_expires = NULL",
+            "worker_pid = NULL", "current_run_id = NULL",
+        ]
+        params: list = [patch.status, patch.step]
+        if patch.assignee is not None:
+            sets.append("assignee = ?")
+            params.append(patch.assignee)
+        if patch.status == "blocked":
+            sets.append("block_kind = ?")
+            params.append("needs_input")
+        for col, val in (patch.columns or {}).items():
+            sets.append(f"{col} = ?")
+            params.append(val)
+        params.append(task_id)
+        conn.execute(
+            f"UPDATE tasks SET {', '.join(sets)} WHERE id = ?", params
+        )
+        for name, payload in patch.events:
+            _append_event(conn, task_id, name, payload)
+        if patch.comment:
+            _insert_workflow_comment(conn, task_id, patch.comment)
+
+
+def _workflow_intercept_complete(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    result: Optional[str],
+    summary: Optional[str],
+    metadata: Optional[dict],
+) -> Optional[bool]:
+    """Stage-advance hook for :func:`complete_task`.
+
+    Returns ``None`` when normal (terminal) completion should proceed —
+    non-workflow tasks and cards whose stage machine just reached
+    ``verified``. Returns ``True`` after applying a non-terminal advance.
+
+    On a workflow card, ``kanban_complete`` means "my STAGE is done", not
+    "the card is done": the state machine decides where the card goes
+    next and which role profile owns it there. Review/verify PASS
+    verdicts clear ``auto_review_state`` (convergence loop ended
+    cleanly); FAIL verdicts never reach here — the tool boundary rejects
+    blocking gate_results on complete and routes them to kanban_block.
+    """
+    from hermes_cli import kanban_workflow as _kwf
+    row = _get_workflow_row(conn, task_id)
+    if row is None:
+        return None
+    defaults = _workflow_defaults()
+    row_map = dict(row)
+    step = _kwf.normalize_entry_stage(row_map.get("current_step_key"))
+
+    patch = _kwf.next_stage_on_success(
+        row_map,
+        run_plan_improve_default=defaults["run_plan_improve"],
+        run_post_verify_default=defaults["run_post_verify"],
+    )
+
+    gate_result = (metadata or {}).get("gate_result")
+    if step in (_kwf.STAGE_REVIEW, _kwf.STAGE_VERIFY) and gate_result:
+        # PASS through the convergence gate: record the round's metrics so
+        # the audit trail shows the loop ENDED, not just that it ran.
+        decision = _kwf.evaluate_review_gate(
+            row_map, gate_result,
+            strategy=defaults["auto_review_strategy"],
+            max_iterations_default=defaults["max_review_iterations"],
+        )
+        patch.events.append((
+            "review_gate", {"outcome": "success", **decision.metrics},
+        ))
+        patch.comment = _kwf.build_gate_summary(decision)
+
+    if patch.terminal:
+        # Stamp the final step, then let the caller's normal completion
+        # body run (hallucination checks, run bookkeeping, cleanup, hooks).
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET current_step_key = ? WHERE id = ?",
+                (_kwf.STAGE_VERIFIED, task_id),
+            )
+            for name, payload in patch.events:
+                _append_event(conn, task_id, name, payload)
+            if patch.comment:
+                _insert_workflow_comment(conn, task_id, patch.comment)
+        return None
+
+    _apply_stage_patch(
+        conn, task_id, patch,
+        run_outcome="completed",
+        run_summary=summary if summary is not None else result,
+        run_metadata=metadata,
+    )
+    if patch.status == "blocked":
+        _fire_kanban_lifecycle_hook(
+            "kanban_task_blocked",
+            task_id,
+            board=get_current_board(),
+            assignee=row_map.get("assignee"),
+            run_id=None,
+            reason=patch.block_reason,
+        )
+    return True
+
+
+def _workflow_intercept_block(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str],
+    kind: Optional[str],
+    gate_result: Optional[dict],
+) -> Optional[bool]:
+    """Convergence-gate hook for :func:`block_task`.
+
+    A review/verify-stage FAIL on a workflow card does not park in
+    ``blocked``: the gate decides rework (card returns to implementing
+    with findings carried in ``auto_review_state``) or manual handoff
+    (card stops at the done-approval gate with ``manual_review_required``).
+    Everything else (other stages, dependency waits) returns ``None`` so
+    the normal typed-block routing runs with the stage preserved.
+    """
+    from hermes_cli import kanban_workflow as _kwf
+    if kind == "dependency":
+        return None
+    row = _get_workflow_row(conn, task_id)
+    if row is None:
+        return None
+    step = (row["current_step_key"] or "").strip()
+    if step not in (_kwf.STAGE_REVIEW, _kwf.STAGE_VERIFY):
+        return None
+
+    defaults = _workflow_defaults()
+    row_map = dict(row)
+    row_map["_block_reason"] = reason
+    decision = _kwf.evaluate_review_gate(
+        row_map, gate_result,
+        strategy=defaults["auto_review_strategy"],
+        max_iterations_default=defaults["max_review_iterations"],
+    )
+    summary_comment = _kwf.build_gate_summary(decision)
+
+    if decision.status == "rework":
+        patch = _kwf.StagePatch(
+            status="ready",
+            step=_kwf.STAGE_IMPLEMENTING,
+            assignee=_kwf.STAGE_ROLES[_kwf.STAGE_IMPLEMENTING],
+            columns={
+                "review_iteration_count": decision.iteration,
+                "auto_review_state": decision.auto_review_state,
+                "rework_requested": 1,
+                "manual_review_required": 0,
+            },
+            events=[(
+                "review_rework",
+                {"from": step, "reason": reason, **decision.metrics},
+            )],
+            comment=summary_comment,
+        )
+        _apply_stage_patch(
+            conn, task_id, patch,
+            run_outcome="blocked", run_summary=reason,
+        )
+        return True
+
+    # manual_review_required: the loop must NOT continue on its own. The
+    # card stops at the done-approval human gate (blocked/needs_input) so
+    # a human either approves or requests changes — exactly lee-to's
+    # "convergence stopped, human required" terminal for the auto loop.
+    patch = _kwf.StagePatch(
+        status="blocked",
+        step=_kwf.STAGE_DONE,
+        columns={
+            "review_iteration_count": decision.iteration,
+            "auto_review_state": decision.auto_review_state,
+            "rework_requested": 0,
+            "manual_review_required": 1,
+        },
+        block_reason=decision.handoff_reason,
+        events=[(
+            "manual_review_required",
+            {
+                "from": step,
+                "handoff_reason": decision.handoff_reason,
+                "reason": reason,
+                **decision.metrics,
+            },
+        )],
+        comment=summary_comment,
+    )
+    _apply_stage_patch(
+        conn, task_id, patch,
+        run_outcome="blocked", run_summary=reason,
+    )
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_blocked",
+        task_id,
+        board=get_current_board(),
+        assignee=row["assignee"],
+        run_id=None,
+        reason=f"manual_review_required: {decision.handoff_reason}",
+    )
+    return True
+
+
+def apply_workflow_human_event(
+    conn: sqlite3.Connection, task_id: str, event: str
+) -> bool:
+    """Apply a human gate action (approve_done / request_changes /
+    start_implementation / request_replanning) to a workflow card.
+
+    Port of lee-to's ``applyHumanTaskEvent``: raises ``ValueError`` when
+    the action doesn't fit the card's stage. ``approve_done`` funnels
+    into :func:`complete_task` so terminal completion keeps its normal
+    bookkeeping (cleanup, hooks, notifications).
+    """
+    from hermes_cli import kanban_workflow as _kwf
+    row = conn.execute(
+        f"SELECT {_WORKFLOW_ROW_COLUMNS} FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"unknown task {task_id}")
+    if not _kwf.is_workflow_task(dict(row)):
+        raise ValueError(f"task {task_id} is not an AIF workflow card")
+
+    patch = _kwf.apply_human_event(dict(row), event)
+
+    if patch.terminal:
+        with write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET current_step_key = ?, "
+                "rework_requested = 0, manual_review_required = 0, "
+                "review_iteration_count = 0, auto_review_state = NULL, "
+                "block_kind = NULL, status = CASE WHEN status = 'blocked' "
+                "THEN 'ready' ELSE status END WHERE id = ?",
+                (_kwf.STAGE_VERIFIED, task_id),
+            )
+            for name, payload in patch.events:
+                _append_event(conn, task_id, name, payload)
+        return complete_task(
+            conn, task_id,
+            result=f"approved by human ({event})",
+        )
+
+    _apply_stage_patch(
+        conn, task_id, patch,
+        run_outcome="completed",
+        run_summary=f"human action: {event}",
+    )
+    return True
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4038,7 +4568,20 @@ def complete_task(
     Any suspected phantom references are recorded as a
     ``suspected_hallucinated_references`` event. This pass is advisory
     and never blocks.
+
+    AIF workflow cards (``workflow_template_id='aif'``) do NOT complete
+    terminally here until their stage machine reaches ``verified``:
+    completing such a card means "current stage done" and advances it via
+    :func:`_workflow_intercept_complete` (which falls through to this
+    body only for the final transition).
     """
+    workflow_advanced = _workflow_intercept_complete(
+        conn, task_id,
+        result=result, summary=summary, metadata=metadata,
+    )
+    if workflow_advanced is not None:
+        return workflow_advanced
+
     now = int(time.time())
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
@@ -4571,6 +5114,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    gate_result: Optional[dict] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -4598,11 +5142,24 @@ def block_task(
 
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
+
+    ``gate_result`` (validated upstream by the tool layer) carries the
+    structured FAIL verdict for review/verify stages of AIF workflow
+    cards. For those, the convergence gate — not this function — decides
+    whether the card goes back to implementing (rework) or stops at the
+    human gate (:func:`_workflow_intercept_block`). A review-stage block
+    WITHOUT a structured verdict is the malformed-output path: it never
+    silently passes and escalates per the same gate.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    workflow_handled = _workflow_intercept_block(
+        conn, task_id, reason=reason, kind=kind, gate_result=gate_result,
+    )
+    if workflow_handled is not None:
+        return workflow_handled
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
@@ -4860,6 +5417,37 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     runs invariant (``current_run_id IS NULL`` ⇔ run row in terminal
     state) holds for the rest of this function's lifetime.
     """
+    # AIF workflow human gates (plan_ready / done-approval) must not be
+    # "unblocked" back into the work pool by a cron or a generic unblock:
+    # a gate step has no worker profile, and blindly readying it would
+    # either deadlock or silently skip the human decision the gate exists
+    # for. Gates are resolved ONLY via apply_workflow_human_event
+    # (approve_done / request_changes / start_implementation / ...).
+    from hermes_cli import kanban_workflow as _kwf
+    gate_row = conn.execute(
+        "SELECT workflow_template_id, current_step_key FROM tasks "
+        "WHERE id = ? AND status IN ('blocked', 'scheduled')",
+        (task_id,),
+    ).fetchone()
+    if (
+        gate_row is not None
+        and _kwf.is_workflow_task(dict(gate_row))
+        and (gate_row["current_step_key"] or "") in _kwf.HUMAN_GATE_STAGES
+    ):
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "workflow_gate_unblock_refused",
+                {
+                    "step": gate_row["current_step_key"],
+                    "actions": list(
+                        _kwf.HUMAN_ACTIONS_BY_STAGE.get(
+                            gate_row["current_step_key"] or "", ()
+                        )
+                    ),
+                },
+            )
+        return False
+
     now = int(time.time())
     with write_txn(conn):
         stale = conn.execute(
@@ -7313,7 +7901,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, workflow_template_id, current_step_key FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -7371,6 +7959,22 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        # AIF workflow cards parked at a non-dispatchable step (a human
+        # gate or terminal) must never spawn a worker — there is no role
+        # profile for those steps. Normally unreachable (gates sit in
+        # ``blocked`` and the unblock guard refuses to ready them), so
+        # this is belt-and-suspenders against manual SQL / legacy rows.
+        if (row["workflow_template_id"] or "").strip():
+            from hermes_cli import kanban_workflow as _kwf
+            if _kwf.is_workflow_task(dict(row)) and not _kwf.is_dispatchable_stage(
+                row["current_step_key"]
+            ):
+                _log.debug(
+                    "kanban dispatch: skipping workflow task %s at "
+                    "non-dispatchable step %r",
+                    row["id"], row["current_step_key"],
+                )
+                continue
         row_assignee = row["assignee"]
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
@@ -8187,6 +8791,60 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
+
+    # AIF workflow banner: which stage this worker IS, and what completing
+    # means (stage advance, not terminal done). On rework rounds the carried
+    # findings are surfaced so the implementer fixes exactly what blocked
+    # the previous review instead of rediscovering it.
+    wf_row = conn.execute(
+        "SELECT workflow_template_id, current_step_key, rework_requested, "
+        "review_iteration_count, max_review_iterations, auto_review_state "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if wf_row is not None and (wf_row["workflow_template_id"] or "").strip():
+        from hermes_cli import kanban_workflow as _kwf
+        if _kwf.is_workflow_task(dict(wf_row)):
+            step = _kwf.normalize_entry_stage(wf_row["current_step_key"])
+            lines.append("## AIF workflow stage")
+            lines.append(
+                f"This card walks the AIF stage machine; you are the "
+                f"**{step}** stage ({_kwf.stage_role(step) or 'gate'}). "
+                "`kanban_complete` = THIS STAGE is done (the card advances "
+                "to the next stage/role automatically) — do NOT do the "
+                "other stages' work. Gate stages (verify/review) MUST pass "
+                "`gate_result`; a FAIL verdict goes to `kanban_block` with "
+                "`gate_result` so the convergence gate can route rework."
+            )
+            mode = resolve_use_subagents(conn, task_id)
+            lines.append(
+                f"Delegation mode: **{'subagents' if mode else 'skills'}** — "
+                + (
+                    "spawn the coordinator/sidecar subagents your aif skill "
+                    "names (quality mode)."
+                    if mode else
+                    "execute your aif skill steps inline; do not spawn "
+                    "subagents (speed mode)."
+                )
+            )
+            if wf_row["rework_requested"]:
+                cap = wf_row["max_review_iterations"] or "config"
+                lines.append("")
+                lines.append(
+                    f"**REWORK ROUND** (review iteration "
+                    f"{wf_row['review_iteration_count']}, cap {cap}): the "
+                    "previous review FAILED with the findings below. Fix "
+                    "them specifically; the next review compares finding "
+                    "ids to prove convergence."
+                )
+                state = _kwf.parse_auto_review_state(wf_row["auto_review_state"])
+                for f in (state.get("findings") or [])[:20]:
+                    if isinstance(f, dict) and f.get("text"):
+                        loc = f" ({f['file']})" if f.get("file") else ""
+                        lines.append(
+                            f"- [{f.get('id', '?')}] {f['text']}{loc}"
+                        )
+            lines.append("")
 
     if task.body and task.body.strip():
         lines.append("## Body")

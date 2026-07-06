@@ -659,6 +659,30 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            # AIF workflow gate stages fail closed on missing verdicts: a
+            # review/verify completion without a validated gate_result is
+            # exactly the "malformed review output" lee-to's convergence
+            # gate refuses to guess about. The worker is still alive here,
+            # so the fix is immediate: re-call with the structured verdict.
+            wf_row = conn.execute(
+                "SELECT workflow_template_id, current_step_key FROM tasks "
+                "WHERE id = ?",
+                (tid,),
+            ).fetchone()
+            if (
+                wf_row is not None
+                and (wf_row["workflow_template_id"] or "").strip() == "aif"
+                and (wf_row["current_step_key"] or "") in ("review", "verify")
+                and not (metadata or {}).get("gate_result")
+            ):
+                return tool_error(
+                    f"kanban_complete: this is the '{wf_row['current_step_key']}' "
+                    "gate stage of an AIF workflow card — a validated "
+                    "gate_result is REQUIRED (schema_version, gate, status "
+                    "pass|warn, blocking=false, blockers, affected_files, "
+                    "suggested_next). Re-call kanban_complete with "
+                    "gate_result=..., or kanban_block with a fail verdict."
+                )
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
@@ -779,12 +803,33 @@ def _handle_block(args: dict, **kw) -> str:
                 f"another reason, call kanban_complete instead — the "
                 f"completion judge will evaluate it."
             )
+        # Structured FAIL verdict for gate stages (review/verify). On AIF
+        # workflow cards this feeds the convergence gate in block_task —
+        # rework vs manual handoff is PROVEN from findings, not guessed
+        # from prose. A pass/non-blocking verdict on kanban_block is a
+        # contradiction: that's a completion, not a blocker.
+        raw_gate = args.get("gate_result")
+        gate_payload = None
+        if raw_gate is not None:
+            try:
+                gate_payload = validate_gate_result(raw_gate)
+            except GateResultError as exc:
+                conn.close()
+                return tool_error(f"kanban_block: gate_result invalid: {exc}")
+            if not gate_result_blocks_completion(gate_payload):
+                conn.close()
+                return tool_error(
+                    "kanban_block: gate_result is non-blocking "
+                    f"({gate_payload.get('gate')}/{gate_payload.get('status')}) "
+                    "— call kanban_complete with it instead."
+                )
         try:
             ok = kb.block_task(
                 conn, tid,
                 reason=reason,
                 kind=kind,
                 expected_run_id=_worker_run_id(tid),
+                gate_result=gate_payload,
             )
             if not ok:
                 return tool_error(
@@ -1411,6 +1456,17 @@ KANBAN_BLOCK_SCHEMA = {
                     "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
+                ),
+            },
+            "gate_result": {
+                "type": "object",
+                "description": (
+                    "Structured FAIL verdict for gate workers (review/verify/"
+                    "security/rules/qa): same schema as kanban_complete's "
+                    "gate_result but with status='fail'/blocking=true. On AIF "
+                    "workflow cards this drives the convergence gate — each "
+                    "blocker's stable id is compared across review rounds, so "
+                    "ALWAYS pass it when failing a gate."
                 ),
             },
             "board": _board_schema_prop(),
