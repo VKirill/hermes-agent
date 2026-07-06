@@ -7665,6 +7665,26 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     if err and _RESPAWN_BLOCKER_RE.search(err):
         return "blocker_auth"
 
+    # AIF workflow cards at a dispatchable stage are EXEMPT from the
+    # recent_success and active_pr guards: a completed run is exactly how
+    # a stage finishes — the advance handler re-readied the card for the
+    # NEXT stage's role, and deferring "until a human reviews" would stall
+    # every stage transition for the guard window (the E2E stall this
+    # exemption fixes). Same for active_pr: the implement stage posting a
+    # PR link must not block the verify/review stages from spawning.
+    # Provider-level guards above (rate limit / auth) still apply — those
+    # are stage-agnostic.
+    wf_row = conn.execute(
+        "SELECT workflow_template_id, current_step_key FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if wf_row is not None and (wf_row["workflow_template_id"] or "").strip():
+        from hermes_cli import kanban_workflow as _kwf
+        if _kwf.is_workflow_task(dict(wf_row)) and _kwf.is_dispatchable_stage(
+            wf_row["current_step_key"]
+        ):
+            return None
+
     # 3. Completed run within guard window — proof of recent success.
     cutoff = now - _RESPAWN_GUARD_SUCCESS_WINDOW
     if conn.execute(
