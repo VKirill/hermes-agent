@@ -1042,7 +1042,7 @@
             return createNewBoard(payload).then(function () { setShowNewBoard(false); });
           },
         }) : null,
-        h(OrchestrationPanel, null),
+        h(OrchestrationPanel, { board: board }),
         h(AttentionStrip, {
           boardData,
           onOpen: setSelectedTaskId,
@@ -1530,7 +1530,8 @@
   // auto-generate). Backed by /orchestration + /profiles endpoints.
   // ---------------------------------------------------------------------
 
-  function OrchestrationPanel() {
+  function OrchestrationPanel(props) {
+    var board = props && props.board;
     const [expanded, setExpanded] = useState(false);
     const [settings, setSettings] = useState(null);
     const [profiles, setProfiles] = useState([]);
@@ -1539,7 +1540,7 @@
 
     const loadAll = useCallback(function () {
       Promise.all([
-        SDK.fetchJSON(`${API}/orchestration`),
+        SDK.fetchJSON(withBoard(`${API}/orchestration`, board)),
         SDK.fetchJSON(`${API}/profiles`),
       ]).then(function (results) {
         setSettings(results[0] || null);
@@ -1548,17 +1549,17 @@
       }).catch(function (err) {
         setMsg({ ok: false, text: "Failed to load: " + (err.message || String(err)) });
       });
-    }, []);
+    }, [board]);
 
     useEffect(function () {
-      // Load on mount so the collapsed pill shows the real mode without
-      // requiring the user to expand the panel first.
-      if (settings === null) loadAll();
-    }, [settings, loadAll]);
+      // Reload on mount and whenever the selected board changes so the panel
+      // reflects that board's per-board override (or the global default).
+      loadAll();
+    }, [board, loadAll]);
 
     const saveSettings = function (patch) {
       setMsg(null);
-      return SDK.fetchJSON(`${API}/orchestration`, {
+      return SDK.fetchJSON(withBoard(`${API}/orchestration`, board), {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(patch),
