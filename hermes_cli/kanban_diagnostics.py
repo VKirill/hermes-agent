@@ -145,6 +145,40 @@ def _task_field(task, name, default=None):
     return getattr(task, name, default)
 
 
+def _is_external_runtime_blocker(text: Optional[str]) -> bool:
+    """True for quota/rate/auth/provider walls that Board Health must not fix.
+
+    These are external runtime blockers, not broken task code. Returning a
+    repeated-failure diagnostic for them makes automated Board Health flows
+    create fix-task-on-fix-task cascades that can only hit the same exhausted
+    provider again.
+    """
+    if not text:
+        return False
+    lower = str(text).lower()
+    return any(
+        needle in lower
+        for needle in (
+            "out of extra usage",
+            "quota exhausted",
+            "quota_exhausted",
+            "usage limit",
+            "credits exhausted",
+            "insufficient credits",
+            "rate limit",
+            "rate-limited",
+            "too many requests",
+            "invalid api key",
+            "unauthorized",
+            "expired token",
+            "provider unavailable",
+            "service unavailable",
+            "missing required model capability",
+            "cli transport unavailable",
+        )
+    )
+
+
 def _parse_payload(ev) -> dict:
     """Tolerate event.payload being either a dict or a JSON string."""
     p = _task_field(ev, "payload", None)
@@ -488,6 +522,9 @@ def _rule_prose_phantom_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
     Auto-clears when a fresh clean completion arrives AFTER the
     suspected event.
     """
+    if _task_field(task, "status") in {"done", "archived"}:
+        return []
+
     hits = _active_hallucination_events(events, "suspected_hallucinated_references")
     if not hits:
         return []
@@ -531,6 +568,9 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     Accepts the legacy ``spawn_failure_threshold`` config key for
     back-compat.
     """
+    if _task_field(task, "status") in {"done", "archived"}:
+        return []
+
     threshold = _positive_int(cfg.get(
         "failure_threshold",
         cfg.get("spawn_failure_threshold", 3),
@@ -595,6 +635,8 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
 
     severity = "critical" if failures >= threshold * 2 else "error"
     err_text = (last_err or "").strip() if last_err else ""
+    if _is_external_runtime_blocker(err_text):
+        return []
     err_snippet = err_text[:500] + ("…" if len(err_text) > 500 else "") if err_text else ""
     outcome_label = {
         "spawn_failed": "spawn",
@@ -650,6 +692,9 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
     before the unified rule kicks in. Suppresses itself when the
     unified rule is also about to fire, to avoid double-flagging.
     """
+    if _task_field(task, "status") in {"done", "archived"}:
+        return []
+
     failure_threshold = int(cfg.get(
         "failure_threshold",
         cfg.get("spawn_failure_threshold", 3),
@@ -698,6 +743,8 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
     # having to open the logs. Truncate defensively — these can be huge
     # (full tracebacks).
     err_text = (last_err or "").strip() if last_err else ""
+    if _is_external_runtime_blocker(err_text):
+        return []
     err_snippet = err_text[:500] + ("…" if len(err_text) > 500 else "") if err_text else ""
     if err_snippet:
         title = f"Agent crashed {consecutive}x: {err_snippet.splitlines()[0][:160]}"

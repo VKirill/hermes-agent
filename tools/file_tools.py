@@ -34,7 +34,8 @@ def get_profile_home_for_session(session_id: Optional[str]) -> Optional[Path]:
     if not session_id:
         from hermes_constants import get_hermes_home, get_default_hermes_root
         try:
-            cur = get_hermes_home().resolve()
+            env_home = os.getenv("HERMES_HOME")
+            cur = Path(env_home).expanduser().resolve() if env_home else get_hermes_home().resolve()
             root = get_default_hermes_root().resolve()
             if cur != root and (root / "profiles") in cur.parents:
                 return cur
@@ -72,7 +73,58 @@ def get_profile_home_for_session(session_id: Optional[str]) -> Optional[Path]:
                             return p_dir
                 except Exception:
                     pass
+    # If a stale/foreign HERMES_SESSION_ID could not be resolved, fall back to
+    # the current HERMES_HOME env. Kanban workers and tests can inherit a
+    # session id from the parent process while HERMES_HOME has already been
+    # rebound to the worker profile; returning None would silently disable the
+    # named-profile hard guard.
+    try:
+        env_home = os.getenv("HERMES_HOME")
+        if env_home:
+            cur = Path(env_home).expanduser().resolve()
+            root_resolved = root.resolve()
+            if cur != root_resolved and (root_resolved / "profiles") in cur.parents:
+                return cur
+    except Exception:
+        pass
     return None
+
+
+_CROSS_PROFILE_OVERRIDE_AREAS = {"skills", "plugins", "cron", "memories"}
+
+
+def _is_cross_profile_override_path(resolved_path: str, profile_home: Optional[Path]) -> bool:
+    """True when cross_profile=True may bypass the profile hard guard.
+
+    The cross_profile flag is a narrow operator override for Hermes profile
+    state (skills/plugins/cron/memories). It must NOT reopen arbitrary writes
+    outside the active profile, such as shared tools or client directories.
+    Those paths need to be the task workspace/CWD or an explicit
+    file_tools.allowed_write_roots entry.
+    """
+    if not profile_home or profile_home.parent.name != "profiles":
+        return False
+    try:
+        from hermes_constants import get_default_hermes_root
+
+        root = get_default_hermes_root().resolve()
+        target = Path(resolved_path).resolve()
+
+        # Default profile scoped areas: <root>/skills, <root>/plugins, ...
+        for area in _CROSS_PROFILE_OVERRIDE_AREAS:
+            if target.is_relative_to((root / area).resolve()):
+                return True
+
+        # Other named profiles' scoped areas:
+        # <root>/profiles/<name>/(skills|plugins|cron|memories)/...
+        profiles_dir = (root / "profiles").resolve()
+        if target.is_relative_to(profiles_dir):
+            rel = target.relative_to(profiles_dir)
+            if len(rel.parts) >= 2 and rel.parts[0] != profile_home.name:
+                return rel.parts[1] in _CROSS_PROFILE_OVERRIDE_AREAS
+    except Exception:
+        return False
+    return False
 
 
 def _check_profile_hard_guards(resolved_path: str, profile_home: Optional[Path]) -> Optional[str]:
@@ -122,7 +174,12 @@ def _check_profile_hard_guards(resolved_path: str, profile_home: Optional[Path])
             Path("/var/tmp").resolve(),
         ]
         if any(resolved_target.is_relative_to(tr) for tr in temp_roots):
-            return None
+            # Temp is generally safe scratch space, but do not let it mask
+            # foreign writes inside a fake/default Hermes root in tests or
+            # unusual temp-based deployments. Those still need the active
+            # workspace/CWD allowlist below.
+            if not inside_root_foreign:
+                return None
 
         # Allowed CWD/workspace roots
         allowed_roots = []
@@ -181,31 +238,32 @@ def _check_profile_hard_guards(resolved_path: str, profile_home: Optional[Path])
         except Exception:
             pass
 
-        if any(resolved_target.is_relative_to(ar) for ar in allowed_roots):
-            # Foreign paths inside the hermes root are only allowed when they
-            # are an active workspace/CWD (e.g. the worker's kanban task
-            # workspace) — never other profiles' homes (blocked above) or
-            # arbitrary root internals via the config allowlist.
-            if inside_root_foreign:
-                cwd_like = set()
-                cwd_like.add(str(Path(os.getcwd()).resolve()))
-                # Kanban task workspace is also an active workspace.
-                kanban_ws2 = os.environ.get("HERMES_KANBAN_WORKSPACE")
-                if kanban_ws2:
-                    try:
-                        cwd_like.add(str(Path(kanban_ws2).resolve()))
-                    except Exception:
-                        pass
+        # For named-profile sessions, foreign paths inside the default Hermes
+        # root are only allowed when they are an active workspace/CWD. Check
+        # that before the broad allowed_roots pass so temp/config/cached roots
+        # cannot accidentally reopen arbitrary default-root writes.
+        if inside_root_foreign:
+            cwd_like = set()
+            cwd_like.add(str(Path(os.getcwd()).resolve()))
+            kanban_ws2 = os.environ.get("HERMES_KANBAN_WORKSPACE")
+            if kanban_ws2:
                 try:
-                    from tools.terminal_tool import _active_environments, _env_lock
-                    with _env_lock:
-                        for env in _active_environments.values():
-                            if getattr(env, "cwd", None):
-                                cwd_like.add(str(Path(env.cwd).resolve()))
+                    cwd_like.add(str(Path(kanban_ws2).resolve()))
                 except Exception:
                     pass
-                if not any(resolved_target.is_relative_to(Path(c)) for c in cwd_like):
-                    return f"Refusing to write to path outside profile home: {resolved_path}"
+            try:
+                from tools.terminal_tool import _active_environments, _env_lock
+                with _env_lock:
+                    for env in _active_environments.values():
+                        if getattr(env, "cwd", None):
+                            cwd_like.add(str(Path(env.cwd).resolve()))
+            except Exception:
+                pass
+            if not any(resolved_target.is_relative_to(Path(c)) for c in cwd_like):
+                return f"Refusing to write to path outside profile home: {resolved_path}"
+            return None
+
+        if any(resolved_target.is_relative_to(ar) for ar in allowed_roots):
             return None
 
         if inside_root_foreign:
@@ -1799,7 +1857,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
 
         # Always run hard guards, falling back to expand_tilde if resolution failed
         _resolved_for_guard = _resolved if _resolved is not None else _expand_tilde(path, profile_home=profile_home)
-        hard_err = _check_profile_hard_guards(_resolved_for_guard, profile_home)
+        hard_err = None
+        if not (cross_profile and _is_cross_profile_override_path(_resolved_for_guard, profile_home)):
+            hard_err = _check_profile_hard_guards(_resolved_for_guard, profile_home)
         if hard_err:
             return tool_error(hard_err)
 
@@ -1933,7 +1993,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             _resolved = str(_resolve_path_for_task(_p, task_id, profile_home=profile_home))
         except Exception:
             _resolved = _p
-        hard_err = _check_profile_hard_guards(_resolved, profile_home)
+        hard_err = None
+        if not (cross_profile and _is_cross_profile_override_path(_resolved, profile_home)):
+            hard_err = _check_profile_hard_guards(_resolved, profile_home)
         if hard_err:
             return tool_error(hard_err)
     try:

@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import unicodedata
+from pathlib import Path
 from typing import Optional
 from hermes_cli.config import cfg_get
 
@@ -473,6 +474,147 @@ def _hardline_block_result(description: str) -> dict:
             "approvals.mode=off, or cron approve mode. If you genuinely "
             "need to run it, run it yourself in a terminal outside the "
             "agent."
+        ),
+    }
+
+
+_POSIX_ABSOLUTE_PATH_RE = re.compile(
+    r"/(?:Users|Volumes|private|tmp|var|opt|home|etc|usr|srv|mnt|workspace)"
+    r"[^\s'\"`)]*"
+)
+_KANBAN_PROFILE_WRITE_INTENT_RE = re.compile(
+    r"(?:\.\s*(?:write_text|write_bytes)\s*\(|"
+    r"\bopen\s*\([^\n)]*['\"][^'\"]*[wax][^'\"]*['\"]|"
+    r"(?:^|[;&|\n])\s*(?:sudo\s+(?:-[^\s]+\s+)*)?(?:tee|cp|mv|install)\b|"
+    r"(?:^|[;&|\n])[^#\n]*(?:>|>>)\s*['\"]?/)"
+    ,
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _path_under_any(path: Path, roots: list[Path]) -> bool:
+    for root in roots:
+        try:
+            if path.is_relative_to(root):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _kanban_profile_write_roots(command_cwd: str | None = None) -> list[Path]:
+    """Roots a named-profile kanban worker may write through terminal/code."""
+    roots: list[Path] = []
+
+    home_raw = os.getenv("HERMES_HOME")
+    if home_raw:
+        try:
+            roots.append(Path(home_raw).expanduser().resolve())
+        except Exception:
+            pass
+
+    for raw in (
+        command_cwd,
+        os.getcwd(),
+        os.getenv("HERMES_KANBAN_WORKSPACE"),
+    ):
+        if raw:
+            try:
+                roots.append(Path(raw).expanduser().resolve())
+            except Exception:
+                pass
+
+    try:
+        import tempfile
+
+        for raw in (tempfile.gettempdir(), "/tmp", "/private/var/tmp", "/var/tmp"):
+            roots.append(Path(raw).resolve())
+    except Exception:
+        pass
+
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly()
+        configured_cwd = cfg_get(cfg, "terminal", "cwd", default=None)
+        if configured_cwd:
+            roots.append(Path(str(configured_cwd)).expanduser().resolve())
+        for raw in cfg_get(cfg, "file_tools", "allowed_write_roots", default=[]) or []:
+            roots.append(Path(str(raw)).expanduser().resolve())
+    except Exception:
+        pass
+
+    # Preserve order while removing duplicates.
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        key = str(root)
+        if key not in seen:
+            seen.add(key)
+            deduped.append(root)
+    return deduped
+
+
+def _check_kanban_profile_terminal_write_guard(
+    command: str,
+    *,
+    command_cwd: str | None = None,
+) -> dict | None:
+    """Block obvious terminal/code write bypasses of named-profile file guards.
+
+    File tools already refuse named-profile kanban workers that try to write
+    outside their profile, temp dir, task workspace, cwd, or configured
+    ``file_tools.allowed_write_roots``. Terminal and execute_code can otherwise
+    perform the same write through Python/tee/redirection, making the file-tool
+    guard policy inconsistent. This check is intentionally narrow: it only
+    fires for kanban workers, only named profiles, and only commands/scripts
+    that contain a recognizable write primitive plus an absolute path outside
+    the allowed roots.
+    """
+    if not os.getenv("HERMES_KANBAN_TASK"):
+        return None
+
+    home_raw = os.getenv("HERMES_HOME")
+    if not home_raw:
+        return None
+    try:
+        profile_home = Path(home_raw).expanduser().resolve()
+    except Exception:
+        return None
+    if profile_home.parent.name != "profiles":
+        return None
+
+    if not _KANBAN_PROFILE_WRITE_INTENT_RE.search(command or ""):
+        return None
+
+    roots = _kanban_profile_write_roots(command_cwd=command_cwd)
+    forbidden: list[str] = []
+    for raw_path in _POSIX_ABSOLUTE_PATH_RE.findall(command or ""):
+        try:
+            resolved = Path(raw_path).expanduser().resolve()
+        except Exception:
+            continue
+        if not _path_under_any(resolved, roots):
+            forbidden.append(str(resolved))
+
+    if not forbidden:
+        return None
+
+    first = forbidden[0]
+    extra = f" (+{len(forbidden) - 1} more)" if len(forbidden) > 1 else ""
+    description = f"kanban profile write guard: terminal/code write outside allowed roots ({first}{extra})"
+    return {
+        "approved": False,
+        "hardline": True,
+        "pattern_key": "kanban_profile_write_guard",
+        "description": description,
+        "message": (
+            f"BLOCKED (hardline): {description}. "
+            "Named-profile kanban workers must write only inside their profile, "
+            "task workspace, temp dirs, cwd, or configured "
+            "file_tools.allowed_write_roots. Do NOT bypass this with terminal "
+            "or execute_code; route shared-tool/system changes to the system "
+            "development lane or ask an operator to extend allowed_write_roots."
         ),
     }
 
@@ -2211,7 +2353,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             command_cwd: str | None = None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -2247,6 +2390,17 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("Sudo stdin guard block: %s (command: %s)",
                        sudo_guess_desc, command[:200])
         return _sudo_stdin_block_result(sudo_guess_desc)
+
+    profile_write_block = _check_kanban_profile_terminal_write_guard(
+        command, command_cwd=command_cwd
+    )
+    if profile_write_block:
+        logger.warning(
+            "Kanban profile terminal write guard block: %s (command: %s)",
+            profile_write_block.get("description"),
+            command[:200],
+        )
+        return profile_write_block
 
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
@@ -2642,6 +2796,14 @@ def check_execute_code_guard(code: str, env_type: str,
         return {"approved": True, "message": None}
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
+
+    profile_write_block = _check_kanban_profile_terminal_write_guard(code)
+    if profile_write_block:
+        logger.warning(
+            "Kanban profile execute_code write guard block: %s",
+            profile_write_block.get("description"),
+        )
+        return profile_write_block
 
     # --yolo or approvals.mode=off: bypass (session- or process-scoped).
     approval_mode = _get_approval_mode()

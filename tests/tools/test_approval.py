@@ -2035,6 +2035,72 @@ class TestEtcPatternsUnaffectedByRefactor:
         assert dangerous is False
 
 
+
+class TestKanbanProfileTerminalWriteGuard:
+    def _profile_home(self, tmp_path, monkeypatch):
+        root = tmp_path / "fake-hermes"
+        profile_home = root / "profiles" / "direct_specialist"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+        workspace = root / "kanban" / "boards" / "marketing" / "workspaces" / "t_worker"
+        workspace.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+        return root, profile_home, workspace
+
+    def test_python_write_text_outside_allowed_roots_is_blocked(self, tmp_path, monkeypatch):
+        from tools import approval as mod
+
+        _root, _profile_home, _workspace = self._profile_home(tmp_path, monkeypatch)
+        target = Path("/Users/agent/tools/ohmy-seo/packages/yandex-seo/src/lib/yaml-schema.ts")
+        cmd = (
+            "python3 - <<'PY'\n"
+            "from pathlib import Path\n"
+            f"p=Path({str(target)!r})\n"
+            "p.write_text('mutated')\n"
+            "PY"
+        )
+
+        result = mod.check_all_command_guards(cmd, "local")
+
+        assert result["approved"] is False
+        assert result.get("hardline") is True
+        assert "kanban profile write guard" in result["message"]
+        assert str(target) in result["message"]
+
+    def test_python_write_text_inside_kanban_workspace_is_allowed(self, tmp_path, monkeypatch):
+        from tools import approval as mod
+
+        _root, _profile_home, workspace = self._profile_home(tmp_path, monkeypatch)
+        target = workspace / "artifact.txt"
+        cmd = (
+            "python3 - <<'PY'\n"
+            "from pathlib import Path\n"
+            f"Path({str(target)!r}).write_text('ok')\n"
+            "PY"
+        )
+
+        result = mod.check_all_command_guards(cmd, "local")
+
+        assert result["approved"] is True
+
+    def test_python_read_only_external_path_is_allowed(self, tmp_path, monkeypatch):
+        from tools import approval as mod
+
+        _root, _profile_home, _workspace = self._profile_home(tmp_path, monkeypatch)
+        target = tmp_path / "tools" / "ohmy-seo" / "README.md"
+        cmd = (
+            "python3 - <<'PY'\n"
+            "from pathlib import Path\n"
+            f"print(Path({str(target)!r}).read_text())\n"
+            "PY"
+        )
+
+        result = mod.check_all_command_guards(cmd, "local")
+
+        assert result["approved"] is True
+
+
 # =========================================================================
 # Gateway approval timeout = deny, NOT consent (#24912)
 #

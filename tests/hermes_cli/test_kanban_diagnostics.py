@@ -100,11 +100,11 @@ def test_hallucinated_cards_clears_on_subsequent_completion():
     assert diags == []
 
 
-def test_prose_phantom_refs_fires_after_clean_completion():
+def test_prose_phantom_refs_fires_for_unfinished_tasks():
     # Prose scan emits its event AFTER the completed event in the DB
     # path, but a subsequent clean completion clears it. Phantom id
     # must be valid hex — the scanner regex is ``t_[a-f0-9]{8,}``.
-    task = _task(status="done")
+    task = _task(status="blocked")
     events = [
         _event("completed", ts=100, summary="referenced t_bad", result_len=0),
         _event("suspected_hallucinated_references", ts=101,
@@ -115,6 +115,17 @@ def test_prose_phantom_refs_fires_after_clean_completion():
     assert diags[0].kind == "prose_phantom_refs"
     assert diags[0].severity == "warning"
     assert diags[0].data["phantom_refs"] == ["t_deadbeef99"]
+
+
+def test_prose_phantom_refs_silent_after_task_done():
+    task = _task(status="done")
+    events = [
+        _event("completed", ts=100, summary="referenced t_deadbeef99", result_len=0),
+        _event("suspected_hallucinated_references", ts=101,
+               phantom_refs=["t_deadbeef99"], source="completion_summary"),
+    ]
+
+    assert kd.compute_task_diagnostics(task, events, []) == []
 
 
 def test_prose_phantom_refs_clears_on_later_clean_edit():
@@ -174,6 +185,45 @@ def test_repeated_failures_escalates_to_critical():
     task = _task(consecutive_failures=6, last_failure_error="boom")
     diags = kd.compute_task_diagnostics(task, [], [])
     assert diags[0].severity == "critical"
+
+
+def test_repeated_failures_suppresses_external_provider_blockers():
+    """Quota/auth/rate walls are external blockers, not Board Health fix work.
+
+    Board Health must not create fix-tasks for tasks whose last failure is an
+    exhausted provider account; those fix tasks would only spawn into the same
+    quota wall and cascade.
+    """
+    task = _task(
+        status="blocked",
+        consecutive_failures=4,
+        last_failure_error="API Error: 400 You're out of extra usage. Add more at claude.ai/settings/usage",
+    )
+    runs = [_run(outcome="crashed", run_id=1, error=task["last_failure_error"])]
+
+    diags = kd.compute_task_diagnostics(task, [], runs)
+
+    assert [d.kind for d in diags if d.kind == "repeated_failures"] == []
+    assert [d.kind for d in diags if d.kind == "repeated_crashes"] == []
+
+
+def test_runtime_failure_diagnostics_silent_after_task_done():
+    """Historical crash counters must not keep dashboard alerts alive after completion."""
+    task = _task(
+        status="done",
+        consecutive_failures=2,
+        last_failure_error="pid 73322 not alive",
+    )
+    runs = [
+        _run(outcome="crashed", run_id=1, error="pid 72926 not alive"),
+        _run(outcome="crashed", run_id=2, error="pid 73322 not alive"),
+        _run(outcome="blocked", run_id=3, error="review-required"),
+    ]
+
+    diags = kd.compute_task_diagnostics(task, [], runs)
+
+    assert [d.kind for d in diags if d.kind == "repeated_failures"] == []
+    assert [d.kind for d in diags if d.kind == "repeated_crashes"] == []
 
 
 def test_repeated_failures_below_threshold_silent():
@@ -305,21 +355,21 @@ def test_stuck_in_blocked_silent_when_not_blocked():
 
 
 def test_repeated_crashes_surfaces_actual_error_in_title():
-    """The title should lead with the actual error text so operators
-    see WHAT broke (e.g. rate-limit, auth, OOM) without opening logs.
+    """The title should lead with the actual worker error text so operators
+    see WHAT broke (e.g. OOM/import error) without opening logs.
     """
     task = _task(status="ready", assignee="x")
     runs = [
-        _run(outcome="crashed", run_id=1, error="openai: 429 Too Many Requests"),
-        _run(outcome="crashed", run_id=2, error="openai: 429 Too Many Requests"),
+        _run(outcome="crashed", run_id=1, error="worker OOM: killed by signal 9"),
+        _run(outcome="crashed", run_id=2, error="worker OOM: killed by signal 9"),
     ]
     diags = kd.compute_task_diagnostics(task, [], runs)
     assert len(diags) == 1
     d = diags[0]
-    assert "429" in d.title
-    assert "Too Many Requests" in d.title
+    assert "OOM" in d.title
+    assert "signal 9" in d.title
     # Full error in detail.
-    assert "429 Too Many Requests" in d.detail
+    assert "worker OOM: killed by signal 9" in d.detail
 
 
 def test_repeated_crashes_no_error_fallback_title():
@@ -334,12 +384,12 @@ def test_repeated_crashes_no_error_fallback_title():
 
 def test_repeated_failures_surfaces_actual_error_in_title():
     task = _task(consecutive_failures=5,
-                 last_failure_error="insufficient_quota: billing limit reached")
+                 last_failure_error="worker import failed: No module named 'project_sdk'")
     diags = kd.compute_task_diagnostics(task, [], [])
     assert len(diags) == 1
     d = diags[0]
-    assert "insufficient_quota" in d.title or "billing limit" in d.title
-    assert "insufficient_quota" in d.detail
+    assert "worker import failed" in d.title or "project_sdk" in d.title
+    assert "project_sdk" in d.detail
 
 
 def test_repeated_crashes_truncates_huge_tracebacks():
@@ -367,9 +417,8 @@ def test_repeated_crashes_truncates_huge_tracebacks():
 
 
 def test_diagnostics_sorted_critical_first():
-    """A task with both a critical (many spawn failures) and a warning
-    (prose phantoms) diagnostic should list the critical one first."""
-    task = _task(status="done", consecutive_failures=10,
+    """Critical runtime diagnostics sort before warnings for active tasks."""
+    task = _task(status="blocked", consecutive_failures=10,
                  last_failure_error="nope")
     events = [
         _event("completed", ts=100, summary="referenced t_missing"),

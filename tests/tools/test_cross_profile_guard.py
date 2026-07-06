@@ -102,6 +102,75 @@ class TestWriteFileCrossProfileGuard:
         assert not result.get("error")
         assert target.exists()
 
+    def test_cross_profile_true_does_not_bypass_general_outside_root(self, fake_hermes):
+        from tools.file_tools import write_file_tool
+
+        target = Path("/" + "Users/agent/tools/ohmy-seo/packages/yandex-seo/src/tool.ts")
+        result_json = write_file_tool(str(target), "mutated", cross_profile=True)
+        result = json.loads(result_json)
+
+        assert result.get("error")
+        assert "outside profile home" in result["error"]
+
+    def test_kanban_workspace_write_allowed_after_chdir(
+        self, fake_hermes, tmp_path, monkeypatch
+    ):
+        """A routed profile may write its own kanban workspace even after
+        terminal/file-tool cwd moved elsewhere for context gathering.
+        """
+        from tools.file_tools import write_file_tool
+
+        workspace = (
+            fake_hermes["root"]
+            / "kanban"
+            / "boards"
+            / "departments"
+            / "workspaces"
+            / "t_worker"
+        )
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+
+        other_cwd = tmp_path / "client-context"
+        other_cwd.mkdir()
+        monkeypatch.chdir(other_cwd)
+
+        target = workspace / "artifact.txt"
+        result_json = write_file_tool(str(target), "workspace artifact")
+        result = json.loads(result_json)
+
+        assert not result.get("error"), result
+        assert target.read_text() == "workspace artifact"
+
+    def test_random_default_root_write_still_blocked(
+        self, fake_hermes, tmp_path, monkeypatch
+    ):
+        """The kanban-workspace exception must not reopen arbitrary writes
+        inside the default Hermes root from a named profile.
+        """
+        from tools.file_tools import write_file_tool
+
+        workspace = (
+            fake_hermes["root"]
+            / "kanban"
+            / "boards"
+            / "departments"
+            / "workspaces"
+            / "t_worker"
+        )
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+
+        other_cwd = tmp_path / "client-context"
+        other_cwd.mkdir()
+        monkeypatch.chdir(other_cwd)
+
+        target = fake_hermes["root"] / "some-default-root-state" / "file.txt"
+        result_json = write_file_tool(str(target), "should not write")
+        result = json.loads(result_json)
+
+        assert result.get("error")
+        assert "outside profile home" in result["error"]
+        assert not target.exists()
+
 
 # ---------------------------------------------------------------------------
 # patch
@@ -157,6 +226,22 @@ class TestPatchCrossProfileGuard:
         assert result.get("error"), f"V4A cross-profile must block: {result}"
         assert "cross-profile" in result["error"].lower()
         assert target.read_text() == original
+
+    def test_cross_profile_true_patch_does_not_bypass_general_outside_root(self, fake_hermes):
+        from tools.file_tools import patch_tool
+
+        target = Path("/" + "Users/agent/tools/ohmy-seo/packages/yandex-seo/src/tool.ts")
+        result_json = patch_tool(
+            mode="replace",
+            path=str(target),
+            old_string="before",
+            new_string="after",
+            cross_profile=True,
+        )
+        result = json.loads(result_json)
+
+        assert result.get("error")
+        assert "outside profile home" in result["error"]
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,13 @@
+{
+  "name": "promo",
+  "label": "МАЯК",
+  "description": "Личный promo-pipeline Кирилла Вечкасова — источники мониторинга, сессии интервьюера, weekly plans, draft ideas",
+  "icon": "🪩",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/promo",
+    "position": "after:kanban"
+  },
+  "entry": "index.js",
+  "api": "plugin_api.py"
+}
