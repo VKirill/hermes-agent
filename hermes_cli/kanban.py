@@ -395,6 +395,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "mode, 'skills' = inline speed mode. Omit to "
                                "use board.json / kanban.use_subagents config "
                                "(default subagents).")
+    p_create.add_argument("--model", default=None, dest="model_override",
+                          metavar="MODEL",
+                          help="Per-task model override: the dispatcher "
+                               "passes -m <model> to the worker instead of "
+                               "the profile default. Use for independent-"
+                               "model gates (e.g. review tasks on sonnet).")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- workflow human gate actions (AIF stage machine) ---
@@ -1415,6 +1421,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
                 None if getattr(args, "delegation", None) is None
                 else getattr(args, "delegation") == "subagents"
             ),
+            model_override=getattr(args, "model_override", None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
