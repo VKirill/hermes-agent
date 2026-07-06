@@ -413,6 +413,36 @@ def test_human_gates_mode_pauses_and_gate_action_resumes(kanban_home: Path) -> N
         )
 
 
+def test_respawn_guard_exempts_workflow_stage_transitions(kanban_home: Path) -> None:
+    """A completed stage run must NOT defer the next stage's spawn.
+
+    check_respawn_guard's recent_success rule exists for classic cards
+    (completed run + ready = a human re-readied something — wait). On a
+    workflow card a completed run IS the stage handoff; guarding it
+    stalled every stage transition for the whole guard window.
+    """
+    with kb.connect_closing() as conn:
+        tid = kb.create_task(conn, title="ship it", workflow="aif")
+        # simulate the planner run: claim → complete (stage advances)
+        assert kb.claim_task(conn, tid, claimer="aif_planner") is not None
+        assert kb.complete_task(conn, tid, result="plan done")
+        row = _step(conn, tid)
+        assert (row["status"], row["current_step_key"]) == ("ready", "implementing")
+        # the freshly-completed run must not guard the implementing spawn
+        assert kb.check_respawn_guard(conn, tid) is None
+
+        # classic card: same sequence DOES guard (regression check)
+        classic = kb.create_task(conn, title="classic", assignee="worker")
+        assert kb.claim_task(conn, classic, claimer="worker") is not None
+        assert kb.complete_task(conn, classic, result="done")
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='ready', claim_lock=NULL, "
+                "claim_expires=NULL WHERE id=?", (classic,),
+            )
+        assert kb.check_respawn_guard(conn, classic) == "recent_success"
+
+
 def test_non_workflow_tasks_complete_normally(kanban_home: Path) -> None:
     with kb.connect_closing() as conn:
         tid = kb.create_task(conn, title="plain card", assignee="worker")
