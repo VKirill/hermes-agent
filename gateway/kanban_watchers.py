@@ -428,6 +428,11 @@ class GatewayKanbanWatchersMixin:
                         metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
+                            # System notification: there is no inbound message
+                            # to anchor a reply to. Telegram DM-topic lanes
+                            # fail loud on anchor-less sends unless the caller
+                            # explicitly accepts thread-id-only routing.
+                            metadata["telegram_dm_topic_anchorless_ok"] = True
                         sub_key = (
                             sub["task_id"], sub["platform"],
                             sub["chat_id"], sub.get("thread_id") or "",

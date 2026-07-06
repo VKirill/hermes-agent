@@ -3556,8 +3556,20 @@ class TelegramAdapter(BasePlatformAdapter):
                 # didn't ask for the anchor to be dropped.
                 dm_topic_reply_to_off = (
                     private_dm_topic_send
-                    and self._reply_to_mode == "off"
-                    and bool(metadata and metadata.get("telegram_dm_topic_reply_fallback"))
+                    and (
+                        (
+                            self._reply_to_mode == "off"
+                            and bool(metadata and metadata.get("telegram_dm_topic_reply_fallback"))
+                        )
+                        # Anchor-less system senders (kanban notifier and other
+                        # non-session pings) have no inbound message to anchor
+                        # to BY DEFINITION. They opt in explicitly and get the
+                        # verified message_thread_id routing (see
+                        # _thread_kwargs_for_send: local bot-api 10.1 routes
+                        # private DM lanes by message_thread_id); the fail-loud
+                        # contract stays intact for every session caller.
+                        or bool(metadata and metadata.get("telegram_dm_topic_anchorless_ok"))
+                    )
                 )
                 reply_to_source = reply_to or (
                     str(metadata_reply_to) if private_dm_topic_send and metadata_reply_to is not None else None
