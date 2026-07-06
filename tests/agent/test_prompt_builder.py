@@ -29,6 +29,7 @@ from agent.prompt_builder import (
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+    KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     PLATFORM_HINTS,
@@ -53,6 +54,13 @@ class TestGuidanceConstants:
     def test_session_search_guidance_is_simple_cross_session_recall(self):
         assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
         assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+
+    def test_kanban_guidance_documents_gate_result_contract(self):
+        assert "gate_result" in KANBAN_GUIDANCE
+        assert "schema_version" in KANBAN_GUIDANCE
+        assert '"gate": "verify"' in KANBAN_GUIDANCE
+        assert "spec/verify/review/security" in KANBAN_GUIDANCE
+        assert "kanban_complete" in KANBAN_GUIDANCE
 
 
 # =========================================================================
