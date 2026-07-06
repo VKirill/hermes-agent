@@ -292,6 +292,95 @@ def test_decompose_unknown_assignee_falls_back_to_default(kanban_home):
     assert child.assignee == "fallback"
 
 
+def test_decompose_filters_deprecated_profiles_from_roster_and_routing(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="replace legacy development profiles", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "test",
+        "tasks": [
+            {"title": "do work", "body": "", "assignee": "systemdev", "parents": []},
+        ],
+    })
+
+    patches = _patch_list_profiles(["dev_factory", "fallback", "backendgpu", "systemdev"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload) as aux_patch, _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={
+                "kanban": {
+                    "orchestrator_profile": "dev_factory",
+                    "default_assignee": "dev_factory",
+                }
+            },
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids and len(outcome.child_ids) == 1
+
+    user_msg = aux_patch.return_value[0].chat.completions.create.call_args.kwargs["messages"][1]["content"]
+    assert "dev_factory" not in user_msg
+    assert "backendgpu" not in user_msg
+    assert "systemdev" not in user_msg
+    assert "fallback" in user_msg
+
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert root is not None
+    assert child is not None
+    assert root.assignee == "fallback"
+    assert child.assignee == "fallback"
+
+
+def test_decompose_filters_configured_deprecated_profiles(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="avoid retired profile", triage=True)
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "test",
+        "tasks": [
+            {"title": "do work", "body": "", "assignee": "old_dev", "parents": []},
+        ],
+    })
+
+    patches = _patch_list_profiles(["old_dev", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload) as aux_patch, _patch_extra_body(), patch(
+            "hermes_cli.kanban_decompose._load_config",
+            return_value={
+                "kanban": {
+                    "default_assignee": "fallback",
+                    "deprecated_assignees": ["old_dev"],
+                }
+            },
+        ):
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids and len(outcome.child_ids) == 1
+    user_msg = aux_patch.return_value[0].chat.completions.create.call_args.kwargs["messages"][1]["content"]
+    assert "old_dev" not in user_msg
+    assert "fallback" in user_msg
+    with kb.connect() as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert child is not None
+    assert child.assignee == "fallback"
+
+
 def test_decompose_handles_malformed_llm_json(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="x", triage=True)

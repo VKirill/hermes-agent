@@ -2390,7 +2390,7 @@ def create_task(
     body: Optional[str] = None,
     assignee: Optional[str] = None,
     created_by: Optional[str] = None,
-    workspace_kind: str = "scratch",
+    workspace_kind: Optional[str] = None,
     workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None,
     tenant: Optional[str] = None,
@@ -2438,6 +2438,11 @@ def create_task(
         raise ValueError(
             f"initial_status must be one of {sorted(VALID_INITIAL_STATUSES)}"
         )
+    workspace_kind_explicit = workspace_kind is not None
+    if workspace_kind is None:
+        workspace_kind = "scratch"
+    else:
+        workspace_kind = str(workspace_kind)
     if workspace_kind not in VALID_WORKSPACE_KINDS:
         raise ValueError(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
@@ -2478,7 +2483,11 @@ def create_task(
             # Canonicalise (a slug may have been passed) and anchor the
             # worktree under the project's primary repo.
             project_id = project_obj.id
-            if workspace_kind == "scratch" and project_obj.primary_path:
+            if (
+                not workspace_kind_explicit
+                and workspace_kind == "scratch"
+                and project_obj.primary_path
+            ):
                 workspace_kind = "worktree"
             if (
                 workspace_kind == "worktree"
@@ -5664,6 +5673,176 @@ _RESPAWN_BLOCKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Provider/runtime errors that are external to the task.  These must not be
+# counted as worker crashes: retrying the same worker/profile usually recreates
+# the same quota/auth wall and can make Board Health spawn fix-task cascades for
+# a problem no code change can solve.  Keep the patterns intentionally broad
+# enough to catch provider messages in worker logs (including failures that
+# happen during agent initialization before ``run_conversation`` can return a
+# structured ``failure_reason``), but narrow enough to avoid classifying normal
+# task exceptions as infrastructure blockers.
+_EXTERNAL_BLOCKER_PATTERNS: tuple[tuple[str, tuple[str, ...], bool], ...] = (
+    (
+        "model_quota_exhausted",
+        (
+            "out of extra usage",
+            "quota exhausted",
+            "quota_exhausted",
+            "usage limit",
+            "weekly usage limit",
+            "credits exhausted",
+            "insufficient credits",
+            "insufficient_quota",
+            "credit balance",
+            "billing hard limit",
+            "exceeded your current quota",
+        ),
+        True,
+    ),
+    (
+        "rate_limit",
+        (
+            "rate limit",
+            "rate_limit",
+            "rate-limited",
+            "too many requests",
+            "429",
+            "retry after",
+            "try again in",
+            "throttled",
+        ),
+        True,
+    ),
+    (
+        "provider_auth_expired",
+        (
+            "auth expired",
+            "authentication expired",
+            "unauthorized",
+            "invalid api key",
+            "invalid_api_key",
+            "invalid auth",
+            "invalid token",
+            "expired token",
+            "re-authenticate",
+            "401",
+            "403",
+        ),
+        False,
+    ),
+    (
+        "provider_unavailable",
+        (
+            "provider unavailable",
+            "temporarily unavailable",
+            "service unavailable",
+            "upstream unavailable",
+            "temporarily overloaded",
+            "overloaded",
+            "529",
+            "503",
+        ),
+        True,
+    ),
+    (
+        "missing_required_model_capability",
+        (
+            "missing required model capability",
+            "model capability",
+            "does not support tools",
+            "does not support tool",
+            "does not support vision",
+            "unsupported modality",
+        ),
+        False,
+    ),
+    (
+        "cli_transport_unavailable",
+        (
+            "cli transport unavailable",
+            "acp transport unavailable",
+            "external process provider",
+            "executable not found",
+            "command not found",
+        ),
+        True,
+    ),
+)
+
+_CLI_TRANSPORT_CONNECTION_REFUSED_RE = re.compile(
+    r"\b("
+    r"cli|acp|mcp|stdio|transport|external[\s_-]+process|"
+    r"provider|claude[\s_-]*code|codex|opencode|qwen|gemini|"
+    r"openrouter|anthropic|openai|nous|model[\s_-]*provider"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def classify_external_runtime_blocker(text: str) -> Optional[dict[str, Any]]:
+    """Classify quota/rate/auth/provider errors as external blockers.
+
+    Returns a compact machine-readable payload suitable for task events and
+    block summaries, or ``None`` when ``text`` looks like an ordinary task or
+    worker failure.  Exposed (no leading underscore) so CLI startup and tests can
+    share the same taxonomy as the dispatcher crash detector.
+    """
+    if not text:
+        return None
+    lower = str(text).lower()
+    for reason, needles, safe_to_retry in _EXTERNAL_BLOCKER_PATTERNS:
+        if any(needle in lower for needle in needles):
+            return {
+                "reason": reason,
+                "safe_to_retry": bool(safe_to_retry),
+            }
+
+    # A bare "connection refused" is often an application/test failure (for
+    # example, a local API under test). Treat it as an external blocker only
+    # when the surrounding text names a Hermes/provider/CLI transport context.
+    if "connection refused" in lower and _CLI_TRANSPORT_CONNECTION_REFUSED_RE.search(lower):
+        return {
+            "reason": "cli_transport_unavailable",
+            "safe_to_retry": True,
+        }
+    return None
+
+
+def _external_blocker_summary(payload: dict[str, Any], evidence: str) -> str:
+    """Human + machine readable block reason for provider/runtime blockers."""
+    reason = str(payload.get("reason") or "external_runtime_blocker")
+    safe = bool(payload.get("safe_to_retry", True))
+    first_line = (evidence or "").strip().splitlines()
+    snippet = first_line[0][:300] if first_line else reason
+    return (
+        "blocked_external: "
+        + json.dumps(
+            {
+                "reason": reason,
+                "safe_to_retry": safe,
+                "evidence": snippet,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+
+
+def _worker_log_tail(task_id: str, *, board: Optional[str] = None, limit: int = 12_000) -> str:
+    """Best-effort tail of a dispatcher's per-task worker log."""
+    try:
+        log_path = worker_logs_dir(board=board) / f"{task_id}.log"
+        with open(log_path, "rb") as fh:
+            try:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - int(limit)))
+            except OSError:
+                pass
+            return fh.read(int(limit)).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
@@ -6343,7 +6522,11 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Appends a ``crashed`` event and drops the task back to ``ready``.
@@ -6362,17 +6545,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     on the first occurrence — retrying a worker whose CLI keeps
     returning 0 without a terminal transition just loops forever.
 
-    When the reap registry shows the worker exited with the rate-limit
-    sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
-    provider quota wall, NOT a task failure. Such tasks are released back
-    to ``ready`` WITHOUT counting a failure (so a long quota window can't
-    trip the breaker) and stamped with a quota-blocker error so
-    ``check_respawn_guard`` defers their respawn until the window clears.
-    The ids are returned via the ``_last_rate_limited`` function attribute
-    (the public return stays the crashed-only ``list[str]``).
+    Provider quota/rate/auth failures are external blockers, not crashes.
+    The crash detector classifies both structured EX_TEMPFAIL exits and
+    unstructured worker logs (agent-init failures happen before the CLI can
+    return ``failure_reason``) and blocks the original task with a
+    ``blocked_external`` reason without incrementing the failure counter.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    external_blocked: list[str] = []
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -6380,6 +6561,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # immediately instead of incrementing by 1.
     crash_details: list[tuple[str, int, str, bool, str]] = []
     # (task_id, pid, claimer, protocol_violation, error_text)
+    external_block_details: list[tuple[str, str, dict[str, Any]]] = []
+    # (task_id, block_summary, classifier_payload)
     with write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
@@ -6405,6 +6588,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
             rate_limited_exit = False
+            external_payload: Optional[dict[str, Any]] = None
+            external_evidence = ""
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
@@ -6424,16 +6609,14 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             elif kind == "rate_limited":
                 # Worker bailed because the provider rate-limited / exhausted
                 # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
-                # the task is fine, the account just hit a wall. Release it
-                # back to ``ready`` so the respawn guard defers it until the
-                # quota window clears, and crucially do NOT count a failure
-                # (skip ``_record_task_failure``) so a long quota window can't
-                # trip the circuit breaker and permanently block the card.
+                # the account/provider just hit an external wall. Block the
+                # original task as ``blocked_external`` (via block_task below),
+                # do NOT count a failure, and do NOT requeue into the same
+                # exhausted provider.
                 protocol_violation = False
                 rate_limited_exit = True
                 error_text = (
-                    f"pid {pid} exited rate-limited (quota wall) — "
-                    f"requeued without counting a failure"
+                    f"pid {pid} exited rate-limited (external provider blocker)"
                 )
                 event_kind = "rate_limited"
                 event_payload = {
@@ -6441,6 +6624,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     "claimer": row["claim_lock"],
                     "exit_code": code,
                 }
+                external_payload = {"reason": "rate_limit", "safe_to_retry": True}
+                external_evidence = error_text
             else:
                 protocol_violation = False
                 if kind == "nonzero_exit":
@@ -6454,6 +6639,23 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 if code is not None and kind != "unknown":
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
+
+            if external_payload is None:
+                log_tail = _worker_log_tail(row["id"], board=board)
+                combined_evidence = "\n".join(
+                    part for part in (error_text, log_tail) if part
+                )
+                external_payload = classify_external_runtime_blocker(combined_evidence)
+                if external_payload is not None:
+                    external_evidence = combined_evidence or error_text
+
+            if external_payload is not None:
+                block_summary = _external_blocker_summary(
+                    external_payload,
+                    external_evidence or error_text,
+                )
+                external_block_details.append((row["id"], block_summary, external_payload))
+                continue
 
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -6478,23 +6680,29 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload,
                     run_id=run_id,
                 )
-                if rate_limited_exit:
-                    # Stamp the failure-error column so ``check_respawn_guard``
-                    # recognizes this as a quota blocker and defers the
-                    # respawn until the window clears — WITHOUT touching
-                    # ``consecutive_failures`` (that's the whole point: no
-                    # breaker trip on a throttle).
+                crashed.append(row["id"])
+                crash_details.append(
+                    (row["id"], pid, row["claim_lock"],
+                     protocol_violation, error_text)
+                )
+    for tid, block_summary, payload in external_block_details:
+        kind = "transient" if payload.get("safe_to_retry", True) else "capability"
+        if block_task(conn, tid, reason=block_summary, kind=kind):
+            external_blocked.append(tid)
+            try:
+                with write_txn(conn):
+                    _append_event(
+                        conn,
+                        tid,
+                        "blocked_external",
+                        {**payload, "summary": block_summary},
+                    )
                     conn.execute(
                         "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-                        (error_text[:500], row["id"]),
+                        (block_summary[:500], tid),
                     )
-                    rate_limited.append(row["id"])
-                else:
-                    crashed.append(row["id"])
-                    crash_details.append(
-                        (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
-                    )
+            except Exception:
+                pass
     # Outside the main txn: increment the unified failure counter for
     # each crashed task. If the breaker trips, the task transitions
     # ready → blocked with a ``gave_up`` event on top of the ``crashed``
@@ -6537,6 +6745,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    detect_crashed_workers._last_external_blocked = external_blocked  # type: ignore[attr-defined]
     return crashed
 
 
@@ -7046,7 +7255,7 @@ def _dispatch_once_locked(
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, board=board)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
     # DispatchResult here so telemetry / tests see the trip.
@@ -7063,6 +7272,11 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    _external_blocked = getattr(
+        detect_crashed_workers, "_last_external_blocked", []
+    )
+    if _external_blocked:
+        result.auto_blocked.extend(_external_blocked)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 

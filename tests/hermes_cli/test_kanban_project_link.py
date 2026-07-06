@@ -40,6 +40,24 @@ def test_project_linked_task_gets_deterministic_worktree_and_branch(kanban_conn)
     assert not task.branch_name.startswith("wt/")
 
 
+def test_explicit_scratch_project_link_does_not_become_worktree(kanban_conn):
+    proj = _make_project()
+    assert proj is not None
+    tid = kb.create_task(
+        kanban_conn,
+        title="Research only",
+        project_id=proj.slug,
+        workspace_kind="scratch",
+    )
+    task = kb.get_task(kanban_conn, tid)
+    assert task is not None
+
+    assert task.project_id == proj.id
+    assert task.workspace_kind == "scratch"
+    assert task.workspace_path is None
+    assert task.branch_name is None
+
+
 def test_explicit_branch_overrides_project_default(kanban_conn):
     proj = _make_project()
     tid = kb.create_task(

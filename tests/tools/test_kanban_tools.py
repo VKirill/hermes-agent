@@ -337,6 +337,103 @@ def test_complete_metadata_round_trips_through_show(worker_env):
     assert shown["runs"][-1]["metadata"] == handoff
 
 
+def test_complete_accepts_non_blocking_gate_result(worker_env):
+    """Developer gate verdicts should persist as machine-readable metadata."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    gate_result = {
+        "schema_version": 1,
+        "gate": "verify",
+        "status": "pass",
+        "blocking": False,
+        "blockers": [],
+        "affected_files": ["tools/kanban_tools.py"],
+        "suggested_next": {
+            "action": None,
+            "reason": "No blocking findings.",
+        },
+    }
+
+    out = kt._handle_complete({
+        "summary": "verified gate passed",
+        "gate_result": gate_result,
+        "metadata": {"tests_run": ["pytest tests/tools/test_kanban_tools.py -q"]},
+    })
+    assert json.loads(out)["ok"] is True
+
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        assert run.metadata is not None
+        assert run.metadata["gate_result"] == gate_result
+        assert run.metadata["tests_run"] == ["pytest tests/tools/test_kanban_tools.py -q"]
+    finally:
+        conn.close()
+
+
+def test_complete_rejects_blocking_gate_result_without_state_change(worker_env):
+    """A failing review/security gate must not be marked done."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    out = kt._handle_complete({
+        "summary": "review found a blocker",
+        "metadata": {
+            "gate_result": {
+                "schema_version": 1,
+                "gate": "review",
+                "status": "fail",
+                "blocking": True,
+                "blockers": [{
+                    "id": "review-001",
+                    "severity": "error",
+                    "file": "agent/prompt_builder.py",
+                    "summary": "Completion would fake-done a blocking review.",
+                }],
+                "affected_files": ["agent/prompt_builder.py"],
+                "suggested_next": {
+                    "action": "request_changes",
+                    "reason": "Fix the review blocker before completion.",
+                },
+            }
+        },
+    })
+    err = json.loads(out).get("error", "")
+    assert "gate_result is blocking" in err
+    assert "kanban_block" in err
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, worker_env)
+        assert task is not None
+        run = kb.latest_run(conn, worker_env)
+        assert run is not None
+        assert task.status == "running"
+        assert run.outcome is None
+    finally:
+        conn.close()
+
+
+def test_complete_rejects_malformed_gate_result(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_complete({
+        "summary": "bad gate shape",
+        "gate_result": {
+            "schema_version": 1,
+            "gate": "approval",  # not a developer gate
+            "status": "pass",
+            "blocking": False,
+            "blockers": [],
+            "affected_files": [],
+            "suggested_next": {"action": None, "reason": "No findings."},
+        },
+    })
+    assert "gate_result invalid" in json.loads(out).get("error", "")
+
+
 def test_complete_stamps_worker_session_id_from_env(monkeypatch, worker_env):
     from tools import kanban_tools as kt
 
@@ -1034,6 +1131,36 @@ def test_create_explicit_workspace_beats_inheritance(monkeypatch, worker_env):
     try:
         child = kb.get_task(conn, d["task_id"])
         assert child.workspace_kind == "scratch"
+    finally:
+        conn.close()
+
+
+def test_create_explicit_scratch_beats_project_routing(worker_env):
+    """Explicit scratch stays scratch even when a project slug resolves."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+
+    with pdb.connect_closing() as pc:
+        pid = pdb.create_project(pc, name="Project App", folders=["/tmp/project-app"])
+        project = pdb.get_project(pc, pid)
+    assert project is not None
+
+    d = json.loads(kt._handle_create({
+        "title": "scratch project child",
+        "assignee": "peer",
+        "project": project.slug,
+        "workspace_kind": "scratch",
+    }))
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child is not None
+        assert child.project_id == project.id
+        assert child.workspace_kind == "scratch"
+        assert child.workspace_path is None
+        assert child.branch_name is None
     finally:
         conn.close()
 
