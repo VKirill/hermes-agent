@@ -2553,6 +2553,7 @@ def create_task(
     workflow_step: Optional[str] = None,
     auto_mode: Optional[bool] = None,
     use_subagents: Optional[bool] = None,
+    model_override: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2821,8 +2822,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, goal_mode, goal_max_turns, session_id,
                         workflow_template_id, current_step_key, auto_mode,
-                        use_subagents
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        use_subagents, model_override
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2851,6 +2852,8 @@ def create_task(
                          else (1 if auto_mode else 0)),
                         (None if use_subagents is None
                          else (1 if use_subagents else 0)),
+                        (str(model_override).strip() or None)
+                        if model_override else None,
                     ),
                 )
                 for pid in parents:
