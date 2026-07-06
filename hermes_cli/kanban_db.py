@@ -674,11 +674,18 @@ def write_board_metadata(
     color: Optional[str] = None,
     archived: Optional[bool] = None,
     default_workdir: Optional[str] = None,
+    orchestrator_profile: Optional[str] = None,
+    default_assignee: Optional[str] = None,
 ) -> dict:
     """Create / update ``board.json`` for ``board``.
 
     Preserves any existing fields not mentioned in the call. Sets
     ``created_at`` on first write. Returns the resulting metadata dict.
+
+    ``orchestrator_profile`` / ``default_assignee`` are per-board overrides
+    consumed by the decomposer (see ``kanban_decompose``): a non-empty value
+    pins that board's orchestrator/default; an empty string clears the
+    override so resolution falls back to the global ``kanban.*`` config.
     """
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta = read_board_metadata(slug)
@@ -697,6 +704,16 @@ def write_board_metadata(
         meta["archived"] = bool(archived)
     if default_workdir is not None:
         meta["default_workdir"] = str(default_workdir) if default_workdir else None
+    for _key, _val in (
+        ("orchestrator_profile", orchestrator_profile),
+        ("default_assignee", default_assignee),
+    ):
+        if _val is not None:
+            _clean = str(_val).strip()
+            if _clean:
+                meta[_key] = _clean
+            else:
+                meta.pop(_key, None)  # empty clears the per-board override
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)

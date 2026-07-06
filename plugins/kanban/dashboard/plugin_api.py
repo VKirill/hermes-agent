@@ -2263,19 +2263,43 @@ class OrchestrationSettingsBody(BaseModel):
 
 
 @router.get("/orchestration")
-def get_orchestration_settings():
-    """Return the current kanban orchestration knobs from config.yaml
-    plus the resolved effective values (filling in fallbacks)."""
+def get_orchestration_settings(board: Optional[str] = Query(None)):
+    """Return the kanban orchestration knobs plus resolved effective values.
+
+    When ``board`` is given and its ``board.json`` pins an
+    ``orchestrator_profile`` / ``default_assignee``, that per-board override is
+    reported and drives ``resolved_*``. Otherwise the global ``kanban.*`` config
+    is used. Resolution mirrors the decomposer: per-board board.json -> global
+    config -> active default profile. ``*_source`` says where each value came
+    from so the UI can label it.
+    """
+    board = _resolve_board(board)
     try:
         from hermes_cli.config import load_config
         cfg = load_config() or {}
     except Exception:
         cfg = {}
     kanban_cfg = (cfg.get("kanban") or {}) if isinstance(cfg, dict) else {}
-    explicit_orch = (kanban_cfg.get("orchestrator_profile") or "").strip()
-    explicit_default = (kanban_cfg.get("default_assignee") or "").strip()
+    global_orch = (kanban_cfg.get("orchestrator_profile") or "").strip()
+    global_default = (kanban_cfg.get("default_assignee") or "").strip()
     auto_decompose = bool(kanban_cfg.get("auto_decompose", True))
     auto_promote_children = bool(kanban_cfg.get("auto_promote_children", True))
+
+    # Per-board override from board.json (if a board is scoped).
+    board_orch = ""
+    board_default = ""
+    if board:
+        try:
+            meta = kanban_db.read_board_metadata(board)
+            board_orch = (meta.get("orchestrator_profile") or "").strip()
+            board_default = (meta.get("default_assignee") or "").strip()
+        except Exception:
+            pass
+
+    explicit_orch = board_orch or global_orch
+    explicit_default = board_default or global_default
+    orch_source = "board" if board_orch else ("global" if global_orch else "fallback")
+    default_source = "board" if board_default else ("global" if global_default else "fallback")
 
     # Resolve fallbacks the same way the decomposer does.
     resolved_orch = explicit_orch
@@ -2295,8 +2319,13 @@ def get_orchestration_settings():
             resolved_default = active_default
 
     return {
+        "board": board,
         "orchestrator_profile": explicit_orch,
         "default_assignee": explicit_default,
+        "orchestrator_source": orch_source,
+        "default_assignee_source": default_source,
+        "global_orchestrator_profile": global_orch,
+        "global_default_assignee": global_default,
         "auto_decompose": auto_decompose,
         "auto_promote_children": auto_promote_children,
         "resolved_orchestrator_profile": resolved_orch,
@@ -2306,33 +2335,26 @@ def get_orchestration_settings():
 
 
 @router.put("/orchestration")
-def set_orchestration_settings(payload: OrchestrationSettingsBody):
-    """Update the kanban orchestration knobs in ~/.hermes/config.yaml.
+def set_orchestration_settings(
+    payload: OrchestrationSettingsBody,
+    board: Optional[str] = Query(None),
+):
+    """Update the kanban orchestration knobs.
 
-    Each field is optional — only fields explicitly passed are
-    written. ``orchestrator_profile`` / ``default_assignee`` accept
-    empty strings to clear the override and fall back to the default
-    profile.
+    When ``board`` is given, ``orchestrator_profile`` / ``default_assignee`` are
+    written as a per-board override in that board's ``board.json`` (an empty
+    string clears the override so it falls back to the global config). Without
+    ``board`` they are written to the global ``~/.hermes/config.yaml``.
+    ``auto_decompose`` / ``auto_promote_children`` are always global.
     """
-    try:
-        from hermes_cli.config import load_config, save_config
-        cfg = load_config() or {}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"failed to load config: {exc}")
+    board = _resolve_board(board)
 
-    kanban_section = cfg.setdefault("kanban", {})
-    if not isinstance(kanban_section, dict):
-        kanban_section = {}
-        cfg["kanban"] = kanban_section
-
-    # Validate any non-empty profile names exist before saving.
     try:
         from hermes_cli import profiles as profiles_mod
     except Exception:
         profiles_mod = None  # type: ignore
 
-    if payload.orchestrator_profile is not None:
-        name = (payload.orchestrator_profile or "").strip()
+    def _validate(name: str):
         if name and profiles_mod is not None:
             try:
                 if not profiles_mod.profile_exists(name):
@@ -2344,36 +2366,59 @@ def set_orchestration_settings(payload: OrchestrationSettingsBody):
                 raise
             except Exception:
                 pass  # fail open if the lookup itself errors
-        kanban_section["orchestrator_profile"] = name
 
+    orch = None
+    dflt = None
+    if payload.orchestrator_profile is not None:
+        orch = (payload.orchestrator_profile or "").strip()
+        _validate(orch)
     if payload.default_assignee is not None:
-        name = (payload.default_assignee or "").strip()
-        if name and profiles_mod is not None:
+        dflt = (payload.default_assignee or "").strip()
+        _validate(dflt)
+
+    # Per-board orchestrator/default -> board.json.
+    if board:
+        kw = {}
+        if orch is not None:
+            kw["orchestrator_profile"] = orch
+        if dflt is not None:
+            kw["default_assignee"] = dflt
+        if kw:
             try:
-                if not profiles_mod.profile_exists(name):
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"profile '{name}' does not exist",
-                    )
-            except HTTPException:
-                raise
-            except Exception:
-                pass
-        kanban_section["default_assignee"] = name
+                kanban_db.write_board_metadata(board, **kw)
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500, detail=f"failed to write board.json: {exc}"
+                )
 
-    if payload.auto_decompose is not None:
-        kanban_section["auto_decompose"] = bool(payload.auto_decompose)
-
-    if payload.auto_promote_children is not None:
-        kanban_section["auto_promote_children"] = bool(payload.auto_promote_children)
-
-    try:
-        save_config(cfg)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"failed to save config: {exc}")
+    # Global config carries auto_decompose / auto_promote_children always, and
+    # orchestrator/default too when no board is scoped.
+    if (not board) or payload.auto_decompose is not None or payload.auto_promote_children is not None:
+        try:
+            from hermes_cli.config import load_config, save_config
+            cfg = load_config() or {}
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"failed to load config: {exc}")
+        kanban_section = cfg.setdefault("kanban", {})
+        if not isinstance(kanban_section, dict):
+            kanban_section = {}
+            cfg["kanban"] = kanban_section
+        if not board:
+            if orch is not None:
+                kanban_section["orchestrator_profile"] = orch
+            if dflt is not None:
+                kanban_section["default_assignee"] = dflt
+        if payload.auto_decompose is not None:
+            kanban_section["auto_decompose"] = bool(payload.auto_decompose)
+        if payload.auto_promote_children is not None:
+            kanban_section["auto_promote_children"] = bool(payload.auto_promote_children)
+        try:
+            save_config(cfg)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"failed to save config: {exc}")
 
     # Echo back the resolved state (callers usually re-render from it).
-    return get_orchestration_settings()
+    return get_orchestration_settings(board)
 
 
 @router.websocket("/events")
