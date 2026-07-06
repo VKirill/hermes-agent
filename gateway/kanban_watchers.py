@@ -433,12 +433,25 @@ class GatewayKanbanWatchersMixin:
                             sub["chat_id"], sub.get("thread_id") or "",
                         )
                         try:
-                            await adapter.send(
+                            _send_result = await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
                             )
-                            logger.debug(
-                                "kanban notifier: delivered %s event for %s to %s/%s on board %s",
-                                kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
+                            # Adapters report soft failures via
+                            # SendResult(success=False) WITHOUT raising —
+                            # treating that as delivered silently lost the
+                            # notification, advanced the cursor, and dropped
+                            # the subscription. Surface it as a real failure.
+                            if _send_result is not None and not getattr(
+                                _send_result, "success", True
+                            ):
+                                raise RuntimeError(
+                                    "adapter soft-failure: "
+                                    f"{getattr(_send_result, 'error', 'unknown')}"
+                                )
+                            logger.info(
+                                "kanban notifier: delivered %s event for %s to %s/%s thread=%s on board %s",
+                                kind, sub["task_id"], platform_str, sub["chat_id"],
+                                sub.get("thread_id") or "-", board_slug,
                             )
                             # After delivering the text notification, surface
                             # any artifact paths the worker referenced in
