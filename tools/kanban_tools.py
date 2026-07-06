@@ -34,6 +34,11 @@ import os
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
+from hermes_cli.kanban_gate_result import (
+    GateResultError,
+    gate_result_blocks_completion,
+    validate_gate_result,
+)
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
@@ -130,6 +135,57 @@ def _stamp_worker_session_metadata(
     stamped = dict(metadata or {})
     stamped["worker_session_id"] = session_id
     return stamped
+
+
+def _merge_and_validate_gate_result(
+    metadata: Optional[dict], gate_result: Any
+) -> tuple[Optional[dict], Optional[str]]:
+    """Merge top-level ``gate_result`` into metadata and validate it.
+
+    Workers may pass the verdict either as ``kanban_complete(gate_result=...)``
+    for discoverability or as ``metadata={"gate_result": ...}`` for backwards
+    compatibility.  A blocking/failing gate is a structured handoff to rework,
+    not a completed task, so completion fails closed and tells the worker to
+    block/comment instead.
+    """
+
+    if metadata is not None and not isinstance(metadata, dict):
+        return metadata, None
+
+    metadata_gate = metadata.get("gate_result") if metadata else None
+    if (
+        gate_result is not None
+        and metadata_gate is not None
+        and gate_result != metadata_gate
+    ):
+        return metadata, (
+            "gate_result invalid: top-level gate_result and "
+            "metadata.gate_result disagree"
+        )
+    raw_gate = gate_result if gate_result is not None else metadata_gate
+    if raw_gate is None:
+        return metadata, None
+
+    try:
+        normalized = validate_gate_result(raw_gate)
+    except GateResultError as exc:
+        return metadata, f"gate_result invalid: {exc}"
+
+    if gate_result_blocks_completion(normalized):
+        gate = normalized.get("gate")
+        action = (normalized.get("suggested_next") or {}).get("action")
+        return metadata, (
+            f"gate_result is blocking ({gate}/{normalized.get('status')}; "
+            f"suggested_next.action={action!r}). Your task is still in-flight "
+            "(no state change). Add the gate_result to a kanban_comment if "
+            "downstream workers need it, then call kanban_block with a concise "
+            "reason or create request_changes follow-up work instead of "
+            "kanban_complete."
+        )
+
+    merged = dict(metadata or {})
+    merged["gate_result"] = normalized
+    return merged, None
 
 
 def _enforce_worker_task_ownership(tid: str) -> Optional[str]:
@@ -513,6 +569,7 @@ def _handle_complete(args: dict, **kw) -> str:
         return ownership_err
     summary = args.get("summary")
     metadata = args.get("metadata")
+    gate_result = args.get("gate_result")
     result = args.get("result")
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
@@ -523,6 +580,13 @@ def _handle_complete(args: dict, **kw) -> str:
         meta_json = redact_sensitive_text(meta_json, force=True)
         try:
             metadata = json.loads(meta_json)
+        except json.JSONDecodeError:
+            pass
+    if gate_result is not None and isinstance(gate_result, dict):
+        gate_json = json.dumps(gate_result)
+        gate_json = redact_sensitive_text(gate_json, force=True)
+        try:
+            gate_result = json.loads(gate_json)
         except json.JSONDecodeError:
             pass
     created_cards = args.get("created_cards")
@@ -587,6 +651,9 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(
             f"metadata must be an object/dict, got {type(metadata).__name__}"
         )
+    metadata, gate_error = _merge_and_validate_gate_result(metadata, gate_result)
+    if gate_error:
+        return tool_error(gate_error)
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
     try:
@@ -860,13 +927,14 @@ def _handle_create(args: dict, **kw) -> str:
     # dir:/worktree project that spawns a follow-up child keeps the child
     # in that project instead of a throwaway scratch dir. Orchestrators
     # (kanban toolset, no HERMES_KANBAN_TASK) and CLI/dashboard callers
-    # fall back to scratch as before. Explicit None path stays None.
+    # fall back to scratch inside ``kb.create_task`` as before. Leaving an
+    # omitted kind as None also lets project-linked tasks derive their default
+    # worktree routing; an explicit ``workspace_kind='scratch'`` stays scratch.
+    # Explicit None path stays None.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
     project_id = args.get("project") or args.get("project_id")
     _inherit_workspace = workspace_kind is None and workspace_path is None
-    if workspace_kind is None:
-        workspace_kind = "scratch"
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
@@ -916,7 +984,7 @@ def _handle_create(args: dict, **kw) -> str:
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
-                workspace_kind=str(workspace_kind),
+                workspace_kind=workspace_kind,
                 workspace_path=workspace_path,
                 project_id=project_id,
                 triage=triage,
@@ -1206,7 +1274,11 @@ KANBAN_COMPLETE_SCHEMA = {
         "tasks via ``kanban_create`` during this run, list their ids "
         "in ``created_cards`` — the kernel verifies them so phantom "
         "references are caught before they leak into downstream "
-        "automation. If you produced deliverable files (charts, PDFs, "
+        "automation. If this run is a spec/verify/review/security/rules/qa "
+        "gate, include a machine-readable ``gate_result`` verdict; blocking "
+        "or failing gate results are rejected so the task must route to "
+        "``kanban_block``/rework instead of fake-done. If you produced "
+        "deliverable files (charts, PDFs, "
         "spreadsheets, generated images), list their absolute paths "
         "in ``artifacts`` — the gateway notifier will upload them as "
         "native attachments to the human who subscribed to the task, "
@@ -1234,7 +1306,23 @@ KANBAN_COMPLETE_SCHEMA = {
                     "Free-form dict of structured facts about this "
                     "attempt — {\"changed_files\": [...], \"tests_run\": 12, "
                     "\"findings\": [...]}. Surfaced to downstream "
-                    "workers alongside ``summary``."
+                    "workers alongside ``summary``. For gate runs, you may "
+                    "also pass metadata.gate_result with the same schema as "
+                    "the top-level gate_result parameter."
+                ),
+            },
+            "gate_result": {
+                "type": "object",
+                "description": (
+                    "Machine-readable spec/verify/review/security/rules/qa "
+                    "gate verdict. Required shape: {schema_version: 1, gate: "
+                    "'spec|verify|review|security|rules|qa', status: "
+                    "'pass|warn|fail', blocking: boolean, blockers: [{id, "
+                    "severity, summary, file?}], affected_files: [path], "
+                    "suggested_next: {action, reason}}. Passing verdicts are "
+                    "stored under metadata.gate_result; blocking/fail verdicts "
+                    "make kanban_complete fail closed so you can kanban_block "
+                    "or route rework."
                 ),
             },
             "result": {
@@ -1450,9 +1538,14 @@ KANBAN_CREATE_SCHEMA = {
                 "type": "string",
                 "enum": ["scratch", "dir", "worktree"],
                 "description": (
-                    "Workspace flavor: 'scratch' (fresh tmp dir, "
-                    "default), 'dir' (shared directory, requires "
-                    "absolute workspace_path), 'worktree' (git worktree)."
+                    "Workspace flavor: 'scratch' (fresh tmp dir), "
+                    "'dir' (shared directory, requires absolute "
+                    "workspace_path), 'worktree' (git worktree). If "
+                    "omitted, dispatcher-spawned workers inherit their "
+                    "current task workspace; non-worker callers default "
+                    "to scratch unless project-derived routing selects a "
+                    "worktree. Pass explicit 'scratch' to prevent project "
+                    "worktree routing."
                 ),
             },
             "workspace_path": {
@@ -1466,9 +1559,11 @@ KANBAN_CREATE_SCHEMA = {
                 "type": "string",
                 "description": (
                     "Optional project id or slug to link the task to. When "
-                    "set, the task becomes a git worktree under the project's "
-                    "primary repo with a deterministic branch (project slug + "
-                    "task id), instead of a random branch."
+                    "workspace_kind is omitted, a resolvable project routes "
+                    "the task to a git worktree under the project's primary "
+                    "repo with a deterministic branch (project slug + task "
+                    "id), instead of a random branch. Explicit "
+                    "workspace_kind='scratch' keeps a scratch workspace."
                 ),
             },
             "triage": {

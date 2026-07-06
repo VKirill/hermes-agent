@@ -12,6 +12,7 @@ import pytest
 
 from hermes_cli import kanban as kc
 from hermes_cli import kanban_db as kb
+from hermes_cli import projects_db as pdb
 
 
 @pytest.fixture
@@ -35,6 +36,7 @@ def kanban_home(tmp_path, monkeypatch):
         ("worktree",              ("worktree", None)),
         ("worktree:/tmp/wt",       ("worktree", "/tmp/wt")),
         ("dir:/tmp/work",         ("dir", "/tmp/work")),
+        (None,                     (None, None)),
     ],
 )
 def test_parse_workspace_flag_valid(value, expected):
@@ -91,6 +93,15 @@ def test_run_slash_create_and_list(kanban_home):
     assert "alice" in out
 
 
+def test_run_slash_create_help_describes_project_workspace_auto_default(kanban_home):
+    out = kc.run_slash("create --help")
+    assert "--project PROJECT" in out
+    assert "default: auto" in out
+    assert "project tasks use a project worktree;" in out
+    assert "otherwise scratch" in out
+    assert "default: scratch" not in out
+
+
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     target = tmp_path / ".worktrees" / "t6-wire"
     target_arg = target.as_posix()
@@ -105,6 +116,42 @@ def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     assert task.workspace_kind == "worktree"
     assert task.workspace_path == target_arg
     assert task.branch_name == "wt/t6-wire"
+
+
+def test_run_slash_create_project_without_workspace_derives_worktree(kanban_home, tmp_path):
+    repo = tmp_path / "project-repo"
+    repo.mkdir()
+    with pdb.connect_closing() as pc:
+        project_id = pdb.create_project(pc, name="CLI Project", folders=[repo.as_posix()])
+        project = pdb.get_project(pc, project_id)
+    assert project is not None
+
+    out = kc.run_slash(f"create 'cli project task' --project {project.slug} --json")
+    payload = json.loads(out)
+
+    assert payload["project_id"] == project.id
+    assert payload["workspace_kind"] == "worktree"
+    assert payload["workspace_path"] == (repo / ".worktrees" / payload["id"]).as_posix()
+    assert payload["branch_name"] == f"{project.slug}/{payload['id']}-cli-project-task"
+
+
+def test_run_slash_create_project_explicit_scratch_stays_scratch(kanban_home, tmp_path):
+    repo = tmp_path / "project-repo"
+    repo.mkdir()
+    with pdb.connect_closing() as pc:
+        project_id = pdb.create_project(pc, name="CLI Project", folders=[repo.as_posix()])
+        project = pdb.get_project(pc, project_id)
+    assert project is not None
+
+    out = kc.run_slash(
+        f"create 'cli research task' --project {project.slug} --workspace scratch --json"
+    )
+    payload = json.loads(out)
+
+    assert payload["project_id"] == project.id
+    assert payload["workspace_kind"] == "scratch"
+    assert payload["workspace_path"] is None
+    assert payload["branch_name"] is None
 
 
 def test_run_slash_rejects_branch_without_worktree(kanban_home):

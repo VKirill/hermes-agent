@@ -29,9 +29,10 @@ Design notes
   no children created. This makes ``decompose`` a strict superset of
   ``specify`` from the user's perspective.
 
-* If the LLM picks an assignee that doesn't exist as a profile, we
-  rewrite it to the configured ``default_assignee`` (or the default
-  profile if unset). A child task NEVER ends up with ``assignee=None``.
+* If the LLM picks an assignee that doesn't exist as a profile, or a
+  profile that has been deprecated for new routing, we rewrite it to
+  the configured ``default_assignee`` (or the default profile if unset).
+  A child task NEVER ends up with ``assignee=None``.
 """
 
 from __future__ import annotations
@@ -47,6 +48,21 @@ from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
 
 logger = logging.getLogger(__name__)
+
+
+# Legacy development profile names that must not receive new kanban work.
+# Keep this intentionally small and role-specific: generic deprecated routing
+# aliases can still live in profile inventory docs, but the decomposer must not
+# expose obsolete development lanes to the LLM roster or accept them as valid
+# assignees when they are replaced by native Hermes/AIF profiles.
+_DEFAULT_DEPRECATED_ASSIGNEES = frozenset({
+    "dev_factory",
+    "dev-factory",
+    "devfactory",
+    "backendgpu",
+    "backend_gpu",
+    "systemdev",
+})
 
 
 _SYSTEM_PROMPT = """You are the Kanban decomposer for the Hermes Agent board.
@@ -177,50 +193,95 @@ def _load_config() -> dict:
         return {}
 
 
-def _resolve_orchestrator_profile(cfg: dict) -> str:
+def _deprecated_assignees_from_config(cfg: dict) -> set[str]:
+    """Return profile names that should not be used for NEW routing.
+
+    ``kanban.deprecated_assignees`` is the canonical key. The legacy-friendly
+    alias ``kanban.deprecated_profiles`` is accepted because operators tend to
+    describe this as "deprecated profiles" in maintenance notes.
+    """
+    deprecated = set(_DEFAULT_DEPRECATED_ASSIGNEES)
+    kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    for key in ("deprecated_assignees", "deprecated_profiles"):
+        raw = kanban_cfg.get(key)
+        if isinstance(raw, str):
+            values = [part.strip() for part in raw.split(",")]
+        elif isinstance(raw, (list, tuple, set)):
+            values = [str(part).strip() for part in raw]
+        else:
+            values = []
+        deprecated.update(value for value in values if value)
+    return deprecated
+
+
+def _profile_exists_and_not_deprecated(name: str, deprecated_assignees: set[str]) -> bool:
+    if not name or name in deprecated_assignees:
+        return False
+    try:
+        return profiles_mod.profile_exists(name)
+    except Exception:
+        return False
+
+
+def _first_non_deprecated_profile(deprecated_assignees: set[str]) -> Optional[str]:
+    try:
+        all_profiles = profiles_mod.list_profiles()
+    except Exception:
+        return None
+    for p in all_profiles:
+        name = getattr(p, "name", "")
+        if name and name not in deprecated_assignees:
+            return name
+    return None
+
+
+def _resolve_orchestrator_profile(cfg: dict, deprecated_assignees: set[str] | None = None) -> str:
     """Resolve which profile owns the root/orchestration task after fan-out.
 
     Falls back to the active default profile when ``kanban.orchestrator_profile``
     is unset, so a task is never stranded for lack of an orchestrator.
     """
+    deprecated_assignees = deprecated_assignees or set()
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get("orchestrator_profile") or "").strip()
-    if explicit:
-        try:
-            if profiles_mod.profile_exists(explicit):
-                return explicit
-        except Exception:
-            pass
+    if explicit and _profile_exists_and_not_deprecated(explicit, deprecated_assignees):
+        return explicit
     # Fall back to the active default profile.
     try:
-        return profiles_mod.get_active_profile_name() or "default"
+        active = profiles_mod.get_active_profile_name() or "default"
     except Exception:
-        return "default"
+        active = "default"
+    if active not in deprecated_assignees:
+        return active
+    return _first_non_deprecated_profile(deprecated_assignees) or active
 
 
-def _resolve_default_assignee(cfg: dict) -> str:
+def _resolve_default_assignee(cfg: dict, deprecated_assignees: set[str] | None = None) -> str:
     """Resolve which profile catches child tasks the orchestrator can't route."""
+    deprecated_assignees = deprecated_assignees or set()
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get("default_assignee") or "").strip()
-    if explicit:
-        try:
-            if profiles_mod.profile_exists(explicit):
-                return explicit
-        except Exception:
-            pass
+    if explicit and _profile_exists_and_not_deprecated(explicit, deprecated_assignees):
+        return explicit
     try:
-        return profiles_mod.get_active_profile_name() or "default"
+        active = profiles_mod.get_active_profile_name() or "default"
     except Exception:
-        return "default"
+        active = "default"
+    if active not in deprecated_assignees:
+        return active
+    return _first_non_deprecated_profile(deprecated_assignees) or active
 
 
-def _build_roster() -> tuple[list[dict], set[str]]:
+def _build_roster(deprecated_assignees: set[str] | None = None) -> tuple[list[dict], set[str]]:
     """Return (roster_for_prompt, valid_assignee_names).
 
     Each roster entry is ``{name, description, has_description}``. The
     valid-set is used after the LLM responds to rewrite invalid
-    assignees to the default fallback.
+    assignees to the default fallback. Deprecated profile names are
+    intentionally omitted from both values so the LLM is not invited to
+    choose them and cannot sneak them back as valid assignees.
     """
+    deprecated_assignees = deprecated_assignees or set()
     roster: list[dict] = []
     valid: set[str] = set()
     try:
@@ -229,6 +290,8 @@ def _build_roster() -> tuple[list[dict], set[str]]:
         logger.warning("decompose: failed to list profiles: %s", exc)
         return roster, valid
     for p in all_profiles:
+        if p.name in deprecated_assignees:
+            continue
         desc = (p.description or "").strip()
         roster.append({
             "name": p.name,
@@ -291,11 +354,12 @@ def decompose_task(
         )
 
     cfg = _load_config()
-    orchestrator = _resolve_orchestrator_profile(cfg)
-    default_assignee = _resolve_default_assignee(cfg)
+    deprecated_assignees = _deprecated_assignees_from_config(cfg)
+    orchestrator = _resolve_orchestrator_profile(cfg, deprecated_assignees)
+    default_assignee = _resolve_default_assignee(cfg, deprecated_assignees)
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     auto_promote = bool(kanban_cfg.get("auto_promote_children", True))
-    roster, valid_names = _build_roster()
+    roster, valid_names = _build_roster(deprecated_assignees)
 
     try:
         from agent.auxiliary_client import (  # type: ignore

@@ -863,11 +863,10 @@ def test_resolve_crash_grace_seconds_handles_bad_env(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Rate-limit requeue: a worker that bails on a provider quota wall must be
-# released back to ``ready`` WITHOUT counting a failure, so a long (e.g.
-# 5-hour) quota window can't trip the circuit breaker and permanently block
-# the card. The respawn guard then defers it on a cooldown until quota
-# returns. Regression coverage for the kanban-rate-limit-failure report.
+# External runtime blockers: a worker that bails on provider quota/rate/auth
+# must be blocked as ``blocked_external`` WITHOUT counting a crash/failure. A
+# long quota window should not re-spawn into the same exhausted provider, and it
+# must not trigger Board Health fix-task cascades.
 # ---------------------------------------------------------------------------
 
 
@@ -890,12 +889,13 @@ def test_classify_worker_exit_recognizes_rate_limit_sentinel(kanban_home):
     assert _kb._classify_worker_exit(pid + 1) == ("nonzero_exit", 1)
 
 
-def test_rate_limit_exit_requeues_without_counting_failure(
+def test_rate_limit_exit_blocks_external_without_counting_failure(
     kanban_home, monkeypatch,
 ):
-    """A rate-limit sentinel exit releases the task to ``ready`` and leaves
-    ``consecutive_failures`` untouched — the breaker must never trip on a
-    transient throttle, even across many quota-wall hits."""
+    """A rate-limit sentinel exit blocks the task as an external runtime
+    blocker, leaves ``consecutive_failures`` untouched, and never records a
+    crash. This prevents quota windows from re-spawning into the same exhausted
+    provider or tripping Board Health fix-task cascades."""
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
@@ -905,51 +905,152 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         host = _kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="rl", assignee="a")
 
-        # Simulate FAR more quota-wall hits than DEFAULT_FAILURE_LIMIT (2).
-        # If any of these counted as a failure the task would be blocked.
-        for i in range(6):
-            pid = 70000 + i
-            # Claim to open a real run (so detect_crashed_workers can close
-            # it with a rate_limited outcome), then point the claim at this
-            # host + a dead pid so the crash path acts on it.
-            kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
-            conn.execute(
-                "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
-                "WHERE id=?",
-                (pid, 0, tid),
-            )
-            conn.commit()
-            _kb._record_worker_exit(
-                pid, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE)
-            )
+        pid = 70000
+        kb.claim_task(conn, tid, claimer=f"{host}:w")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
+            "WHERE id=?",
+            (pid, 0, tid),
+        )
+        conn.commit()
+        _kb._record_worker_exit(
+            pid, _exited_status(_kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+        )
 
-            crashed = kb.detect_crashed_workers(conn)
-            # Rate-limited requeues are NOT crashes.
-            assert tid not in crashed
-            rl = getattr(_kb.detect_crashed_workers, "_last_rate_limited", [])
-            assert tid in rl
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid not in crashed
+        assert getattr(_kb.detect_crashed_workers, "_last_rate_limited", []) == []
+        assert tid in getattr(_kb.detect_crashed_workers, "_last_external_blocked", [])
 
-            task = kb.get_task(conn, tid)
-            assert task.status == "ready", (
-                f"hit {i}: should requeue ready, got {task.status}"
-            )
-            assert task.consecutive_failures == 0, (
-                f"hit {i}: rate-limit must not count a failure, "
-                f"got {task.consecutive_failures}"
-            )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error and "blocked_external" in task.last_failure_error
+        assert "rate_limit" in task.last_failure_error
 
-        # Last failure error stamped so the respawn guard recognizes the
-        # quota wall.
-        assert task.last_failure_error and "rate-limited" in task.last_failure_error
-
-        # A ``rate_limited`` run outcome was recorded (not ``crashed``).
         outcomes = [
             r["outcome"] for r in conn.execute(
                 "SELECT outcome FROM task_runs WHERE task_id=?", (tid,),
             ).fetchall()
         ]
-        assert "rate_limited" in outcomes
+        assert "blocked" in outcomes
         assert "crashed" not in outcomes
+
+        event_kinds = [
+            r["kind"] for r in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? ORDER BY id", (tid,),
+            ).fetchall()
+        ]
+        assert "blocked" in event_kinds
+        assert "blocked_external" in event_kinds
+
+
+def test_dead_worker_log_quota_error_blocks_external_without_crash(
+    kanban_home, monkeypatch,
+):
+    """Agent-init quota errors can happen before the CLI returns the
+    EX_TEMPFAIL sentinel. The dispatcher must still classify the worker log and
+    block externally instead of recording ``pid not alive`` as a crash."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="quota-log", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, consecutive_failures=? WHERE id=?",
+            (71000, 0, tid),
+        )
+        conn.commit()
+        log_dir = kb.worker_logs_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / f"{tid}.log").write_text(
+            "API Error: 400 You're out of extra usage. Add more at claude.ai/settings/usage\n",
+            encoding="utf-8",
+        )
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid not in crashed
+        assert tid in getattr(_kb.detect_crashed_workers, "_last_external_blocked", [])
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.consecutive_failures == 0
+        assert "model_quota_exhausted" in (task.last_failure_error or "")
+
+        assert not conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND kind='crashed'",
+            (tid,),
+        ).fetchone()
+
+
+def test_connection_refused_without_cli_context_is_not_external_blocker():
+    payload = kb.classify_external_runtime_blocker(
+        "pytest failed: connection refused to local API under test"
+    )
+    assert payload is None
+
+
+def test_connection_refused_with_cli_transport_context_is_external_blocker():
+    payload = kb.classify_external_runtime_blocker(
+        "Claude Code CLI transport failed: connection refused while opening ACP session"
+    )
+    assert payload == {
+        "reason": "cli_transport_unavailable",
+        "safe_to_retry": True,
+    }
+
+
+def test_dead_worker_log_app_connection_refused_counts_as_crash(
+    kanban_home, monkeypatch,
+):
+    """Application-level connection failures are task failures, not provider
+    transport blockers. They must go through the normal crash/failure counter
+    so implementation rework is not suppressed as ``blocked_external``."""
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="app-refused", assignee="a")
+        kb.claim_task(conn, tid, claimer=f"{host}:w")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, consecutive_failures=? WHERE id=?",
+            (72000, 0, tid),
+        )
+        conn.commit()
+        log_dir = kb.worker_logs_dir()
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / f"{tid}.log").write_text(
+            "pytest failed: connection refused to local API under test\n",
+            encoding="utf-8",
+        )
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid in crashed
+        assert tid not in getattr(_kb.detect_crashed_workers, "_last_external_blocked", [])
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.consecutive_failures == 1
+        assert "blocked_external" not in (task.last_failure_error or "")
+
+        assert conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND kind='crashed'",
+            (tid,),
+        ).fetchone()
+        assert not conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND kind='blocked_external'",
+            (tid,),
+        ).fetchone()
 
 
 def test_real_crash_still_counts_and_trips_breaker(kanban_home, monkeypatch):

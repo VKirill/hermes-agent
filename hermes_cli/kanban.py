@@ -93,11 +93,16 @@ def _run_state_kwargs(args: argparse.Namespace) -> Optional[dict[str, str]]:
     return {"state_type": st, "state_name": sn}
 
 
-def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
+def _parse_workspace_flag(value: Optional[str]) -> tuple[Optional[str], Optional[str]]:
     """Parse ``--workspace`` into ``(kind, path|None)``.
 
     Accepts: ``scratch``, ``worktree``, ``worktree:<path>``, ``dir:<path>``.
+    ``None`` means the flag was omitted; the DB layer may then infer a
+    project-linked worktree. An empty string keeps the legacy scratch fallback
+    used by older slash/CLI callers.
     """
+    if value is None:
+        return (None, None)
     if not value:
         return ("scratch", None)
     v = value.strip()
@@ -310,9 +315,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--assignee", default=None, help="Profile name to assign")
     p_create.add_argument("--parent", action="append", default=[],
                           help="Parent task id (repeatable)")
-    p_create.add_argument("--workspace", default="scratch",
+    p_create.add_argument("--workspace", default=None,
                           help="scratch | worktree | worktree:<path> | dir:<path> "
-                               "(default: scratch)")
+                               "(default: auto: project tasks use a project "
+                               "worktree; otherwise scratch)")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
     p_create.add_argument("--project", default=None,
