@@ -191,6 +191,22 @@ class GatewayKanbanWatchersMixin:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
 
+        # Single-adapter multiplex mode: ONE shared platform adapter serves
+        # every profile (gateway.topic_profile_routing.single_adapter). In
+        # that topology no per-profile gateway/adapter will ever exist, so
+        # the owner-profile collect gate below would skip profile-owned
+        # subscriptions FOREVER (the silent "topic never hears back" bug).
+        # Delivery still routes through _authorization_adapter, which falls
+        # back to the shared adapter only when the owner profile has no
+        # adapter-registry entry of its own — cross-bot mis-delivery stays
+        # impossible, and the DB-level cursor claim keeps multi-gateway
+        # setups race-safe.
+        try:
+            _tpr = (cfg.get("gateway") or {}).get("topic_profile_routing") or {}
+            single_adapter_mode = bool(_tpr.get("single_adapter"))
+        except Exception:
+            single_adapter_mode = False
+
         # Initial delay so the gateway can finish wiring adapters.
         await asyncio.sleep(5)
 
@@ -253,7 +269,11 @@ class GatewayKanbanWatchersMixin:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
                                 owner_profile = sub.get("notifier_profile") or None
-                                if owner_profile and owner_profile != notifier_profile:
+                                if (
+                                    owner_profile
+                                    and owner_profile != notifier_profile
+                                    and not single_adapter_mode
+                                ):
                                     _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
                                     if not _owner_adapters:
                                         logger.debug(
