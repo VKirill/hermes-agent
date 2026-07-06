@@ -11,7 +11,9 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-ALLOWED_GATES = frozenset({"spec", "verify", "review", "security", "rules", "qa"})
+ALLOWED_GATES = frozenset(
+    {"spec", "verify", "review", "security", "rules", "qa", "qa-check"}
+)
 ALLOWED_STATUSES = frozenset({"pass", "warn", "fail"})
 ALLOWED_SEVERITIES = frozenset({"info", "warning", "warn", "error"})
 REQUIRED_FIELDS = frozenset({
