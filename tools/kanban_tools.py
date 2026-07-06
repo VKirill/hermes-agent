@@ -933,7 +933,15 @@ def _handle_comment(args: dict, **kw) -> str:
         kb, conn = _connect(board=board)
         try:
             cid = kb.add_comment(conn, tid, author=author, body=str(body))
-            return _ok(task_id=tid, comment_id=cid)
+            # Opt-in resume: a comment that supplies what a blocked task was
+            # waiting for should also wake it — a comment alone never
+            # resumes a blocked task (the dispatcher only spawns 'ready').
+            unblocked = None
+            if args.get("unblock"):
+                unblocked = bool(kb.unblock_task(conn, tid))
+            if unblocked is None:
+                return _ok(task_id=tid, comment_id=cid)
+            return _ok(task_id=tid, comment_id=cid, unblocked=unblocked)
         finally:
             conn.close()
     except ValueError as e:
@@ -1524,6 +1532,15 @@ KANBAN_COMMENT_SCHEMA = {
             "body": {
                 "type": "string",
                 "description": "Markdown-supported comment body.",
+            },
+            "unblock": {
+                "type": "boolean",
+                "description": (
+                    "Set true when this comment supplies the input a "
+                    "blocked task was waiting for: the task is returned "
+                    "to the work queue after the comment is posted. A "
+                    "comment alone NEVER resumes a blocked task."
+                ),
             },
             "board": _board_schema_prop(),
         },
