@@ -1,0 +1,137 @@
+# spec-only fixture (.spec.yaml): describes the contract for a future
+# runner. No existing runner consumes this file, so a green CI does not
+# prove the --list branches below executed.
+# Ported from lee-to AI Factory; paths adapted to Hermes
+# (.ai-factory/ → .hermes-dev/). Hermes has no config.yaml, so the
+# original `workflow.plan_id_format: sequential` config resolution is
+# replaced by filename auto-detection: numbered NNNN_<branch-slug>.md
+# plans are always globbed alongside the plain slug name.
+
+scenario: sequential-plan-discovery
+description: |
+  With multiple numbered plan files matching the current branch stem,
+  `aif-improve --list` must:
+
+    1. Compute `<branch-slug>` = `git branch --show-current` with every `/`
+       replaced by `-` (step 2 of skills/aif-improve/references/LIST-MODE.md).
+    2. Glob `.hermes-dev/plans/[0-9][0-9][0-9][0-9]_<branch-slug>.md`
+       (sequential naming is auto-detected from filenames — there is no
+       config flag in Hermes) and surface the matches in the availability
+       summary (highest-numbered first) — the listing must include
+       `0005_feature-user-auth.md`.
+    3. NOT execute refinement, NOT modify any plan file (read-only `--list`
+       contract).
+    4. NOT list `0003_other-feature.md` as a current-branch sequential
+       match (different stem).
+
+  Fixture state:
+    Current branch:                       feature/user-auth
+    Branch-derived slug:                  feature-user-auth
+    .hermes-dev/plans/0001_feature-user-auth.md   (this branch, OLDER)
+    .hermes-dev/plans/0005_feature-user-auth.md   (this branch, HIGHEST)
+    .hermes-dev/plans/0003_other-feature.md       (different stem — ignored)
+
+  This is the cross-skill regression for ichinya's fourth-pass P1: every
+  consumer of sequential plan naming (here `aif-improve`) must glob the
+  numbered pattern for the branch stem before falling back to the plain
+  slug lookup. Production-equivalent `allowed_tools_override` is
+  read-only — `Write`/`Edit` are intentionally omitted because `--list` is
+  a read-only contract; any Write call would already be a contract bug.
+skill: aif-improve
+argument: "--list"
+max_turns: 50
+
+runner:
+  model: claude-sonnet-4-6
+  permission_mode: bypassPermissions
+  allowed_tools_override:
+    - Read
+    - Glob
+    - Grep
+    - Bash(git *)
+    - Bash(pwd)
+    - Bash(basename *)
+    - Bash(cd *)
+    - Bash(printenv *)
+    - AskUserQuestion
+    - Questions
+
+fixtures:
+  git_init: true
+  git_branch: feature/user-auth
+  files_committed:
+    - path: README.md
+      content: |
+        # Demo repo
+
+        Fixture for sequential plan discovery in aif-improve --list.
+    - path: package.json
+      content: |
+        {
+          "name": "demo",
+          "version": "0.1.0"
+        }
+    - path: .hermes-dev/plans/0001_feature-user-auth.md
+      content: |
+        # Feature: user-auth (older plan)
+
+        ## Context
+        - Mode: full
+        - Tests: no
+        - Logging: no
+        - Docs: no
+
+        ## Tasks
+
+        - [x] Task 1: Older numbered plan for the same branch stem. The
+              `--list` summary may mention it as a lower-numbered match,
+              but the highest-numbered sibling for the same branch is
+              0005.
+    - path: .hermes-dev/plans/0005_feature-user-auth.md
+      content: |
+        # Feature: user-auth (latest plan)
+
+        ## Context
+        - Mode: full
+        - Tests: no
+        - Logging: no
+        - Docs: no
+
+        ## Tasks
+
+        - [x] Task 1: Highest-numbered sequential plan for the current
+              branch (feature/user-auth → stem feature-user-auth). The
+              `--list` summary MUST surface this filename.
+    - path: .hermes-dev/plans/0003_other-feature.md
+      content: |
+        # Feature: other-feature (different branch stem — must be ignored)
+
+        ## Tasks
+
+        - [x] Task 1: This plan belongs to a different branch stem and
+              must NOT be listed as a current-branch sequential match by
+              aif-improve --list on branch feature/user-auth.
+
+assertions:
+  - id: globs-numbered-plans
+    type: tool_called
+    tool: Glob
+    args_match:
+      pattern: "\\[0-9\\]"
+    weight: 3
+
+  - id: lists-highest-numbered-plan
+    type: output_contains
+    pattern: "0005_feature-user-auth\\.md"
+    weight: 4
+
+  - id: list-mode-does-not-write
+    type: no_tool_called
+    tool: Write
+
+  - id: list-mode-does-not-edit
+    type: no_tool_called
+    tool: Edit
+
+  - id: stay-in-sandbox
+    type: no_path_escape

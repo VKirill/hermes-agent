@@ -1,0 +1,85 @@
+# Ported from lee-to ai-factory (tests/sequential-skips-archive.yaml), adapted
+# to Hermes: .ai-factory/plans|archive -> .hermes-dev/plans|archive, sequential
+# rule via .hermes-dev/RULES.md (no config.yaml), settings from the task body.
+# Spec-style fixture — no Hermes runner consumes it yet.
+scenario: sequential-skips-archive
+description: |
+  Sequential numbering in aif-plan must only count plans in
+  `.hermes-dev/plans/`, NOT plans in `.hermes-dev/archive/plans/`. This is a
+  consumer-side regression test for the aif-archive feature.
+
+  Fixture state:
+    .hermes-dev/plans/0001_alpha.md          — active plan
+    .hermes-dev/archive/plans/0003_beta.md   — archived plan (must be ignored)
+
+  Expected: the new plan is written as 0002_*, not 0004_*.
+  The archived plan with prefix 0003 must NOT influence the numbering.
+skill: aif-plan
+argument: "add user dashboard (settings: tests no, logging standard, docs no)"
+
+runner:
+  model: claude-sonnet-4-6
+  permission_mode: bypassPermissions
+  allowed_tools_override:
+    - Read
+    - Write
+    - Glob
+    - Grep
+    - Bash(git *)
+    - Bash(mkdir *)
+    - Bash(basename *)
+    - Bash(cd *)
+    - Bash(cp *)
+    - Bash(hermes kanban *)
+
+fixtures:
+  git_init: true
+  git_branch: main
+  files_committed:
+    - path: README.md
+      content: |
+        # Demo repo
+    - path: .hermes-dev/RULES.md
+      content: |
+        # Project rules
+
+        - Plan files use a 4-digit sequential prefix: `NNNN_<slug>.md`
+          (next = max existing prefix in .hermes-dev/plans/ + 1; empty dir
+          starts at 0001; hard cap 9999; archived plans under
+          .hermes-dev/archive/plans/ do not count).
+    - path: .hermes-dev/plans/0001_alpha.md
+      content: |
+        # Plan: alpha
+        - [x] Task 1
+    - path: .hermes-dev/archive/plans/0003_beta.md
+      content: |
+        ---
+        archived: 2026-05-20
+        ---
+        # Plan: beta
+        - [x] Task 1
+
+user_responses: []
+
+assertions:
+  - id: writes-0002-not-0004
+    type: tool_called
+    tool: Write
+    args_match:
+      file_path: "\\.hermes-dev/plans/0002_"
+    weight: 4
+
+  - id: does-not-write-0004
+    type: no_tool_called
+    tool: Write
+    args_match:
+      file_path: "\\.hermes-dev/plans/0004_"
+
+  - id: does-not-write-0003
+    type: no_tool_called
+    tool: Write
+    args_match:
+      file_path: "\\.hermes-dev/plans/0003_"
+
+  - id: stay-in-sandbox
+    type: no_path_escape

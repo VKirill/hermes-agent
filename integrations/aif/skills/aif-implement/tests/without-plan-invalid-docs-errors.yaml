@@ -1,0 +1,78 @@
+# Ported from lee-to ai-factory (tests/without-plan-invalid-docs-errors.yaml),
+# adapted to Hermes: lee-to's `--docs=<value>` CLI flag becomes a Docs setting
+# in the task body (plan Settings contract: Docs yes/no). An invalid value is
+# rejected before execution; the autonomous worker blocks with the exact
+# reason. Spec-style fixture — no Hermes runner consumes it yet.
+scenario: without-plan-invalid-docs-errors
+description: |
+  Inline mode must reject an invalid Docs setting (`docs: maybe` — the
+  Settings contract allows yes|no) and must NOT proceed to execute the task
+  described after it.
+
+  Verifies:
+  (1) the skill's output contains the "invalid docs value" error
+      (worker mode: kanban block with that reason);
+  (2) the described `test.txt` file is NOT created;
+  (3) no plan/fix artifact is created.
+skill: aif-implement
+argument: 'Inline task (no plan, settings: docs: maybe): create a file named test.txt at the repo root containing exactly the text "Hello world"'
+max_turns: 20
+
+runner:
+  model: claude-sonnet-4-6
+  permission_mode: bypassPermissions
+  allowed_tools_override:
+    - Read
+    - Write
+    - Edit
+    - Glob
+    - Grep
+    - Bash(git *)
+    - Bash(ls *)
+    - Bash(pwd)
+    - Bash(basename *)
+    - Bash(cd *)
+    - Bash(printenv *)
+    - Bash(hermes kanban *)
+
+fixtures:
+  git_init: true
+  git_branch: main
+  files_committed:
+    - path: README.md
+      content: |
+        # Demo repo
+
+        Minimal fixture repo for the aif-implement inline-mode invalid-docs scenario.
+    - path: package.json
+      content: |
+        {
+          "name": "demo",
+          "version": "0.1.0"
+        }
+
+user_responses: []
+
+assertions:
+  # Documented error text: "Invalid docs value. Expected yes|no."
+  - id: prints-invalid-docs-error
+    type: output_contains
+    pattern: "(?i)invalid\\s+docs\\s+value"
+    weight: 3
+
+  # The described file must NOT be created (early stop before execution).
+  - id: no-write-test-txt
+    type: no_tool_called
+    tool: Write
+    args_match:
+      file_path: "(^|/)test\\.txt$"
+
+  # No plan/fix/patch artifacts.
+  - id: no-plan-artifacts-written
+    type: no_tool_called
+    tool: Write
+    args_match:
+      file_path: "\\.hermes-dev/(plans|fixes|patches)/"
+
+  - id: stay-in-sandbox
+    type: no_path_escape

@@ -1,0 +1,111 @@
+# Ported from lee-to ai-factory (tests/full-sequential-9999-cap.yaml), adapted
+# to Hermes: sequential numbering comes from a .hermes-dev/RULES.md project
+# rule (no config.yaml), and the autonomous worker BLOCKS the kanban task with
+# the exact reason instead of just printing a message to the user.
+# Spec-style fixture — no Hermes runner consumes it yet.
+scenario: full-sequential-9999-cap
+description: |
+  Planning with the sequential-prefix project rule must hard-stop when a plan
+  numbered `9999` already exists in `.hermes-dev/plans/`. `9999` is a strict
+  cap so that consumer globs in aif-implement / aif-verify (also 4-digit)
+  cannot drift out of contract.
+
+  Fixture state:
+    .hermes-dev/RULES.md            (declares the sequential-prefix rule)
+    .hermes-dev/plans/9999_alpha.md
+
+  Expected behavior:
+    - aif-plan aborts BEFORE writing any new plan file.
+    - No `Write` call to `.hermes-dev/plans/10000_*.md` (would break the
+      4-digit consumer glob contract).
+    - No `Write` call to `.hermes-dev/plans/9999_*.md` (must not overwrite
+      the existing plan or claim 9999 again).
+    - No `Write` call to any other 4-digit-prefixed plan file (no silent
+      fallback to a different number).
+    - The kanban task is blocked with a reason that mentions the `9999` cap
+      (autonomous block-not-ask; interactive use surfaces the same message).
+
+  Verifies the 9999-cap branch of the numbering algorithm
+  (references/TASK-FORMAT.md, "Plan File Naming").
+skill: aif-plan
+argument: "add product search API (settings: tests yes, logging verbose, docs yes)"
+
+runner:
+  model: claude-sonnet-4-6
+  permission_mode: bypassPermissions
+  allowed_tools_override:
+    - Read
+    - Write
+    - Glob
+    - Grep
+    - Bash(git *)
+    - Bash(mkdir *)
+    - Bash(basename *)
+    - Bash(cd *)
+    - Bash(cp *)
+    - Bash(hermes kanban *)
+
+fixtures:
+  git_init: true
+  git_branch: main
+  files_committed:
+    - path: README.md
+      content: |
+        # Demo repo
+
+        Fixture for the aif-plan sequential 9999-cap scenario.
+    - path: package.json
+      content: |
+        {
+          "name": "demo",
+          "version": "0.1.0"
+        }
+    - path: .hermes-dev/RULES.md
+      content: |
+        # Project rules
+
+        - Plan files use a 4-digit sequential prefix: `NNNN_<slug>.md`
+          (next = max existing prefix in .hermes-dev/plans/ + 1; empty dir
+          starts at 0001; hard cap 9999).
+    - path: .hermes-dev/plans/9999_alpha.md
+      content: |
+        # Plan: alpha
+
+        - [x] Task 1
+
+user_responses: []
+
+assertions:
+  - id: reports-9999-cap
+    type: output_contains
+    pattern: "9999"
+    weight: 3
+
+  # Autonomous worker: the stop is a kanban block, not a question to the user.
+  - id: blocks-kanban-task
+    type: tool_called
+    tool: Bash
+    args_match:
+      command: "hermes kanban.*block"
+    weight: 2
+
+  - id: no-write-10000-prefix
+    type: no_tool_called
+    tool: Write
+    args_match:
+      file_path: "\\.hermes-dev/plans/10000_"
+
+  - id: no-write-or-overwrite-9999
+    type: no_tool_called
+    tool: Write
+    args_match:
+      file_path: "\\.hermes-dev/plans/9999_"
+
+  - id: no-write-other-numbered-plan
+    type: no_tool_called
+    tool: Write
+    args_match:
+      file_path: "\\.hermes-dev/plans/[0-9]{4}_(?!alpha\\b).+\\.md$"
+
+  - id: stay-in-sandbox
+    type: no_path_escape

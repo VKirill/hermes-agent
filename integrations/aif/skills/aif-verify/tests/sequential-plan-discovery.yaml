@@ -1,0 +1,133 @@
+# Ported from lee-to ai-factory (aif-verify/tests/sequential-plan-discovery.yaml),
+# adapted to Hermes: sequential rule via .hermes-dev/RULES.md (no config.yaml);
+# discovery applies when the kanban handoff names no plan path; the autonomous
+# verifier defaults its scope to the changed files vs base (no "verify last
+# commit or branch diff?" question). Spec-style fixture — no Hermes runner
+# consumes it yet.
+scenario: sequential-plan-discovery
+description: |
+  With the sequential-prefix project rule active and multiple numbered plan
+  files matching the current branch stem, aif-verify (no plan named in the
+  handoff) must:
+
+    1. Compute `branch_stem` = `git branch --show-current` with every `/`
+       replaced by `-`.
+    2. Glob `.hermes-dev/plans/[0-9][0-9][0-9][0-9]_<branch_stem>.md` first.
+    3. Read the **highest-numbered** match for the current branch's stem.
+    4. Emit `WARN [aif-verify] multiple sequential plans for <branch>: ...`
+       when more than one match exists.
+    5. Not read or verify against plans whose stem belongs to a different
+       branch.
+
+  Fixture state:
+    Current branch:                       feature/user-auth
+    Branch-derived stem:                  feature-user-auth
+    .hermes-dev/plans/0001_feature-user-auth.md   (this branch, OLDER)
+    .hermes-dev/plans/0005_feature-user-auth.md   (this branch, HIGHEST → chosen)
+    .hermes-dev/plans/0003_other-feature.md       (different stem — ignored)
+
+  This is the cross-skill regression: the producer (aif-plan, sequential rule)
+  writes `<NNNN>_<stem>.md`, and aif-verify must resolve the same canonical
+  stem path — not `<NNNN>_<raw-branch>.md` (which would contain a literal `/`
+  for branches like `feature/user-auth`).
+skill: aif-verify
+argument: ""
+max_turns: 50
+
+runner:
+  model: claude-sonnet-4-6
+  permission_mode: bypassPermissions
+  allowed_tools_override:
+    - Read
+    - Glob
+    - Grep
+    - Bash(git *)
+    - Bash(pwd)
+    - Bash(basename *)
+    - Bash(cd *)
+    - Bash(printenv *)
+    - Bash(hermes kanban *)
+
+fixtures:
+  git_init: true
+  git_branch: feature/user-auth
+  files_committed:
+    - path: README.md
+      content: |
+        # Demo repo
+
+        Fixture for sequential plan discovery in aif-verify.
+    - path: package.json
+      content: |
+        {
+          "name": "demo",
+          "version": "0.1.0"
+        }
+    - path: .hermes-dev/RULES.md
+      content: |
+        # Project rules
+
+        - Plan files use a 4-digit sequential prefix: `NNNN_<slug>.md`.
+    - path: .hermes-dev/plans/0001_feature-user-auth.md
+      content: |
+        # Feature: user-auth (older plan)
+
+        ## Settings
+        - Testing: no
+        - Logging: no
+        - Docs: no
+
+        ## Tasks
+
+        - [x] Task 1: Older plan, completed earlier. Must NOT be the plan
+              that aif-verify verifies against — the higher-numbered
+              sibling for the same branch wins.
+    - path: .hermes-dev/plans/0005_feature-user-auth.md
+      content: |
+        # Feature: user-auth (latest plan)
+
+        ## Settings
+        - Testing: no
+        - Logging: no
+        - Docs: no
+
+        ## Tasks
+
+        - [x] Task 1: This is the plan that aif-verify must read for the
+              current branch (feature/user-auth → stem feature-user-auth).
+              Highest-numbered sequential match wins.
+    - path: .hermes-dev/plans/0003_other-feature.md
+      content: |
+        # Feature: other-feature (different branch stem — must be ignored)
+
+        ## Tasks
+
+        - [x] Task 1: This plan belongs to a different branch stem and
+              must NOT be selected by aif-verify on branch
+              feature/user-auth.
+
+# Autonomous verifier: scope defaults to changed files vs base
+# (git diff --name-only <base>...HEAD) — no interactive scope question.
+user_responses: []
+
+assertions:
+  - id: reads-highest-numbered-plan
+    type: tool_called
+    tool: Read
+    args_match:
+      file_path: "\\.hermes-dev/plans/0005_feature-user-auth\\.md$"
+    weight: 4
+
+  - id: does-not-read-other-stem-plan
+    type: no_tool_called
+    tool: Read
+    args_match:
+      file_path: "\\.hermes-dev/plans/0003_other-feature\\.md$"
+
+  - id: warns-about-multiple-sequential-plans
+    type: output_contains
+    pattern: "(?i)WARN \\[aif-verify\\] multiple sequential plans"
+    weight: 2
+
+  - id: stay-in-sandbox
+    type: no_path_escape

@@ -1,0 +1,109 @@
+# Ported from lee-to ai-factory (tests/fast-plan-creates-file.yaml), adapted to
+# Hermes: lee-to's fast plan `.ai-factory/PLAN.md` becomes a regular plan at
+# .hermes-dev/plans/<slug>.md named in the kanban handoff; no interactive
+# delete-plan / verify-or-commit questions (autonomous: complete on evidence,
+# the plan file is kept). Spec-style fixture — no Hermes runner consumes it yet.
+scenario: fast-plan-creates-file
+description: |
+  Given a kanban task whose handoff names the plan, aif-implement must read
+  `.hermes-dev/plans/hello-world-file.md`, execute the single task it
+  contains, and flip the checkbox `- [ ]` → `- [x]` immediately after the
+  task (Step 1–3.4 of the Hermes SKILL.md).
+
+  Verifies:
+  (1) the skill Reads the plan named in the handoff;
+  (2) the described file is actually written with the expected content;
+  (3) the skill Edits the plan to mark the task complete.
+skill: aif-implement
+argument: "Execute the plan at .hermes-dev/plans/hello-world-file.md"
+max_turns: 50
+
+runner:
+  model: claude-sonnet-4-6
+  permission_mode: bypassPermissions
+  allowed_tools_override:
+    - Read
+    - Write
+    - Edit
+    - Glob
+    - Grep
+    - Bash(git *)
+    - Bash(mkdir *)
+    - Bash(ls *)
+    - Bash(pwd)
+    - Bash(basename *)
+    - Bash(cd *)
+    - Bash(printenv *)
+    - Bash(hermes kanban *)
+
+fixtures:
+  git_init: true
+  git_branch: main
+  files_committed:
+    - path: README.md
+      content: |
+        # Demo repo
+
+        Minimal fixture repo for the aif-implement plan-discovery scenario.
+    - path: package.json
+      content: |
+        {
+          "name": "demo",
+          "version": "0.1.0"
+        }
+    - path: .hermes-dev/plans/hello-world-file.md
+      content: |
+        # Feature: hello-world-file
+
+        ## Settings
+        - Testing: no
+        - Logging: no
+        - Docs: no
+
+        ## Tasks
+
+        - [ ] Task 1: Use the `Write` tool to create `test.txt` at the repo root containing exactly the text `Hello world` (no trailing newline). Do not use Bash to echo/printf the file — the test asserts the Write tool call.
+
+# Autonomous worker: no questions. The plan file is never deleted; completion
+# happens via kanban complete with evidence.
+user_responses: []
+
+assertions:
+  # Positive — the plan named in the handoff was read.
+  - id: reads-plan
+    type: tool_called
+    tool: Read
+    args_match:
+      file_path: "\\.hermes-dev/plans/hello-world-file\\.md$"
+    weight: 2
+
+  # Positive — the task's output file was produced with the EXACT requested
+  # content. The plan task explicitly mandates the Write tool (not Bash) so
+  # the assertion can pin both file path and content bytes.
+  - id: writes-test-txt-with-hello-world
+    type: tool_called
+    tool: Write
+    args_match:
+      file_path: "(^|/)test\\.txt$"
+      content: "Hello world"
+    weight: 3
+
+  # Defense in depth — the completion evidence mentions the produced file by
+  # name (the handoff lists changed files).
+  - id: reports-test-txt-created
+    type: output_contains
+    pattern: "(?i)test\\.txt"
+    weight: 1
+
+  # Positive — the plan's checkbox was flipped to `- [x]` right after the task.
+  - id: updates-plan-checkbox
+    type: tool_called
+    tool: Edit
+    args_match:
+      file_path: "\\.hermes-dev/plans/hello-world-file\\.md$"
+      new_string: "- \\[x\\]"
+    weight: 2
+
+  # Sandbox hygiene — all file-path tool calls stay inside the worktree.
+  - id: stay-in-sandbox
+    type: no_path_escape

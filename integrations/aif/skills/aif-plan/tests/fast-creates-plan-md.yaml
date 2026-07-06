@@ -1,0 +1,99 @@
+# Ported from lee-to ai-factory (tests/fast-creates-plan-md.yaml), adapted to
+# Hermes: no fast/full mode split — lee-to's fast mode collapsed into the single
+# Hermes flow that always writes .hermes-dev/plans/<slug>.md (there is no
+# .hermes-dev/PLAN.md single-file path). Settings come from the task body, not
+# interactive questions (autonomous worker: block-not-ask). Spec-style fixture —
+# no Hermes runner consumes it yet; it documents expected behavior.
+scenario: fast-creates-plan-md
+description: |
+  A small planning task must write its plan under `.hermes-dev/plans/<slug>.md`
+  and the plan body must contain at least one markdown checkbox (`- [ ]`) and
+  logging instructions (aif-plan Step 4: never create a task without logging
+  instructions). No explicit max_turns — uses the internal safety cap; hitting
+  it prints a warning, not a failure.
+skill: aif-plan
+argument: "add GET /health endpoint that returns 200 OK (settings: tests no, logging verbose, docs no)"
+
+runner:
+  model: claude-sonnet-4-6
+  permission_mode: bypassPermissions
+  # Keep the run focused — no subagent exploration. Kanban CLI is allowed so
+  # the worker can complete/hand off; the skill degrades gracefully without it.
+  allowed_tools_override:
+    - Read
+    - Write
+    - Glob
+    - Grep
+    - Bash(git *)
+    - Bash(mkdir *)
+    - Bash(basename *)
+    - Bash(cd *)
+    - Bash(hermes kanban *)
+
+fixtures:
+  git_init: true
+  git_branch: main
+  files_committed:
+    - path: README.md
+      content: |
+        # Demo API
+
+        Tiny Node.js API skeleton.
+    - path: package.json
+      content: |
+        {
+          "name": "demo-api",
+          "version": "0.1.0",
+          "type": "module",
+          "dependencies": { "express": "^4.0.0" }
+        }
+    - path: src/index.ts
+      content: |
+        import express from 'express';
+
+        const app = express();
+        app.get('/', (_req, res) => res.send('ok'));
+        app.listen(3000, () => console.log('listening on :3000'));
+
+# Autonomous worker: no interactive questions. Settings are read from the task
+# body (argument above); missing input would be a kanban block, not a question.
+user_responses: []
+
+assertions:
+  - id: writes-plan-with-checkboxes
+    type: tool_called
+    tool: Write
+    args_match:
+      file_path: "\\.hermes-dev/plans/[a-z0-9-]+\\.md$"
+      content: "- \\[ \\]"
+    weight: 3
+
+  - id: writes-plan-path
+    type: tool_called
+    tool: Write
+    args_match:
+      file_path: "\\.hermes-dev/plans/[a-z0-9-]+\\.md$"
+    weight: 1
+
+  # Tasks must carry logging instructions (Important rule 6 of aif-plan).
+  - id: plan-mentions-logging
+    type: tool_called
+    tool: Write
+    args_match:
+      file_path: "\\.hermes-dev/plans/[a-z0-9-]+\\.md$"
+      content: "(?i)log"
+    weight: 1
+
+  # lee-to's fast mode wrote a single .ai-factory/PLAN.md at the root; Hermes
+  # intentionally dropped that path — everything goes to plans/.
+  - id: not-writing-legacy-single-plan
+    type: no_tool_called
+    tool: Write
+    args_match:
+      file_path: "\\.hermes-dev/PLAN\\.md$"
+
+  - id: stay-in-sandbox
+    type: no_path_escape
+    # Defaults cover Read/Write/Edit/Glob/Grep. The skill legitimately reads
+    # its own source tree (installed at `~/.hermes/skills/aif-plan/`) which the
+    # runner should treat as allowed.

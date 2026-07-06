@@ -1,0 +1,104 @@
+# Ported from lee-to ai-factory (tests/without-plan-creates-file.yaml), adapted
+# to Hermes: lee-to's `--without-plan` flag becomes the natural Hermes inline
+# mode — a kanban task carrying its own scoped description with no plan
+# artifact. Plan artifact paths map to .hermes-dev/{plans,fixes,patches}.
+# Spec-style fixture — no Hermes runner consumes it yet.
+scenario: without-plan-creates-file
+description: |
+  Inline mode (a single scoped task, no plan) must execute the task described
+  in the kanban body WITHOUT discovering or reading any plan file.
+
+  Verifies:
+  (1) the described file is actually written with the expected content;
+  (2) the skill does NOT Read anything under `.hermes-dev/plans/` or
+      `.hermes-dev/fixes/` (the real "no load" guarantee);
+  (3) the skill does NOT Write or Edit any plan/fix/patch artifacts.
+
+  NOTE on Glob: a minimal Glob/exists probe of plan paths IS allowed in inline
+  mode, solely to emit `WARN [inline]` when an existing plan file is being
+  intentionally ignored. The contract is "no Read/Write/Edit of plan
+  artifacts," not "no probe at all."
+skill: aif-implement
+argument: 'Inline task (no plan): create a file named test.txt at the repo root containing exactly the text "Hello world"'
+max_turns: 40
+
+runner:
+  model: claude-sonnet-4-6
+  permission_mode: bypassPermissions
+  # Keep the test focused. No web, no subagent exploration. The kanban CLI is
+  # wired so the worker can complete on evidence.
+  allowed_tools_override:
+    - Read
+    - Write
+    - Edit
+    - Glob
+    - Grep
+    - Bash(git *)
+    - Bash(mkdir *)
+    - Bash(ls *)
+    - Bash(pwd)
+    - Bash(basename *)
+    - Bash(cd *)
+    - Bash(printenv *)
+    - Bash(hermes kanban *)
+
+fixtures:
+  git_init: true
+  git_branch: main
+  files_committed:
+    - path: README.md
+      content: |
+        # Demo repo
+
+        Minimal fixture repo for the aif-implement inline-mode scenario.
+    - path: package.json
+      content: |
+        {
+          "name": "demo",
+          "version": "0.1.0"
+        }
+
+user_responses: []
+
+assertions:
+  # Positive — the file actually got written with the requested content.
+  - id: writes-test-txt-with-hello-world
+    type: tool_called
+    tool: Write
+    args_match:
+      file_path: "(^|/)test\\.txt$"
+      content: "Hello world"
+    weight: 3
+
+  # Negative — inline mode must NOT read any plan or fix-plan file.
+  - id: no-read-plan-artifacts
+    type: no_tool_called
+    tool: Read
+    args_match:
+      file_path: "\\.hermes-dev/plans/"
+
+  - id: no-read-fix-plan
+    type: no_tool_called
+    tool: Read
+    args_match:
+      file_path: "\\.hermes-dev/fixes/"
+
+  # Negative — inline mode must NOT create or update plan/fix/patch artifacts.
+  # (Note: Glob probes of `.hermes-dev/plans/*.md` ARE allowed — only to emit
+  # `WARN [inline]` when a plan exists, never to load the file. The real
+  # guarantee is "no Read / Write / Edit of plan artifacts.")
+  - id: no-write-plan-artifacts
+    type: no_tool_called
+    tool: Write
+    args_match:
+      file_path: "\\.hermes-dev/(plans|fixes|patches)/"
+
+  - id: no-edit-plan-artifacts
+    type: no_tool_called
+    tool: Edit
+    args_match:
+      file_path: "\\.hermes-dev/(plans|fixes)/"
+
+  # Sandbox hygiene — all file-path tool calls stay inside the worktree.
+  - id: stay-in-sandbox
+    type: no_path_escape

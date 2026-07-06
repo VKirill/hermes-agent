@@ -1,0 +1,102 @@
+# Ported from lee-to ai-factory (tests/without-plan-conflict-errors.yaml),
+# adapted to Hermes: the conflict is a task body that BOTH demands inline
+# execution ("no plan, ignore plan artifacts") AND names a plan file to
+# execute. An autonomous worker blocks with the conflict as the reason instead
+# of printing a CLI usage error. Spec-style fixture — no Hermes runner
+# consumes it yet.
+scenario: without-plan-conflict-errors
+description: |
+  Inline mode is mutually exclusive with executing a named plan file. This
+  scenario hands the worker a task that says "inline, without a plan" AND
+  points at `.hermes-dev/plans/should-never-be-loaded.md` — contradictory
+  instructions the skill must refuse to run.
+
+  Verifies:
+  (1) the skill's output contains the mutually-exclusive / conflict error
+      (in worker mode: kanban block with that reason);
+  (2) the described `test.txt` file is NOT created;
+  (3) the seeded plan file is NOT Read (no plan discovery / loading) — the
+      conflict must be caught while parsing the task scope, before plan
+      loading;
+  (4) no checkbox flip / Edit on the plan file.
+skill: aif-implement
+argument: 'Inline task (no plan): create a file named test.txt at the repo root containing exactly the text "Hello world". Execute the plan at .hermes-dev/plans/should-never-be-loaded.md'
+max_turns: 20
+
+runner:
+  model: claude-sonnet-4-6
+  permission_mode: bypassPermissions
+  allowed_tools_override:
+    - Read
+    - Write
+    - Edit
+    - Glob
+    - Grep
+    - Bash(git *)
+    - Bash(ls *)
+    - Bash(pwd)
+    - Bash(basename *)
+    - Bash(cd *)
+    - Bash(printenv *)
+    - Bash(hermes kanban *)
+
+fixtures:
+  git_init: true
+  git_branch: main
+  files_committed:
+    - path: README.md
+      content: |
+        # Demo repo
+
+        Minimal fixture repo for the aif-implement inline-mode conflict scenario.
+    - path: package.json
+      content: |
+        {
+          "name": "demo",
+          "version": "0.1.0"
+        }
+    - path: .hermes-dev/plans/should-never-be-loaded.md
+      content: |
+        # Feature: should-never-be-loaded
+
+        ## Settings
+        - Testing: no
+        - Logging: no
+        - Docs: no
+
+        ## Tasks
+
+        - [ ] Task 1: this plan should be ignored because "inline, no plan" + a named plan file is a hard conflict
+
+user_responses: []
+
+assertions:
+  # Documented error: inline mode and a named plan file are mutually exclusive.
+  - id: prints-mutually-exclusive-error
+    type: output_contains
+    pattern: "(?i)mutually\\s+exclusive|conflict"
+    weight: 3
+
+  # The described file must NOT be created.
+  - id: no-write-test-txt
+    type: no_tool_called
+    tool: Write
+    args_match:
+      file_path: "(^|/)test\\.txt$"
+
+  # The plan file must NOT be read (conflict is caught before plan loading).
+  - id: no-read-plan
+    type: no_tool_called
+    tool: Read
+    args_match:
+      file_path: "\\.hermes-dev/plans/should-never-be-loaded\\.md$"
+
+  # The plan file must NOT be edited (no checkbox flip, no rewrite).
+  - id: no-edit-plan
+    type: no_tool_called
+    tool: Edit
+    args_match:
+      file_path: "\\.hermes-dev/plans/should-never-be-loaded\\.md$"
+
+  - id: stay-in-sandbox
+    type: no_path_escape

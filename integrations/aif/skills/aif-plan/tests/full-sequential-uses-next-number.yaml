@@ -1,0 +1,100 @@
+# Ported from lee-to ai-factory (tests/full-sequential-uses-next-number.yaml),
+# adapted to Hermes: sequential numbering comes from a .hermes-dev/RULES.md
+# project rule (no config.yaml), the stem is the description slug (no
+# branch-prefix stems — Hermes aif-plan does not create branches), settings
+# come from the task body. Spec-style fixture — no Hermes runner consumes it yet.
+scenario: full-sequential-uses-next-number
+description: |
+  Planning with the sequential-prefix project rule active must:
+    1. Derive the plan slug from the task description:
+       "add product search API" -> `add-product-search-api`.
+    2. Derive the next 4-digit prefix from the existing plan files in
+       `.hermes-dev/plans/`.
+    3. Write the new plan as `<NNNN>_<slug>.md` — both halves of the filename
+       must agree with the slug-based discovery used by aif-implement and
+       aif-verify (highest-numbered match for the same stem wins downstream).
+
+  Fixture state:
+    .hermes-dev/plans/0001_alpha.md
+    .hermes-dev/plans/0002_beta.md
+
+  Expected: the new plan is written exactly under
+    .hermes-dev/plans/0003_add-product-search-api.md
+
+  Verifies the numbering algorithm and the save step (aif-plan Step 5,
+  references/TASK-FORMAT.md "Plan File Naming").
+skill: aif-plan
+argument: "add product search API (settings: tests yes, logging verbose, docs yes)"
+
+runner:
+  model: claude-sonnet-4-6
+  permission_mode: bypassPermissions
+  allowed_tools_override:
+    - Read
+    - Write
+    - Glob
+    - Grep
+    - Bash(git *)
+    - Bash(mkdir *)
+    - Bash(basename *)
+    - Bash(cd *)
+    - Bash(cp *)
+    - Bash(hermes kanban *)
+
+fixtures:
+  git_init: true
+  git_branch: main
+  files_committed:
+    - path: README.md
+      content: |
+        # Demo repo
+
+        Fixture for the aif-plan sequential numbering scenario.
+    - path: package.json
+      content: |
+        {
+          "name": "demo",
+          "version": "0.1.0"
+        }
+    - path: .hermes-dev/RULES.md
+      content: |
+        # Project rules
+
+        - Plan files use a 4-digit sequential prefix: `NNNN_<slug>.md`
+          (next = max existing prefix in .hermes-dev/plans/ + 1; empty dir
+          starts at 0001; hard cap 9999).
+    - path: .hermes-dev/plans/0001_alpha.md
+      content: |
+        # Plan: alpha
+
+        - [x] Task 1
+    - path: .hermes-dev/plans/0002_beta.md
+      content: |
+        # Plan: beta
+
+        - [x] Task 1
+
+user_responses: []
+
+assertions:
+  - id: writes-slug-stem-0003
+    type: tool_called
+    tool: Write
+    args_match:
+      file_path: "\\.hermes-dev/plans/0003_add-product-search-api\\.md$"
+    weight: 4
+
+  - id: not-writing-without-prefix
+    type: no_tool_called
+    tool: Write
+    args_match:
+      file_path: "\\.hermes-dev/plans/(?!0003_)[a-z0-9-]+\\.md$"
+
+  - id: not-overwriting-0001-or-0002
+    type: no_tool_called
+    tool: Write
+    args_match:
+      file_path: "\\.hermes-dev/plans/000[12]_"
+
+  - id: stay-in-sandbox
+    type: no_path_escape
