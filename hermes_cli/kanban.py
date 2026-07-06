@@ -577,6 +577,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
 
     # --- comment / complete / block / unblock / archive ---
     p_comment = sub.add_parser("comment", help="Append a comment")
+    p_comment.add_argument("--unblock", action="store_true",
+                           help="After posting the comment, unblock the task "
+                                "(use when the comment supplies the input a "
+                                "blocked task was waiting for — a comment "
+                                "alone never resumes a blocked task).")
     p_comment.add_argument("task_id")
     p_comment.add_argument("text", nargs="+", help="Comment body")
     p_comment.add_argument("--author", default=None,
@@ -1922,6 +1927,13 @@ def _cmd_comment(args: argparse.Namespace) -> int:
     author = args.author or _profile_author()
     with kb.connect_closing() as conn:
         kb.add_comment(conn, args.task_id, author, body)
+        if getattr(args, "unblock", False):
+            if kb.unblock_task(conn, args.task_id):
+                print(f"Comment added to {args.task_id}; task unblocked")
+                return 0
+            print(f"Comment added to {args.task_id}; unblock skipped "
+                  f"(not blocked/scheduled, or a workflow human gate)")
+            return 0
     print(f"Comment added to {args.task_id}")
     return 0
 
