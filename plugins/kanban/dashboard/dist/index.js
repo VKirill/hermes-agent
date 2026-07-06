@@ -2592,6 +2592,31 @@
               ? h(Badge, { variant: "outline", className: "hermes-kanban-tag",
                            title: `Tenant: ${t.tenant}. Free-form tag for grouping tasks (customer, project, team).` }, t.tenant)
               : null,
+            // AIF workflow: stage chip + convergence badges (port of aif-handoff UI)
+            t.workflow_template_id === "aif" && t.current_step_key
+              ? h(Badge, { variant: "outline", className: "hermes-kanban-tag",
+                           title: `AIF workflow stage: ${t.current_step_key}. One card walks plan→implement→verify→review→verified; the assignee is rewritten per stage.` },
+                  "⚙ " + t.current_step_key)
+              : null,
+            t.workflow_template_id === "aif" && t.review_iteration_count > 0
+              ? h("span", {
+                  className: "hermes-kanban-count",
+                  title: `Review convergence: rework iteration ${t.review_iteration_count}` +
+                         (t.max_review_iterations ? ` of ${t.max_review_iterations}` : "") +
+                         ". At the cap the loop stops and asks a human.",
+                }, "↻ " + t.review_iteration_count + (t.max_review_iterations ? "/" + t.max_review_iterations : ""))
+              : null,
+            t.manual_review_required
+              ? h("span", {
+                  className: "hermes-kanban-warning-badge hermes-kanban-warning-badge--error",
+                  title: "Automatic review convergence stopped — human review required. Use Approve / Request changes.",
+                }, "👤")
+              : null,
+            t.rework_requested && !t.manual_review_required
+              ? h(Badge, { variant: "outline", className: "hermes-kanban-tag",
+                           title: "Rework round: the previous review failed; the implementer is fixing the carried findings." },
+                  "rework")
+              : null,
             progress
               ? h("span", {
                   className: cn(
@@ -3263,6 +3288,16 @@
             ? `on (max ${t.goal_max_turns} turns)`
             : "on",
         }) : null,
+        t.workflow_template_id === "aif" ? h(MetaRow, {
+          label: "AIF workflow",
+          value: `stage ${t.current_step_key || "?"}` +
+            (t.auto_mode === false ? " · human gates" : " · auto") +
+            (t.review_iteration_count > 0
+              ? ` · review ${t.review_iteration_count}${t.max_review_iterations ? "/" + t.max_review_iterations : ""}`
+              : "") +
+            (t.manual_review_required ? " · MANUAL REVIEW REQUIRED" : "") +
+            (t.rework_requested ? " · rework" : ""),
+        }) : null,
         t.created_by ? h(MetaRow, { label: tx(i18n, "createdBy", "Created by"), value: t.created_by }) : null,
       ),
       h(StatusActions, {
@@ -3270,6 +3305,8 @@
         onPatch: props.onPatch,
         onSpecify: props.onSpecify,
         onDecompose: props.onDecompose,
+        boardSlug: props.boardSlug,
+        onRefresh: props.onRefresh,
       }),
       h(DiagnosticsSection, {
         task: t,
@@ -3745,6 +3782,56 @@
     const [specifyMsg, setSpecifyMsg] = useState(null);
     const [decomposeBusy, setDecomposeBusy] = useState(false);
     const [decomposeMsg, setDecomposeMsg] = useState(null);
+    const [wfBusy, setWfBusy] = useState(false);
+    const [wfMsg, setWfMsg] = useState(null);
+
+    // AIF workflow human gate actions (port of aif-handoff HUMAN_ACTIONS_BY_STATUS).
+    // Rendered only when the card sits at a gate step; the backend enforces
+    // the stage guards, so a stale drawer just gets a 409 with the reason.
+    const wfStep = task.workflow_template_id === "aif" ? (task.current_step_key || "") : "";
+    const wfAction = function (action, needsReason) {
+      return function () {
+        if (wfBusy) return;
+        let reason = null;
+        if (needsReason) {
+          reason = window.prompt("What must change? (recorded as a comment for the implementer)") || "";
+          if (!reason.trim()) return;
+        }
+        setWfBusy(true);
+        setWfMsg(null);
+        SDK.fetchJSON(withBoard(`${API}/tasks/${encodeURIComponent(task.id)}/workflow-action`, props.boardSlug), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: action, reason: reason }),
+        }).then(function (res) {
+          setWfMsg({ ok: true, text: `${action} → ${res.status} (stage ${res.current_step_key})` });
+          if (props.onRefresh) props.onRefresh();
+        }).catch(function (err) {
+          setWfMsg({ ok: false, text: `${action} failed: ` + (err.message || String(err)) });
+        }).then(function () { setWfBusy(false); });
+      };
+    };
+    const wfButtons = [];
+    if (wfStep === "done") {
+      wfButtons.push(h(Button, {
+        onClick: wfAction("approve_done", false), disabled: wfBusy, size: "sm",
+        title: "Human approval: done → verified (terminal). Convergence stopped here" +
+               (task.manual_review_required ? " because automatic review required a human." : "."),
+      }, "✓ Approve → verified"));
+      wfButtons.push(h(Button, {
+        onClick: wfAction("request_changes", true), disabled: wfBusy, size: "sm",
+        title: "Send the card back to implementing with a fresh convergence budget.",
+      }, "↩ Request changes"));
+    } else if (wfStep === "plan_ready") {
+      wfButtons.push(h(Button, {
+        onClick: wfAction("start_implementation", false), disabled: wfBusy, size: "sm",
+        title: "Accept the plan and start implementing.",
+      }, "▶ Start implementation"));
+      wfButtons.push(h(Button, {
+        onClick: wfAction("request_replanning", false), disabled: wfBusy, size: "sm",
+        title: "Send the card back to planning.",
+      }, "↩ Replan"));
+    }
     const b = function (label, patch, enabled, confirmMsg) {
       return h(Button, {
         onClick: function () { if (enabled !== false) props.onPatch(patch, { confirm: confirmMsg }); },
@@ -3837,6 +3924,12 @@
       : null;
 
     return h("div", null,
+      wfButtons.length > 0
+        ? h("div", { className: "hermes-kanban-actions" }, wfButtons)
+        : null,
+      wfMsg ? h("div", {
+        className: wfMsg.ok ? "hermes-kanban-msg-ok" : "hermes-kanban-msg-err",
+      }, wfMsg.text) : null,
       h("div", { className: "hermes-kanban-actions" },
         specifyButton,
         decomposeButton,

@@ -1106,6 +1106,63 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
 
 
 # ---------------------------------------------------------------------------
+# AIF workflow human gate actions (port of aif-handoff HUMAN_ACTIONS)
+# ---------------------------------------------------------------------------
+
+_WORKFLOW_ACTIONS = {
+    "approve_done", "request_changes",
+    "start_implementation", "request_replanning",
+}
+
+
+class WorkflowActionBody(BaseModel):
+    action: str
+    reason: Optional[str] = None
+
+
+@router.post("/tasks/{task_id}/workflow-action")
+def workflow_action(
+    task_id: str, payload: WorkflowActionBody, board: Optional[str] = Query(None)
+):
+    """Resolve an AIF workflow human gate: approve to verified, request
+    changes (rework), or the plan_ready actions. The card's stage decides
+    which actions are legal — kanban_db raises the lee-to guard errors."""
+    action = (payload.action or "").strip()
+    if action not in _WORKFLOW_ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"action must be one of {sorted(_WORKFLOW_ACTIONS)}",
+        )
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        if kanban_db.get_task(conn, task_id) is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        reason = (payload.reason or "").strip()
+        if reason:
+            kanban_db.add_comment(
+                conn, task_id, author="dashboard",
+                body=f"{action.upper().replace('_', ' ')}: {reason}",
+            )
+        try:
+            ok = kanban_db.apply_workflow_human_event(conn, task_id, action)
+        except ValueError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        if not ok:
+            raise HTTPException(
+                status_code=409, detail=f"could not apply {action} to {task_id}"
+            )
+        task = kanban_db.get_task(conn, task_id)
+        return {
+            "ok": True,
+            "status": task.status if task else None,
+            "current_step_key": getattr(task, "current_step_key", None),
+        }
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Links
 # ---------------------------------------------------------------------------
 
