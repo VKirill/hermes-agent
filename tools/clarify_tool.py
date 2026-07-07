@@ -8,7 +8,7 @@ messaging platforms, choices are rendered as a numbered list.
 
 Supports two modes:
 
-1. **Simple** -- provide ``choices`` (up to 4 strings). Auto-appends
+1. **Simple** -- provide ``choices`` (up to 12 strings). Auto-appends
    'Other (type your answer)'.
 2. **Rich** -- provide ``options`` (up to 25 objects with label, value,
    style, and optional modal forms). The caller controls the full options
@@ -26,8 +26,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 
 # Maximum number of predefined choices the agent can offer.
-# A 5th "Other (type your answer)" option is always appended by the UI.
-MAX_CHOICES = 4
+# An "Other (type your answer)" option is always appended by the UI.
+# Adapters paginate long lists (Telegram: 6 buttons per page + ◀ ▶ nav).
+MAX_CHOICES = 12
 
 # -- Rich-option validation constants ----------------------------------------
 
@@ -94,7 +95,7 @@ CLARIFY_SCHEMA = {
     "description": (
         "Ask the user a question when you need clarification, feedback, or a "
         "decision before proceeding. Supports two modes:\n\n"
-        "1. **Simple** -- provide `choices` (up to 4 strings). Auto-appends "
+        "1. **Simple** -- provide `choices` (up to 12 strings). Auto-appends "
         "'Other (type your answer)'.\n"
         "2. **Rich** -- provide `options` (up to 25 objects with label, value, "
         "style, and optional modal forms). The caller controls the full "
@@ -130,7 +131,7 @@ CLARIFY_SCHEMA = {
                 "maxItems": MAX_CHOICES,
                 "description": (
                     "REQUIRED whenever you are presenting selectable options: "
-                    "each distinct option is its own array element (up to 4). "
+                    "each distinct option is its own array element (up to 12). "
                     "The UI renders these as pickable rows and auto-appends an "
                     "'Other (type your answer)' option. Omit this parameter "
                     "entirely ONLY for a genuinely open-ended free-text question."
@@ -304,7 +305,7 @@ def clarify_tool(
 
     Args:
         question:        The question text to present.
-        choices:         Up to 4 predefined answer choices (simple path).
+        choices:         Up to 12 predefined answer choices (simple path).
         options:         Up to 25 rich option objects (rich path).
                          Mutually exclusive with ``choices``.
         display_type:    How to render options (currently only "buttons").

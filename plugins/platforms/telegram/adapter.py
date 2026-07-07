@@ -4623,6 +4623,90 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.warning("[%s] send_slash_confirm failed: %s", self.name, e)
             return SendResult(success=False, error=str(e))
 
+    # Clarify keyboard: buttons per page; longer lists get a ◀ ▶ nav row.
+    _CLARIFY_PER_PAGE = 6
+    # Labels at or under this length render as text buttons; any longer
+    # label on the page switches it to numeric buttons + numbered body list.
+    _CLARIFY_TEXT_LABEL_MAX = 24
+
+    def _clarify_page_view(
+        self,
+        clarify_id: str,
+        question: str,
+        choices: list,
+        page: int,
+    ):
+        """Build ``(text, InlineKeyboardMarkup)`` for one page of a clarify.
+
+        ≤6 choices → single page, no nav row. Longer lists paginate 6 per
+        page with a ``◀ x/y ▶`` row (callback ``cl:<id>:pg:<n>`` edits the
+        same message in place). Choice callback indices stay GLOBAL, so
+        resolution is page-independent. Telegram caps callback_data at
+        64 bytes; ``cl:<id>:<idx>`` stays well under it.
+        """
+        per_page = self._CLARIFY_PER_PAGE
+        total = len(choices)
+        pages = max(1, -(-total // per_page))
+        page = max(0, min(int(page), pages - 1))
+        start = page * per_page
+        subset = choices[start:start + per_page]
+
+        text = f"❓ {_html.escape(question)}"
+        use_text_labels = all(
+            len(str(c)) <= self._CLARIFY_TEXT_LABEL_MAX for c in subset
+        )
+
+        rows = []
+        if use_text_labels:
+            # Short labels → the label IS the button; body stays clean.
+            for i, c in enumerate(subset):
+                rows.append([
+                    InlineKeyboardButton(
+                        str(c),
+                        callback_data=f"cl:{clarify_id}:{start + i}",
+                    )
+                ])
+        else:
+            # Long labels → full option text in the body (mobile users can
+            # read it), buttons keep short numeric labels; 3 per row.
+            option_lines = "\n".join(
+                f"{start + i + 1}. {_html.escape(str(c))}"
+                for i, c in enumerate(subset)
+            )
+            text += f"\n\n{option_lines}"
+            row = []
+            for i in range(len(subset)):
+                row.append(InlineKeyboardButton(
+                    str(start + i + 1),
+                    callback_data=f"cl:{clarify_id}:{start + i}",
+                ))
+                if len(row) == 3:
+                    rows.append(row)
+                    row = []
+            if row:
+                rows.append(row)
+
+        if pages > 1:
+            nav = []
+            if page > 0:
+                nav.append(InlineKeyboardButton(
+                    "◀️", callback_data=f"cl:{clarify_id}:pg:{page - 1}"))
+            nav.append(InlineKeyboardButton(
+                f"{page + 1}/{pages}",
+                callback_data=f"cl:{clarify_id}:pg:{page}"))
+            if page < pages - 1:
+                nav.append(InlineKeyboardButton(
+                    "▶️", callback_data=f"cl:{clarify_id}:pg:{page + 1}"))
+            rows.append(nav)
+
+        rows.append([
+            InlineKeyboardButton(
+                "✏️ Other (type answer)",
+                callback_data=f"cl:{clarify_id}:other",
+            )
+        ])
+        return text, InlineKeyboardMarkup(rows)
+
     async def send_clarify(
         self,
         chat_id: str,
@@ -4632,12 +4716,13 @@ class TelegramAdapter(BasePlatformAdapter):
         session_key: str,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Render a clarify prompt with one inline button per choice.
+        """Render a clarify prompt with inline buttons per choice.
 
-        Multi-choice mode (``choices`` non-empty): renders one button per
-        option plus a final "✏️ Other (type answer)" button.  Picking the
-        "Other" button flips the entry into text-capture mode so the next
-        message becomes the response.
+        Multi-choice mode (``choices`` non-empty): renders up to 6 choice
+        buttons per page (short labels as text buttons, long ones numeric)
+        plus a ◀ ▶ nav row for longer lists and a final "✏️ Other (type
+        answer)" button.  Picking "Other" flips the entry into text-capture
+        mode so the next message becomes the response.
 
         Open-ended mode (``choices`` empty): renders the question as plain
         text — no buttons.  The next message in the session is captured by
@@ -4647,19 +4732,14 @@ class TelegramAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         try:
-            text = f"❓ {_html.escape(question)}"
             thread_id = self._metadata_thread_id(metadata)
 
             if choices:
-                # Render full option text in the message body so mobile
-                # users can read long choices that would be truncated in
-                # inline button labels.  Buttons keep short numeric labels
-                # (1, 2, …, Other) to avoid Telegram truncation.
-                option_lines = "\n".join(
-                    f"{i + 1}. {_html.escape(str(c))}"
-                    for i, c in enumerate(choices)
+                text, markup = self._clarify_page_view(
+                    clarify_id, question, choices, 0
                 )
-                text += f"\n\n{option_lines}"
+            else:
+                text, markup = f"❓ {_html.escape(question)}", None
 
             kwargs: Dict[str, Any] = {
                 "chat_id": normalize_telegram_chat_id(chat_id),
@@ -4667,25 +4747,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 "parse_mode": ParseMode.HTML,
                 **self._link_preview_kwargs(),
             }
-
-            if choices:
-                # Telegram caps callback_data at 64 bytes; keep "cl:<id>:<idx>"
-                # short.
-                rows = []
-                for idx in range(len(choices)):
-                    rows.append([
-                        InlineKeyboardButton(
-                            str(idx + 1),
-                            callback_data=f"cl:{clarify_id}:{idx}",
-                        )
-                    ])
-                rows.append([
-                    InlineKeyboardButton(
-                        "✏️ Other (type answer)",
-                        callback_data=f"cl:{clarify_id}:other",
-                    )
-                ])
-                kwargs["reply_markup"] = InlineKeyboardMarkup(rows)
+            if markup is not None:
+                kwargs["reply_markup"] = markup
 
             reply_to_id = self._reply_to_message_id_for_send(None, metadata)
             kwargs["reply_to_message_id"] = reply_to_id
@@ -5521,6 +5584,40 @@ class TelegramAdapter(BasePlatformAdapter):
                     return
 
                 user_display = getattr(query.from_user, "first_name", "User")
+
+                if choice_token.startswith("pg:"):
+                    # Pagination nav — re-render the requested page in place,
+                    # never resolves the clarify.
+                    try:
+                        target_page = int(choice_token.split(":", 1)[1])
+                    except (ValueError, IndexError):
+                        await query.answer(text="Invalid page.")
+                        return
+                    entry = None
+                    try:
+                        from tools.clarify_gateway import _entries as _clarify_entries  # type: ignore
+                        entry = _clarify_entries.get(clarify_id)
+                    except Exception:
+                        entry = None
+                    if entry is None or not entry.choices:
+                        # Entry evicted (timeout / restart) — a stale keyboard.
+                        self._clarify_state.pop(clarify_id, None)
+                        await query.answer(text="This prompt has already been resolved.")
+                        return
+                    text, markup = self._clarify_page_view(
+                        clarify_id, entry.question, entry.choices, target_page
+                    )
+                    try:
+                        await query.edit_message_text(
+                            text=text,
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=markup,
+                        )
+                    except Exception:
+                        # Same-page tap → "message is not modified"; harmless.
+                        pass
+                    await query.answer()
+                    return
 
                 if choice_token == "other":
                     # Flip into text-capture mode and tell the user to type

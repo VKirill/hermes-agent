@@ -584,3 +584,188 @@ class TestBaseAdapterClarifyFallback:
         assert "Free form?" in adapter.sent[0]
         # No numbered list — choices were empty
         assert "1." not in adapter.sent[0]
+
+
+# ===========================================================================
+# Pagination — >6 choices get 6 buttons per page + ◀ ▶ nav row
+# ===========================================================================
+
+class TestTelegramClarifyPagination:
+    def setup_method(self):
+        _clear_clarify_state()
+
+    def test_single_page_has_no_nav(self):
+        adapter = _make_adapter()
+        captured = []
+
+        import plugins.platforms.telegram.adapter as tg_mod
+        orig_btn = tg_mod.InlineKeyboardButton
+        orig_markup = tg_mod.InlineKeyboardMarkup
+
+        class Btn:
+            def __init__(self, label, callback_data=None):
+                self.label = label
+                self.callback_data = callback_data
+
+        class Markup:
+            def __init__(self, rows):
+                captured.append(rows)
+
+        tg_mod.InlineKeyboardButton = Btn
+        tg_mod.InlineKeyboardMarkup = Markup
+        try:
+            adapter._clarify_page_view("cidP0", "Pick", ["a", "b", "c"], 0)
+        finally:
+            tg_mod.InlineKeyboardButton = orig_btn
+            tg_mod.InlineKeyboardMarkup = orig_markup
+
+        rows = captured[0]
+        # 3 choice rows + Other row; no nav row for a single page
+        assert len(rows) == 4
+        assert rows[-1][0].callback_data == "cl:cidP0:other"
+        labels = [r[0].label for r in rows[:3]]
+        assert labels == ["a", "b", "c"]
+
+    def test_pagination_first_page(self):
+        adapter = _make_adapter()
+        choices = [f"choice {i}" for i in range(1, 14)]  # 13 → 3 pages
+        captured = []
+
+        import plugins.platforms.telegram.adapter as tg_mod
+        orig_btn = tg_mod.InlineKeyboardButton
+        orig_markup = tg_mod.InlineKeyboardMarkup
+
+        class Btn:
+            def __init__(self, label, callback_data=None):
+                self.label = label
+                self.callback_data = callback_data
+
+        class Markup:
+            def __init__(self, rows):
+                captured.append(rows)
+
+        tg_mod.InlineKeyboardButton = Btn
+        tg_mod.InlineKeyboardMarkup = Markup
+        try:
+            text, markup = adapter._clarify_page_view("cidP1", "Pick", choices, 0)
+        finally:
+            tg_mod.InlineKeyboardButton = orig_btn
+            tg_mod.InlineKeyboardMarkup = orig_markup
+
+        rows = captured[0]
+        # 6 short-label buttons (one per row) + nav row + Other row = 8 rows
+        assert len(rows) == 8
+        # First six buttons carry GLOBAL indices 0..5
+        first_labels = [r[0].label for r in rows[:6]]
+        assert first_labels == [f"choice {i}" for i in range(1, 7)]
+        assert [r[0].callback_data for r in rows[:6]] == [
+            f"cl:cidP1:{i}" for i in range(6)
+        ]
+        # Nav row: no ◀ on first page; indicator 1/3; ▶ to page 1
+        nav = rows[6]
+        assert [b.label for b in nav] == ["1/3", "▶️"]
+        assert nav[-1].callback_data == "cl:cidP1:pg:1"
+        # Other row last
+        assert rows[7][0].callback_data == "cl:cidP1:other"
+
+    def test_pagination_last_page_global_indices(self):
+        adapter = _make_adapter()
+        choices = [f"choice {i}" for i in range(1, 14)]  # 13 → 3 pages
+        captured = []
+
+        import plugins.platforms.telegram.adapter as tg_mod
+        orig_btn = tg_mod.InlineKeyboardButton
+        orig_markup = tg_mod.InlineKeyboardMarkup
+
+        class Btn:
+            def __init__(self, label, callback_data=None):
+                self.label = label
+                self.callback_data = callback_data
+
+        class Markup:
+            def __init__(self, rows):
+                captured.append(rows)
+
+        tg_mod.InlineKeyboardButton = Btn
+        tg_mod.InlineKeyboardMarkup = Markup
+        try:
+            text, markup = adapter._clarify_page_view("cidP2", "Pick", choices, 2)
+        finally:
+            tg_mod.InlineKeyboardButton = orig_btn
+            tg_mod.InlineKeyboardMarkup = orig_markup
+
+        rows = captured[0]
+        # Last page: 1 choice (index 12) + nav + Other = 3 rows
+        assert len(rows) == 3
+        assert rows[0][0].callback_data == "cl:cidP2:12"
+        nav = rows[1]
+        # ◀ to page 1, indicator 3/3, no ▶
+        assert [b.label for b in nav] == ["◀️", "3/3"]
+        assert nav[0].callback_data == "cl:cidP2:pg:1"
+
+    def test_page_clamped_out_of_range(self):
+        adapter = _make_adapter()
+        choices = [f"c{i}" for i in range(13)]
+        # Should not raise on absurd page numbers
+        adapter._clarify_page_view("cidP3", "Pick", choices, 99)
+        adapter._clarify_page_view("cidP3", "Pick", choices, -5)
+
+    @pytest.mark.asyncio
+    async def test_nav_callback_edits_message_without_resolving(self):
+        from tools import clarify_gateway as cm
+
+        adapter = _make_adapter()
+        choices = [f"choice {i}" for i in range(1, 14)]
+        cm.register("cidNav", "sk-nav", "Pick", choices)
+        adapter._clarify_state["cidNav"] = "sk-nav"
+
+        query = AsyncMock()
+        query.data = "cl:cidNav:pg:1"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock()
+        query.from_user.id = "777"
+        query.from_user.first_name = "Tester"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, context)
+
+        # Message edited in place, prompt NOT resolved, state kept
+        query.edit_message_text.assert_called_once()
+        assert "cidNav" in adapter._clarify_state
+        with cm._lock:
+            entry = cm._entries.get("cidNav")
+        assert entry is not None
+        assert not entry.event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_nav_callback_on_expired_entry(self):
+        adapter = _make_adapter()
+        # No entry registered — simulates timeout eviction
+        adapter._clarify_state["cidGone"] = "sk-gone"
+
+        query = AsyncMock()
+        query.data = "cl:cidGone:pg:1"
+        query.message = MagicMock()
+        query.message.chat_id = 12345
+        query.from_user = MagicMock()
+        query.from_user.id = "777"
+        query.from_user.first_name = "Tester"
+        query.answer = AsyncMock()
+        query.edit_message_text = AsyncMock()
+
+        update = MagicMock()
+        update.callback_query = query
+        context = MagicMock()
+
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_USERS": "*"}, clear=False):
+            await adapter._handle_callback_query(update, context)
+
+        query.edit_message_text.assert_not_called()
+        assert "cidGone" not in adapter._clarify_state

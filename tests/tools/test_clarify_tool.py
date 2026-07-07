@@ -73,7 +73,7 @@ class TestClarifyToolChoicesValidation:
             choices_passed.extend(choices or [])
             return "picked"
 
-        many_choices = ["a", "b", "c", "d", "e", "f", "g"]
+        many_choices = [f"choice-{i}" for i in range(MAX_CHOICES + 3)]
         clarify_tool("Pick one", choices=many_choices, callback=mock_callback)
 
         assert len(choices_passed) == MAX_CHOICES
@@ -254,6 +254,6 @@ class TestClarifySchema:
         choices_spec = CLARIFY_SCHEMA["parameters"]["properties"]["choices"]
         assert choices_spec.get("maxItems") == MAX_CHOICES
 
-    def test_max_choices_is_four(self):
-        """MAX_CHOICES constant should be 4."""
-        assert MAX_CHOICES == 4
+    def test_max_choices_is_twelve(self):
+        """MAX_CHOICES constant should be 12 (adapters paginate 6/page)."""
+        assert MAX_CHOICES == 12
