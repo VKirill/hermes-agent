@@ -326,6 +326,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "worktree under the project's primary repo with a "
                                "deterministic branch. See `hermes project list`.")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
+    p_create.add_argument("--session", default=None,
+                          help="Originating chat/agent session id. Defaults to "
+                               "$HERMES_SESSION_ID when the CLI runs inside an "
+                               "agent loop (gateway Bash inherits it), so the "
+                               "kanban notifier can wake the creating session "
+                               "on terminal events. NULL for plain CLI runs.")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
@@ -1410,6 +1416,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             priority=args.priority,
             parents=tuple(args.parent or ()),
             triage=bool(getattr(args, "triage", False)),
+            session_id=(getattr(args, "session", None)
+                        or os.environ.get("HERMES_SESSION_ID") or None),
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
