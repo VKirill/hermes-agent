@@ -888,6 +888,27 @@ class TelegramAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             return False
 
+    @staticmethod
+    def _normalize_chat_type(raw: Optional[str]) -> str:
+        """Map Telegram's raw ``chat.type`` to Hermes' normalized chat_type.
+
+        Mirrors ``_build_message_event`` so synthetic events built from a
+        callback query (suggestion buttons etc.) route through the SAME
+        topic->profile binding and DM-topic delivery path as a live inbound
+        message. ``_topic_profile_key`` and the DM-topic send helpers
+        (``_thread_metadata_for_source`` / ``_reply_anchor_for_event``) all
+        gate on ``chat_type == "dm"``; leaving Telegram's raw ``"private"``
+        here silently drops the profile binding (turn falls back to the
+        default profile/model) and refuses DM-topic delivery ("requires a
+        reply anchor").
+        """
+        ct = str(raw or "").split(".")[-1].lower()
+        if ct in {"group", "supergroup"}:
+            return "group"
+        if ct == "channel":
+            return "channel"
+        return "dm"
+
     @classmethod
     def _is_private_dm_topic_send(
         cls,
@@ -5377,15 +5398,45 @@ class TelegramAdapter(BasePlatformAdapter):
             if not prompt:
                 return
             from gateway.session import SessionSource
+            # Build the synthetic source EXACTLY like a live inbound reply in
+            # this topic would, so the injected turn routes to the same
+            # profile/session and delivers back into the same DM-topic lane:
+            #   * normalize chat_type ("private" -> "dm"): _topic_profile_key
+            #     and the DM-topic send helpers gate on chat_type == "dm"; the
+            #     raw "private" made the turn fall back to the default profile
+            #     and refused delivery ("requires a reply anchor").
+            #   * resolve the thread via the SAME normalizer inbound uses so
+            #     routing agrees on one value; fall back to the raw
+            #     message_thread_id for callback messages that omit
+            #     is_topic_message.
+            #   * carry the tapped suggestion message id as the reply anchor so
+            #     DM-topic delivery has a message to attach the response to.
+            norm_chat_type = self._normalize_chat_type(query_chat_type)
+            thread_id = (
+                self._effective_message_thread_id(query_message)
+                if query_message is not None
+                else None
+            )
+            if thread_id is None and query_thread_id is not None:
+                thread_id = str(query_thread_id)
+            anchor_id = None
+            if query_message is not None:
+                anchor_id = str(getattr(query_message, "message_id", "")).strip() or None
             source = SessionSource(
                 platform=Platform.TELEGRAM,
                 chat_id=str(query_chat_id),
-                chat_type=str(query_chat_type or "private"),
+                chat_type=norm_chat_type,
                 user_id=caller_id,
                 user_name=query_user_name,
-                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                thread_id=thread_id,
+                message_id=anchor_id,
             )
-            event = MessageEvent(text=prompt, source=source, internal=True)
+            event = MessageEvent(
+                text=prompt,
+                source=source,
+                internal=True,
+                message_id=anchor_id,
+            )
             await self.handle_message(event)
             return
 

@@ -95,7 +95,7 @@ class TestSendSuggestion:
         assert adapter._bot.send_message.call_args.kwargs["parse_mode"] is None
 
 
-def _make_query(data, thread_id=919312):
+def _make_query(data, thread_id=919312, is_topic_message=True, message_id=555):
     return SimpleNamespace(
         data=data,
         from_user=SimpleNamespace(id=259034221, first_name="Kirill"),
@@ -103,6 +103,8 @@ def _make_query(data, thread_id=919312):
             chat_id=259034221,
             chat=SimpleNamespace(type="private"),
             message_thread_id=thread_id,
+            is_topic_message=is_topic_message,
+            message_id=message_id,
         ),
         answer=AsyncMock(),
         edit_message_reply_markup=AsyncMock(),
@@ -128,7 +130,28 @@ class TestSuggestionCallbacks:
         assert event.internal is True
         assert "следующий шаг" in event.text
         assert event.source.thread_id == "919312"
+        # chat_type must be the normalized "dm" (not Telegram's raw "private"),
+        # otherwise topic->profile binding and DM-topic delivery both miss and
+        # the turn lands in the default profile/model and fails to deliver.
+        assert event.source.chat_type == "dm"
+        # the tapped suggestion message must be carried as the reply anchor so
+        # DM-topic delivery is not refused ("requires a reply anchor").
+        assert event.message_id == "555"
+        assert event.source.message_id == "555"
         query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
+
+    def test_do_thread_falls_back_to_raw_when_not_topic_message(self):
+        # Some callback message payloads omit is_topic_message; the raw
+        # message_thread_id must still route the turn into the topic lane.
+        adapter = _make_adapter()
+        adapter._is_callback_user_authorized = MagicMock(return_value=True)
+        adapter.handle_message = AsyncMock()
+
+        _run_callback(adapter, _make_query("sg:do", is_topic_message=False))
+
+        event = adapter.handle_message.await_args.args[0]
+        assert event.source.thread_id == "919312"
+        assert event.source.chat_type == "dm"
 
     def test_explain_injects_internal_message(self):
         adapter = _make_adapter()
