@@ -207,3 +207,76 @@ def test_openai_codex_stale_floor_tiers():
 
     assert openai_codex_stale_timeout_floor(55_000) == 900.0
     assert openai_codex_stale_timeout_floor(120_000) == 1200.0
+
+
+# ── Claude Agent SDK heartbeat (idle-based stale, not total wall-clock) ──────
+
+
+def _make_sdk_agent(tmp_path: Path):
+    """A real AIAgent flipped into Claude-Agent-SDK non-stream mode.
+
+    The SDK path leaves ``_anthropic_client`` None and drives the whole `claude`
+    CLI turn through one blocking ``_anthropic_messages_create`` call, so the
+    stale-detector must measure idle-since-last-activity, not total wall-clock.
+    """
+    agent = _make_agent(tmp_path)
+    agent.api_mode = "anthropic_messages"
+    agent._claude_agent_sdk_mode = "hybrid"
+    agent._anthropic_client = None
+    return agent
+
+
+def test_sdk_heartbeat_keeps_long_call_alive(monkeypatch, tmp_path):
+    """A long-but-live SDK turn (activity every 0.1s) must NOT be aborted even
+    though it runs far longer than the base stale window."""
+    import time
+    from agent.chat_completion_helpers import interruptible_api_call
+
+    agent = _make_sdk_agent(tmp_path)
+    monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda _k: 0.5)
+    monkeypatch.setattr(agent, "_touch_activity", lambda *a, **k: None)
+
+    sentinel = object()
+
+    def _fake_call(api_kwargs):
+        # ~1.5s ≫ 0.5s stale window, but streams activity like the adapter's
+        # per-message heartbeat.
+        for _ in range(15):
+            agent._sdk_stream_last_activity_ts = time.time()
+            time.sleep(0.1)
+        return sentinel
+
+    monkeypatch.setattr(agent, "_anthropic_messages_create", _fake_call)
+
+    out = interruptible_api_call(agent, {"model": "sonnet", "messages": []})
+    assert out is sentinel  # idle-based detector did not kill the live turn
+
+
+def test_sdk_stale_still_fires_when_wedged(monkeypatch, tmp_path):
+    """A genuinely stuck SDK turn (no activity at all) must still trip the
+    stale detector — the heartbeat relaxes the timer, it doesn't disable it."""
+    import time
+    import pytest
+    from agent.chat_completion_helpers import interruptible_api_call
+
+    agent = _make_sdk_agent(tmp_path)
+    monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda _k: 0.5)
+    monkeypatch.setattr(agent, "_touch_activity", lambda *a, **k: None)
+    monkeypatch.setattr(agent, "_buffer_status", lambda *a, **k: None)
+
+    stop = {"v": False}
+
+    def _wedged_call(api_kwargs):
+        # Never signals activity; stay alive past the detector's join so the
+        # TimeoutError sticks, then exit once the test releases us.
+        while not stop["v"]:
+            time.sleep(0.02)
+        return object()
+
+    monkeypatch.setattr(agent, "_anthropic_messages_create", _wedged_call)
+
+    try:
+        with pytest.raises(TimeoutError):
+            interruptible_api_call(agent, {"model": "sonnet", "messages": []})
+    finally:
+        stop["v"] = True

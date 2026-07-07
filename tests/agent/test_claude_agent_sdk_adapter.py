@@ -445,6 +445,59 @@ def test_missing_sdk_raises_friendly(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Stale-detector heartbeat (long-but-live SDK turns must not be aborted)
+# ---------------------------------------------------------------------------
+def test_collect_query_fires_heartbeat_per_message():
+    # The heartbeat feeds Hermes' non-stream stale-detector; it must fire on
+    # EVERY SDK message (stream deltas included) so a long-but-live turn keeps
+    # the detector's idle timer fresh instead of tripping on total wall-clock.
+    fake = _make_fake_sdk(
+        assistant_blocks=[_FakeTextBlock("done")],
+        result_kwargs={"result": "done", "session_id": "s-hb"},
+        stream_events=[
+            _FakeStreamEvent({"type": "content_block_delta",
+                              "delta": {"type": "text_delta", "text": "a"}}),
+            _FakeStreamEvent({"type": "content_block_delta",
+                              "delta": {"type": "text_delta", "text": "b"}}),
+        ],
+    )
+    beats = {"n": 0}
+
+    def _hb():
+        beats["n"] += 1
+
+    result = adp._run_async(
+        adp._collect_query(fake, "hi", _FakeOptions(), bridge=None, heartbeat=_hb)
+    )
+    assert result["text"] == "done"
+    # 2 stream events + 1 assistant + 1 result = 4 messages, plus one pre-loop
+    # beat right after query() → at least 5 refreshes.
+    assert beats["n"] >= 5
+
+
+def test_partial_messages_enabled_without_live_consumer(monkeypatch):
+    # Even with no display/TTS/tool consumer attached (headless kanban worker),
+    # partial messages must be requested so the SDK emits stream deltas — those
+    # deltas are the stale-detector heartbeat that keeps a long generation
+    # alive. Before the fix this was gated on an active bridge, so headless
+    # copywriting turns emitted nothing mid-generation and died at 90s.
+    capture = {}
+    fake = _make_fake_sdk(
+        assistant_blocks=[_FakeTextBlock("ok")],
+        result_kwargs={"result": "ok", "session_id": "s-pm"},
+        capture=capture,
+    )
+    monkeypatch.setattr(adp, "_get_claude_agent_sdk", lambda: fake)
+    agent = _agent()  # SimpleNamespace w/o stream consumers → bridge inactive
+
+    adp.create_claude_agent_message(agent, _api_kwargs())
+
+    assert capture["options"].include_partial_messages is True
+    # The turn recorded activity the stale-detector can read.
+    assert getattr(agent, "_sdk_stream_last_activity_ts", None) is not None
+
+
+# ---------------------------------------------------------------------------
 # Deepened hybrid execution, guardrails, budget, refusal mapping
 # ---------------------------------------------------------------------------
 def test_settings_budget_and_disallowed(monkeypatch):
@@ -655,8 +708,11 @@ def test_stream_events_ignored_without_consumers(monkeypatch):
 
     msg = adp.create_claude_agent_message(_agent(), _api_kwargs())
 
-    # No consumers → partial messages not requested, result still clean.
-    assert not hasattr(capture["options"], "include_partial_messages")
+    # Partial messages are always requested now (they double as the
+    # stale-detector heartbeat), but with no consumer attached the stream
+    # events are ignored for OUTPUT — never fired to callbacks, and the
+    # collected result stays clean.
+    assert capture["options"].include_partial_messages is True
     assert msg.content[-1].text == "Hi"
 
 

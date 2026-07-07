@@ -61,9 +61,10 @@ import logging
 import os
 import re
 import threading
+import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from agent.transports.hermes_tool_exposure import (
     looks_like_tool_error,
@@ -922,6 +923,7 @@ async def _collect_query(
     options,
     bridge: Optional[_StreamBridge] = None,
     interrupt_check=None,
+    heartbeat: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """Run the turn through ``ClaudeSDKClient`` and collect text, usage and
     session id.
@@ -1008,7 +1010,16 @@ async def _collect_query(
     )
     try:
         await client.query(prompt)
+        # Seed the stale-detector heartbeat: connect()/query() count as the
+        # start of activity, so the first model token gets a full idle window.
+        if heartbeat is not None:
+            heartbeat()
         async for message in client.receive_response():
+            # Any SDK message — stream delta, tool result, assistant chunk — is
+            # liveness. Refresh the heartbeat FIRST so Hermes' non-stream
+            # stale-detector measures idle-between-events, not total wall-clock.
+            if heartbeat is not None:
+                heartbeat()
             if interrupted or (interrupt_check is not None and interrupt_check()):
                 # Fast path between messages; the watcher covers mid-tool.
                 # If the watcher set the flag it already sent the native
@@ -1314,8 +1325,14 @@ def create_claude_agent_message(agent, api_kwargs: dict) -> _SDKMessage:
     # activity in real time instead of a silent wait. _build_options drops the
     # flag on older SDKs that don't know it.
     bridge = _StreamBridge(agent)
-    if bridge.active:
-        opt_kwargs["include_partial_messages"] = True
+    # Always request partial messages. Besides live progress (when a consumer
+    # is attached), the SDK stream deltas are the heartbeat that keeps Hermes'
+    # non-stream stale-detector from killing a long-but-live SDK turn: without a
+    # consumer the turn would otherwise emit no messages during a long
+    # generation and trip the base timeout. Headless kanban workers hit exactly
+    # this — a big copywriting turn died at the 90s non-stream stale cap.
+    # _build_options drops the flag on older SDKs that don't support it.
+    opt_kwargs["include_partial_messages"] = True
 
     options = _build_options(sdk, opt_kwargs)
 
@@ -1323,6 +1340,13 @@ def create_claude_agent_message(agent, api_kwargs: dict) -> _SDKMessage:
         "%sclaude_agent_sdk: mode=%s model=%s prompt_chars=%d%s",
         getattr(agent, "log_prefix", ""), mode, model, len(prompt), mcp_note,
     )
+
+    def _sdk_heartbeat() -> None:
+        # Feed Hermes' non-stream stale-detector (chat_completion_helpers): an
+        # SDK turn runs as one blocking call, so without a per-message heartbeat
+        # the detector sees zero activity and aborts a long-but-live turn at the
+        # base stale timeout (headless workers died at the 90s non-stream cap).
+        agent._sdk_stream_last_activity_ts = time.time()
 
     collected: Dict[str, Any] = {}
     for attempt in (0, 1):
@@ -1337,6 +1361,7 @@ def create_claude_agent_message(agent, api_kwargs: dict) -> _SDKMessage:
                     # interrupt by a watcher inside _collect_query, so a stop
                     # lands mid-tool instead of after the running tool call.
                     interrupt_check=lambda: bool(getattr(agent, "_interrupt_requested", False)),
+                    heartbeat=_sdk_heartbeat,
                 )
             )
         except InterruptedError:

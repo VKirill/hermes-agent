@@ -315,6 +315,19 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # apply richer recovery (credential rotation, provider fallback).
     _stale_timeout = agent._compute_non_stream_stale_timeout(api_kwargs)
 
+    # ── Claude Agent SDK heartbeat ───────────────────────────────────────
+    # SDK turns run the whole `claude` CLI turn as one blocking non-stream call,
+    # streaming progress as SDK messages. Measure idle-since-last-activity
+    # (refreshed by the adapter's message loop via ``_sdk_stream_last_activity_ts``)
+    # instead of total wall-clock, so a long-but-live turn isn't killed at the
+    # base stale timeout — the previous total-elapsed check aborted big Sonnet
+    # copywriting turns at 90s even while tokens were still streaming. Reset the
+    # marker before the worker starts so a value left by a previous call on this
+    # agent can't be misread as activity for this one.
+    _sdk_stale_heartbeat = bool(getattr(agent, "_claude_agent_sdk_mode", None))
+    if _sdk_stale_heartbeat:
+        agent._sdk_stream_last_activity_ts = None
+
     # ── Codex Responses stream watchdogs ────────────────────────────────
     # The chatgpt.com/backend-api/codex endpoint has an intermittent failure
     # mode where it accepts the connection but never emits a single stream
@@ -520,9 +533,20 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
             break
 
-        # Stale-call detector: kill the connection if no response
-        # arrives within the configured timeout.
-        if _elapsed > _stale_timeout:
+        # Stale-call detector: kill the connection if no response arrives
+        # within the configured timeout. For the Claude Agent SDK path the call
+        # is one long blocking turn that streams progress as SDK messages, so
+        # measure idle-since-last-activity instead of total wall-clock — a
+        # long-but-live turn keeps refreshing ``_sdk_stream_last_activity_ts``
+        # and must not be aborted just because the whole turn runs long.
+        if _sdk_stale_heartbeat:
+            _last_sdk_ts = getattr(agent, "_sdk_stream_last_activity_ts", None)
+            _stale_elapsed = time.time() - (
+                _last_sdk_ts if _last_sdk_ts is not None else _call_start
+            )
+        else:
+            _stale_elapsed = _elapsed
+        if _stale_elapsed > _stale_timeout:
             _est_ctx = estimate_request_context_tokens(api_kwargs)
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
@@ -534,44 +558,47 @@ def interruptible_api_call(agent, api_kwargs: dict):
             logger.warning(
                 "Non-streaming API call stale for %.0fs (threshold %.0fs). "
                 "model=%s context=~%s tokens. Killing connection.",
-                _elapsed, _stale_timeout,
+                _stale_elapsed, _stale_timeout,
                 api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
             )
             if _silent_hint:
                 agent._buffer_status(
-                    f"⚠️ No response from provider for {int(_elapsed)}s "
+                    f"⚠️ No response from provider for {int(_stale_elapsed)}s "
                     f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
                     f"{_silent_hint}"
                 )
             else:
                 agent._buffer_status(
-                    f"⚠️ No response from provider for {int(_elapsed)}s "
+                    f"⚠️ No response from provider for {int(_stale_elapsed)}s "
                     f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
                     f"Aborting call."
                 )
             try:
                 if agent.api_mode == "anthropic_messages":
-                    agent._anthropic_client.close()
+                    # SDK mode owns its own transport (the `claude` CLI) and
+                    # leaves ``_anthropic_client`` None — guard the close.
+                    if getattr(agent, "_anthropic_client", None) is not None:
+                        agent._anthropic_client.close()
                     agent._rebuild_anthropic_client()
                 else:
                     _close_request_client_once("stale_call_kill")
             except Exception:
                 pass
             agent._touch_activity(
-                f"stale non-streaming call killed after {int(_elapsed)}s"
+                f"stale non-streaming call killed after {int(_stale_elapsed)}s"
             )
             # Wait briefly for the thread to notice the closed connection.
             t.join(timeout=2.0)
             if result["error"] is None and result["response"] is None:
                 if _silent_hint:
                     result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
+                        f"Non-streaming API call timed out after {int(_stale_elapsed)}s "
                         f"with no response (threshold: {int(_stale_timeout)}s). "
                         f"{_silent_hint}"
                     )
                 else:
                     result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
+                        f"Non-streaming API call timed out after {int(_stale_elapsed)}s "
                         f"with no response (threshold: {int(_stale_timeout)}s)"
                     )
             break
