@@ -4591,3 +4591,63 @@ def test_dispatch_once_stale_disabled_when_timeout_zero(kanban_home, monkeypatch
         )
         assert res.stale == [], "stale_timeout_seconds=0 should disable detection"
         assert kb.get_task(conn, t).status == "running"
+
+
+class TestNotifySubscriptionInheritance:
+    """Children inherit parent notification subscriptions at create time."""
+
+    def test_child_inherits_parent_subscription(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import importlib
+        from hermes_cli import kanban_db as kb
+        importlib.reload(kb)
+        with kb.connect_closing() as conn:
+            parent = kb.create_task(conn, title="parent", assignee="p1")
+            kb.add_notify_sub(
+                conn, task_id=parent, platform="telegram", chat_id="259034221",
+                thread_id="921316", notifier_profile="pm_test",
+            )
+            child = kb.create_task(conn, title="child", assignee="p1",
+                                    parents=(parent,))
+            rows = conn.execute(
+                "SELECT platform, chat_id, thread_id, notifier_profile, last_event_id "
+                "FROM kanban_notify_subs WHERE task_id = ?", (child,),
+            ).fetchall()
+        assert len(rows) == 1
+        r = rows[0]
+        assert (r["platform"], r["chat_id"], r["thread_id"]) == ("telegram", "259034221", "921316")
+        assert r["notifier_profile"] == "pm_test"
+        assert r["last_event_id"] == 0
+
+    def test_multi_parent_dedup(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import importlib
+        from hermes_cli import kanban_db as kb
+        importlib.reload(kb)
+        with kb.connect_closing() as conn:
+            p1 = kb.create_task(conn, title="p1", assignee="a")
+            p2 = kb.create_task(conn, title="p2", assignee="a")
+            for p in (p1, p2):
+                kb.add_notify_sub(conn, task_id=p, platform="telegram",
+                                  chat_id="111", thread_id="222")
+            kb.add_notify_sub(conn, task_id=p2, platform="telegram",
+                              chat_id="333", thread_id="")
+            child = kb.create_task(conn, title="c", assignee="a", parents=(p1, p2))
+            rows = conn.execute(
+                "SELECT chat_id, thread_id FROM kanban_notify_subs "
+                "WHERE task_id = ? ORDER BY chat_id", (child,),
+            ).fetchall()
+        # identical (111,222) from both parents deduped; (333,'') kept
+        assert [(r["chat_id"], r["thread_id"]) for r in rows] == [("111", "222"), ("333", "")]
+
+    def test_no_parents_no_subs(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        import importlib
+        from hermes_cli import kanban_db as kb
+        importlib.reload(kb)
+        with kb.connect_closing() as conn:
+            t = kb.create_task(conn, title="solo", assignee="a")
+            rows = conn.execute(
+                "SELECT 1 FROM kanban_notify_subs WHERE task_id = ?", (t,),
+            ).fetchall()
+        assert rows == []

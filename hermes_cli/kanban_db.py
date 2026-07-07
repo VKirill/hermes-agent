@@ -2861,6 +2861,26 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                if parents:
+                    # Inherit notification subscriptions from parents: a child
+                    # task reports to the same chat/thread the parent was
+                    # subscribed to (e.g. the client's Telegram topic), so
+                    # pipeline children don't complete into silence. The
+                    # PRIMARY KEY (task_id, platform, chat_id, thread_id) +
+                    # OR IGNORE dedupes multi-parent overlaps and pre-existing
+                    # identical subs. last_event_id starts at 0 — the child
+                    # has its own event stream.
+                    placeholders = ",".join("?" * len(parents))
+                    conn.execute(
+                        f"""INSERT OR IGNORE INTO kanban_notify_subs
+                            (task_id, platform, chat_id, thread_id, user_id,
+                             notifier_profile, created_at, last_event_id)
+                            SELECT ?, platform, chat_id, thread_id, user_id,
+                                   notifier_profile, ?, 0
+                            FROM kanban_notify_subs
+                            WHERE task_id IN ({placeholders})""",
+                        (task_id, int(time.time()), *parents),
+                    )
                 _append_event(
                     conn,
                     task_id,
