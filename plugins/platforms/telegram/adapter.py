@@ -5642,8 +5642,13 @@ class TelegramAdapter(BasePlatformAdapter):
 
                     await query.answer(text="✏️ Type your answer in the chat.")
                     try:
+                        # message.text already starts with the "❓ " prefix
+                        # send_clarify rendered — don't prepend a second one.
+                        base_text = _html.escape((query.message.text or "").strip())
+                        if not base_text.startswith("❓"):
+                            base_text = f"❓ {base_text}"
                         await query.edit_message_text(
-                            text=f"❓ {query.message.text or ''}\n\n<i>Awaiting typed response from {_html.escape(user_display)}…</i>",
+                            text=f"{base_text}\n\n<i>Awaiting typed response from {_html.escape(user_display)}…</i>",
                             parse_mode=ParseMode.HTML,
                             reply_markup=None,
                         )
