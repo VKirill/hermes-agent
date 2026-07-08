@@ -1804,6 +1804,53 @@ def _truncate_content(
     return head + marker + tail
 
 
+def _base_hermes_home() -> Path:
+    """Return the base (non-profile) HERMES_HOME.
+
+    Under a profile, ``get_hermes_home()`` resolves to ``<base>/profiles/<name>``;
+    shared persona bases live under the base home, not the profile.
+    """
+    home = get_hermes_home()
+    try:
+        if home.parent.name == "profiles":
+            return home.parent.parent
+    except Exception:
+        pass
+    return home
+
+
+def _apply_soul_inheritance(content: str) -> str:
+    """Opt-in persona inheritance for SOUL.md.
+
+    A profile SOUL that declares ``@inherit: <name>`` (optionally wrapped in an
+    HTML comment) is composed as ``<base>/personas/<name>.md`` + the profile
+    overlay, so the common PM playbook lives in one shared file and each client
+    SOUL is a thin overlay. Profiles without the directive are returned
+    unchanged, so default behavior is fully preserved.
+    """
+    import re
+    m = re.search(
+        r"(?m)^[ \t]*(?:<!--[ \t]*)?@inherit:[ \t]*([A-Za-z0-9_.\-]+)[ \t]*(?:-->)?[ \t]*$",
+        content,
+    )
+    if not m:
+        return content
+    base_name = m.group(1)
+    try:
+        base_path = _base_hermes_home() / "personas" / f"{base_name}.md"
+        if not base_path.is_file():
+            logger.debug("SOUL @inherit: base persona not found: %s", base_path)
+            return content
+        base = base_path.read_text(encoding="utf-8").strip()
+        overlay = (content[: m.start()] + content[m.end():]).strip()
+        if not base:
+            return overlay or content
+        return f"{base}\n\n---\n\n{overlay}" if overlay else base
+    except Exception as e:
+        logger.debug("SOUL inheritance (@inherit: %s) failed: %s", base_name, e)
+        return content
+
+
 def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
     """Load SOUL.md from HERMES_HOME and return its content, or None.
 
@@ -1824,6 +1871,7 @@ def load_soul_md(context_length: Optional[int] = None) -> Optional[str]:
         content = soul_path.read_text(encoding="utf-8").strip()
         if not content:
             return None
+        content = _apply_soul_inheritance(content)
         content = _scan_context_content(content, "SOUL.md")
         content = _truncate_content(
             content, "SOUL.md", context_length=context_length,

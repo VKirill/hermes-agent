@@ -42,12 +42,154 @@ import logging
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
+
+import yaml
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import profiles as profiles_mod
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
+
+
+def _routing_dir() -> Path:
+    return get_hermes_home() / "routing"
+
+
+def _routing_table_for_board(board_name: str) -> dict | None:
+    """Load the deterministic (skill -> profile) routing table for a board.
+
+    Tables live at ``<HERMES_HOME>/routing/*.yaml``; each declares its own
+    ``board:`` key so any file whose board matches is used regardless of
+    filename. Missing directory, missing file, or a parse error all yield
+    ``None`` — decompose_task falls straight back to LLM/config routing,
+    exactly as if no table existed. This is deliberately re-read (not
+    process-cached) so editing the table takes effect on the next decompose
+    without a restart; the file is tiny and decompose already makes a
+    network round-trip, so the extra disk read is noise.
+    """
+    board_name = (board_name or "").strip()
+    if not board_name:
+        return None
+    directory = _routing_dir()
+    if not directory.is_dir():
+        return None
+    try:
+        for path in sorted(directory.glob("*.yaml")):
+            try:
+                data = yaml.safe_load(path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                logger.debug("decompose: failed to parse routing table %s: %s", path, exc)
+                continue
+            if isinstance(data, dict) and (data.get("board") or "").strip() == board_name:
+                return data
+    except Exception as exc:
+        logger.debug("decompose: routing table scan failed: %s", exc)
+    return None
+
+
+def _deterministic_route(
+    board_name: str,
+    skill: object,
+    fallback_assignee: str,
+    valid_names: set[str],
+    deprecated_assignees: set[str],
+) -> tuple[str, str]:
+    """Override an LLM-picked assignee with the board's routing table, if any.
+
+    Precedence when a table exists for this board: explicit ``by_skill[skill]``
+    entry > table's own ``default`` > whatever the LLM/global config already
+    chose (``fallback_assignee``). A mapped profile that doesn't exist or is
+    deprecated is ignored (never route to a ghost profile) and resolution
+    falls through to the next tier. No table for this board, or no skill on
+    this task, leaves ``fallback_assignee`` untouched — this only *narrows*
+    routing for boards that opted in, it never breaks boards without a table.
+
+    Returns ``(assignee, tier)`` where ``tier`` is one of ``table_skill``,
+    ``table_default``, or ``fallback`` — for routing-decision observability
+    (see ``_log_routing_decision``), not used for control flow.
+    """
+    table = _routing_table_for_board(board_name)
+    if not table:
+        return fallback_assignee, "fallback"
+    by_skill = table.get("by_skill") if isinstance(table.get("by_skill"), dict) else {}
+    skill_key = skill.strip() if isinstance(skill, str) else ""
+    if skill_key:
+        mapped = by_skill.get(skill_key)
+        if isinstance(mapped, str) and mapped.strip():
+            mapped = mapped.strip()
+            if mapped in valid_names and mapped not in deprecated_assignees:
+                return mapped, "table_skill"
+            logger.info(
+                "decompose: routing table maps skill %r -> %r but that profile "
+                "is missing/deprecated — falling through", skill_key, mapped,
+            )
+    default = table.get("default")
+    if isinstance(default, str) and default.strip():
+        default = default.strip()
+        if default in valid_names and default not in deprecated_assignees:
+            return default, "table_default"
+    return fallback_assignee, "fallback"
+
+
+def _routing_log_path() -> Path:
+    return get_hermes_home() / "kanban" / "routing-decisions.log"
+
+
+def _log_routing_decision(
+    *,
+    task_id: str,
+    board: str,
+    skill: object,
+    llm_assignee_raw: object,
+    tier: str,
+    final_assignee: str,
+) -> None:
+    """Append one JSONL record of a routing decision for dashboard observability.
+
+    Best-effort only: any failure (missing dir, disk full, permissions) is
+    swallowed — this is an observability side-channel, never allowed to
+    affect task routing or fail a decompose call. Rotates by truncating to
+    the last ``_ROUTING_LOG_MAX_LINES`` once it grows past ~2x that, so the
+    file doesn't grow unbounded on a long-lived install.
+    """
+    try:
+        import time
+
+        path = _routing_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": time.time(),
+            "task_id": task_id,
+            "board": board,
+            "skill": skill if isinstance(skill, str) else None,
+            "llm_assignee_raw": llm_assignee_raw if isinstance(llm_assignee_raw, str) else None,
+            "tier": tier,
+            "final_assignee": final_assignee,
+        }
+        line = json.dumps(record, ensure_ascii=False)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        _maybe_rotate_routing_log(path)
+    except Exception as exc:
+        logger.debug("decompose: routing-decision log write failed: %s", exc)
+
+
+_ROUTING_LOG_MAX_LINES = 2000
+
+
+def _maybe_rotate_routing_log(path: Path) -> None:
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) <= _ROUTING_LOG_MAX_LINES * 2:
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines[-_ROUTING_LOG_MAX_LINES:])
+    except Exception as exc:
+        logger.debug("decompose: routing-decision log rotate failed: %s", exc)
 
 
 # Legacy development profile names that must not receive new kanban work.
@@ -86,6 +228,7 @@ Output a single JSON object with this exact shape:
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
+        "skill": "<short skill/capability slug this task needs, e.g. 'direct-ads-copy', 'seo-copywriting', 'ga4-data-api', or null if none is obvious>",
         "parents": [<int>, ...]
       },
       ...
@@ -103,6 +246,10 @@ Rules:
   - Pick assignees from the roster by matching the task to the profile's
     DESCRIPTION (not just the name). When nothing matches well, use null
     and the system will route to the default_assignee.
+  - "skill" is your best guess at the named capability/skill this task
+    exercises (a short kebab-case slug), independent of "assignee". Some
+    boards use it to deterministically override routing — get it right even
+    if you're unsure of the exact assignee. Use null if nothing fits.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
 
@@ -114,7 +261,8 @@ return:
     "rationale": "<one sentence>",
     "title": "<tightened title>",
     "body":  "<concrete spec for a single worker>",
-    "assignee": "<profile name from the roster, or null for default>"
+    "assignee": "<profile name from the roster, or null for default>",
+    "skill": "<short skill/capability slug this task needs, or null>"
   }
 
 In that case the task stays as one work item, just with a tightened spec and
@@ -239,19 +387,25 @@ def _resolve_orchestrator_profile(
     cfg: dict,
     deprecated_assignees: set[str] | None = None,
     board_override: str | None = None,
+    routing_orchestrator: str | None = None,
 ) -> str:
     """Resolve which profile owns the root/orchestration task after fan-out.
 
-    Precedence: per-board ``board.json`` override → global
+    Precedence: per-board ``board.json`` override → this board's deterministic
+    routing table (``routing/*.yaml``'s ``orchestrator:`` key, if any) → global
     ``kanban.orchestrator_profile`` → the active default profile (so a task
     is never stranded for lack of an orchestrator). The per-board override
     lets a dev board be led by a dev profile while the marketing board keeps
-    its own lead.
+    its own lead; the routing table sits one tier below it so a manual
+    ``board.json`` edit still wins if someone sets one.
     """
     deprecated_assignees = deprecated_assignees or set()
     board_override = (board_override or "").strip()
     if board_override and _profile_exists_and_not_deprecated(board_override, deprecated_assignees):
         return board_override
+    routing_orchestrator = (routing_orchestrator or "").strip()
+    if routing_orchestrator and _profile_exists_and_not_deprecated(routing_orchestrator, deprecated_assignees):
+        return routing_orchestrator
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get("orchestrator_profile") or "").strip()
     if explicit and _profile_exists_and_not_deprecated(explicit, deprecated_assignees):
@@ -391,9 +545,12 @@ def decompose_task(
     cfg = _load_config()
     deprecated_assignees = _deprecated_assignees_from_config(cfg)
     board_meta = _current_board_metadata()
+    board_name = kb.get_current_board()
+    routing_table = _routing_table_for_board(board_name)
     orchestrator = _resolve_orchestrator_profile(
         cfg, deprecated_assignees,
         (board_meta.get("orchestrator_profile") or "").strip(),
+        (routing_table or {}).get("orchestrator"),
     )
     default_assignee = _resolve_default_assignee(
         cfg, deprecated_assignees,
@@ -472,6 +629,15 @@ def decompose_task(
                 default_assignee=default_assignee,
                 valid_names=valid_names,
             )
+            assignee_val, _tier = _deterministic_route(
+                board_name, parsed.get("skill"), assignee_val,
+                valid_names, deprecated_assignees,
+            )
+            _log_routing_decision(
+                task_id=task_id, board=board_name, skill=parsed.get("skill"),
+                llm_assignee_raw=parsed.get("assignee"), tier=_tier,
+                final_assignee=assignee_val,
+            )
         if title_val is None and body_val is None:
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
@@ -532,6 +698,13 @@ def decompose_task(
                 "routing to default_assignee %r",
                 task_id, idx, assignee, default_assignee,
             )
+        chosen, _tier = _deterministic_route(
+            board_name, entry.get("skill"), chosen, valid_names, deprecated_assignees,
+        )
+        _log_routing_decision(
+            task_id=f"{task_id}#{idx}", board=board_name, skill=entry.get("skill"),
+            llm_assignee_raw=assignee, tier=_tier, final_assignee=chosen,
+        )
         parents = entry.get("parents") or []
         if not isinstance(parents, list):
             parents = []

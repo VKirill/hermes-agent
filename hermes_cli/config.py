@@ -93,6 +93,62 @@ def _backup_corrupt_config(config_path: Path) -> Optional[Path]:
         return None
 
 
+def _last_good_config_path(config_path: Path) -> Path:
+    """Sidecar holding the most recent successfully-parsed ``config.yaml``."""
+    return config_path.with_name(f"{config_path.name}.lastgood")
+
+
+def _snapshot_last_good_config(config_path: Path) -> None:
+    """Atomically snapshot ``config.yaml`` as last-known-good after a clean parse.
+
+    Best-effort and idempotent: only rewrites the snapshot when the live file
+    actually changed (size or newer mtime), so steady-state loads don't churn
+    disk. Uses temp→``os.replace`` so a snapshot is never itself torn. Symlinks
+    are not followed (mirrors ``_backup_corrupt_config``).
+    """
+    tmp = None
+    try:
+        if config_path.is_symlink() or not config_path.is_file():
+            return
+        lg = _last_good_config_path(config_path)
+        try:
+            src = config_path.stat()
+            if lg.exists():
+                dst = lg.stat()
+                if src.st_size == dst.st_size and int(src.st_mtime) <= int(dst.st_mtime):
+                    return
+        except OSError:
+            pass
+        tmp = lg.with_name(f"{lg.name}.tmp.{os.getpid()}")
+        shutil.copy2(config_path, tmp)
+        os.replace(tmp, lg)
+    except Exception:
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+def _load_last_good_raw(config_path: Path) -> Optional[Dict[str, Any]]:
+    """Return the parsed last-known-good config dict, or ``None`` if unusable.
+
+    Recovery source when ``config.yaml`` fails to parse: rather than silently
+    dropping every user override onto ``DEFAULT_CONFIG`` (which strands the bot
+    on the base model with no aux providers and can drive a corrupt→default→
+    restart loop), the loader reuses the last config that parsed cleanly.
+    """
+    try:
+        lg = _last_good_config_path(config_path)
+        if not lg.is_file():
+            return None
+        with open(lg, encoding="utf-8") as f:
+            data = fast_safe_load(f) or {}
+        return data if isinstance(data, dict) and data else None
+    except Exception:
+        return None
+
+
 def _warn_config_parse_failure(config_path: Path, exc: Exception) -> None:
     """Surface a config.yaml parse failure to user, log, and stderr.
 
@@ -6605,10 +6661,18 @@ def read_raw_config() -> Dict[str, Any]:
                 data = fast_safe_load(f) or {}
         except Exception as e:
             _warn_config_parse_failure(config_path, e)
+            last_good = _load_last_good_raw(config_path)
+            if last_good is not None:
+                logger.warning(
+                    "config: reusing last-known-good config.yaml (live file is "
+                    "unparseable) — user overrides preserved until the YAML is fixed."
+                )
+                return copy.deepcopy(last_good)
             return {}
 
         if not isinstance(data, dict):
             data = {}
+        _snapshot_last_good_config(config_path)
         _RAW_CONFIG_CACHE[path_key] = (cache_key[0], cache_key[1], copy.deepcopy(data))
         return data
 
@@ -6885,8 +6949,25 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
                     user_config.pop("max_turns", None)
 
                 config = _deep_merge(config, user_config)
+                _snapshot_last_good_config(config_path)
             except Exception as e:
                 _warn_config_parse_failure(config_path, e)
+                # Recover to the last config that parsed cleanly instead of
+                # stranding the bot on DEFAULT_CONFIG (base model, no aux
+                # providers) — the root of the corrupt→default→restart loop.
+                last_good = _load_last_good_raw(config_path)
+                if last_good is not None:
+                    logger.warning(
+                        "config: reusing last-known-good config.yaml (live file is "
+                        "unparseable) — user overrides preserved until the YAML is fixed."
+                    )
+                    if "max_turns" in last_good:
+                        agent_lg = dict(last_good.get("agent") or {})
+                        if agent_lg.get("max_turns") is None:
+                            agent_lg["max_turns"] = last_good["max_turns"]
+                        last_good["agent"] = agent_lg
+                        last_good.pop("max_turns", None)
+                    config = _deep_merge(config, last_good)
 
         normalized = _normalize_root_model_keys(_normalize_max_turns_config(config))
         expanded = _expand_env_vars(normalized)
