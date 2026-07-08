@@ -96,7 +96,7 @@ def _deterministic_route(
     fallback_assignee: str,
     valid_names: set[str],
     deprecated_assignees: set[str],
-) -> str:
+) -> tuple[str, str]:
     """Override an LLM-picked assignee with the board's routing table, if any.
 
     Precedence when a table exists for this board: explicit ``by_skill[skill]``
@@ -106,10 +106,14 @@ def _deterministic_route(
     falls through to the next tier. No table for this board, or no skill on
     this task, leaves ``fallback_assignee`` untouched — this only *narrows*
     routing for boards that opted in, it never breaks boards without a table.
+
+    Returns ``(assignee, tier)`` where ``tier`` is one of ``table_skill``,
+    ``table_default``, or ``fallback`` — for routing-decision observability
+    (see ``_log_routing_decision``), not used for control flow.
     """
     table = _routing_table_for_board(board_name)
     if not table:
-        return fallback_assignee
+        return fallback_assignee, "fallback"
     by_skill = table.get("by_skill") if isinstance(table.get("by_skill"), dict) else {}
     skill_key = skill.strip() if isinstance(skill, str) else ""
     if skill_key:
@@ -117,7 +121,7 @@ def _deterministic_route(
         if isinstance(mapped, str) and mapped.strip():
             mapped = mapped.strip()
             if mapped in valid_names and mapped not in deprecated_assignees:
-                return mapped
+                return mapped, "table_skill"
             logger.info(
                 "decompose: routing table maps skill %r -> %r but that profile "
                 "is missing/deprecated — falling through", skill_key, mapped,
@@ -126,8 +130,66 @@ def _deterministic_route(
     if isinstance(default, str) and default.strip():
         default = default.strip()
         if default in valid_names and default not in deprecated_assignees:
-            return default
-    return fallback_assignee
+            return default, "table_default"
+    return fallback_assignee, "fallback"
+
+
+def _routing_log_path() -> Path:
+    return get_hermes_home() / "kanban" / "routing-decisions.log"
+
+
+def _log_routing_decision(
+    *,
+    task_id: str,
+    board: str,
+    skill: object,
+    llm_assignee_raw: object,
+    tier: str,
+    final_assignee: str,
+) -> None:
+    """Append one JSONL record of a routing decision for dashboard observability.
+
+    Best-effort only: any failure (missing dir, disk full, permissions) is
+    swallowed — this is an observability side-channel, never allowed to
+    affect task routing or fail a decompose call. Rotates by truncating to
+    the last ``_ROUTING_LOG_MAX_LINES`` once it grows past ~2x that, so the
+    file doesn't grow unbounded on a long-lived install.
+    """
+    try:
+        import time
+
+        path = _routing_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        record = {
+            "ts": time.time(),
+            "task_id": task_id,
+            "board": board,
+            "skill": skill if isinstance(skill, str) else None,
+            "llm_assignee_raw": llm_assignee_raw if isinstance(llm_assignee_raw, str) else None,
+            "tier": tier,
+            "final_assignee": final_assignee,
+        }
+        line = json.dumps(record, ensure_ascii=False)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        _maybe_rotate_routing_log(path)
+    except Exception as exc:
+        logger.debug("decompose: routing-decision log write failed: %s", exc)
+
+
+_ROUTING_LOG_MAX_LINES = 2000
+
+
+def _maybe_rotate_routing_log(path: Path) -> None:
+    try:
+        with open(path, encoding="utf-8") as f:
+            lines = f.readlines()
+        if len(lines) <= _ROUTING_LOG_MAX_LINES * 2:
+            return
+        with open(path, "w", encoding="utf-8") as f:
+            f.writelines(lines[-_ROUTING_LOG_MAX_LINES:])
+    except Exception as exc:
+        logger.debug("decompose: routing-decision log rotate failed: %s", exc)
 
 
 # Legacy development profile names that must not receive new kanban work.
@@ -567,9 +629,14 @@ def decompose_task(
                 default_assignee=default_assignee,
                 valid_names=valid_names,
             )
-            assignee_val = _deterministic_route(
+            assignee_val, _tier = _deterministic_route(
                 board_name, parsed.get("skill"), assignee_val,
                 valid_names, deprecated_assignees,
+            )
+            _log_routing_decision(
+                task_id=task_id, board=board_name, skill=parsed.get("skill"),
+                llm_assignee_raw=parsed.get("assignee"), tier=_tier,
+                final_assignee=assignee_val,
             )
         if title_val is None and body_val is None:
             return DecomposeOutcome(
@@ -631,8 +698,12 @@ def decompose_task(
                 "routing to default_assignee %r",
                 task_id, idx, assignee, default_assignee,
             )
-        chosen = _deterministic_route(
+        chosen, _tier = _deterministic_route(
             board_name, entry.get("skill"), chosen, valid_names, deprecated_assignees,
+        )
+        _log_routing_decision(
+            task_id=f"{task_id}#{idx}", board=board_name, skill=entry.get("skill"),
+            llm_assignee_raw=assignee, tier=_tier, final_assignee=chosen,
         )
         parents = entry.get("parents") or []
         if not isinstance(parents, list):
