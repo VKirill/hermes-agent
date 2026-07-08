@@ -176,6 +176,11 @@ gateway:
   profile:
     header:                "👤 **Profil:** `{profile}`"
     home:                  "📂 **Kezdőkönyvtár:** `{home}`"
+    pinned:                "✅ Pinned this topic to profile `{profile}`."
+    cleared:               "Cleared the topic profile binding. Now using the global active profile `{profile}`."
+    unknown:               "Unknown profile `{profile}`. Available profiles: {available}."
+    available_tap:         "Available profiles (tap to switch):"
+    clear_hint:            "To clear the binding: `/profile default`"
 
   reasoning:
     level_default:             "medium (alapértelmezett)"

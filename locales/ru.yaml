@@ -176,6 +176,11 @@ gateway:
   profile:
     header:                "👤 **Профиль:** `{profile}`"
     home:                  "📂 **Домашний каталог:** `{home}`"
+    pinned:                "✅ За топиком закреплен профиль `{profile}`."
+    cleared:               "Привязка профиля для топика сброшена. Сейчас используется глобальный активный профиль `{profile}`."
+    unknown:               "Профиль `{profile}` не найден. Доступные профили: {available}."
+    available_tap:         "Доступные профили (нажмите, чтобы переключиться):"
+    clear_hint:            "Чтобы снять привязку: `/profile default`"
 
   reasoning:
     level_default:             "medium (по умолчанию)"

@@ -92,9 +92,12 @@ class TestFilterMCPChildren:
 # ---------------------------------------------------------------------------
 
 class TestLoadMCPConfig:
+    # _load_mcp_config() reads via hermes_cli.config.read_raw_config (not
+    # load_config) — patch that so these tests actually exercise the mocked
+    # data instead of silently falling through to the real config file.
     def test_no_config_returns_empty(self):
         """No mcp_servers key in config -> empty dict."""
-        with patch("hermes_cli.config.load_config", return_value={"model": "test"}):
+        with patch("hermes_cli.config.read_raw_config", return_value={"model": "test"}):
             from tools.mcp_tool import _load_mcp_config
             result = _load_mcp_config()
             assert result == {}
@@ -108,7 +111,7 @@ class TestLoadMCPConfig:
                 "env": {},
             }
         }
-        with patch("hermes_cli.config.load_config", return_value={"mcp_servers": servers}):
+        with patch("hermes_cli.config.read_raw_config", return_value={"mcp_servers": servers}):
             from tools.mcp_tool import _load_mcp_config
             result = _load_mcp_config()
             assert "filesystem" in result
@@ -116,7 +119,7 @@ class TestLoadMCPConfig:
 
     def test_mcp_servers_not_dict_returns_empty(self):
         """mcp_servers set to non-dict value -> empty dict."""
-        with patch("hermes_cli.config.load_config", return_value={"mcp_servers": "invalid"}):
+        with patch("hermes_cli.config.read_raw_config", return_value={"mcp_servers": "invalid"}):
             from tools.mcp_tool import _load_mcp_config
             result = _load_mcp_config()
             assert result == {}
@@ -806,6 +809,13 @@ class TestToolHandler:
             _servers.pop("test_srv", None)
 
     def test_recycled_stdio_server_reconnects_lazily_on_tool_call(self):
+        # Reconnect-on-call now goes through _wait_for_server_session_ready
+        # (a poll loop for srv.session becoming non-None/ready), not the
+        # older _request_lazy_reconnect trigger — #26892 moved to waiting
+        # for the transport's own async session swap instead of driving it
+        # synchronously from the tool-call handler. This test's intent
+        # (recycled server transparently gets a session before the call)
+        # is unchanged; only the mechanism being faked is updated.
         from tools.mcp_tool import _make_tool_handler, _servers
 
         mock_session = MagicMock()
@@ -817,8 +827,7 @@ class TestToolHandler:
         server._recycled_reason = "idle_timeout_seconds"
         _servers["test_srv"] = server
 
-        def fake_lazy_reconnect(server_name, srv):
-            assert server_name == "test_srv"
+        def fake_wait_for_session_ready(srv, **kwargs):
             assert srv is server
             srv.session = mock_session
             srv._recycled_reason = None
@@ -826,7 +835,7 @@ class TestToolHandler:
 
         try:
             handler = _make_tool_handler("test_srv", "greet", 120)
-            with patch("tools.mcp_tool._request_lazy_reconnect", side_effect=fake_lazy_reconnect) as reconnect, \
+            with patch("tools.mcp_tool._wait_for_server_session_ready", side_effect=fake_wait_for_session_ready) as reconnect, \
                  self._patch_mcp_loop():
                 result = json.loads(handler({"name": "world"}))
             assert result["result"] == "reconnected"
@@ -975,7 +984,14 @@ class TestDiscoverAndRegister:
             server._tools = mock_tools
             return server
 
+        # Fingerprint isolation (our MCP profile-isolation feature) folds a
+        # config-content hash into the toolset name (mcp-<fp>, fp = "name:hash")
+        # so a reconfigured server doesn't collide with its own stale toolset.
+        # Pin the fingerprint to the bare server name here so this test's
+        # toolset-name assertions stay readable — the isolation mechanism
+        # itself is covered by its own dedicated tests.
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
+             patch("tools.mcp_tool._get_mcp_config_fingerprint", side_effect=lambda name, cfg: name), \
              patch("tools.registry.registry", mock_registry):
             asyncio.run(
                 _discover_and_register_server("myserver", {"command": "test"})
@@ -1003,7 +1019,10 @@ class TestDiscoverAndRegister:
             server._tools = mock_tools
             return server
 
+        # See test_toolset_resolves_live_from_registry above: pin the
+        # fingerprint to the bare name so toolset-name assertions stay simple.
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
+             patch("tools.mcp_tool._get_mcp_config_fingerprint", side_effect=lambda name, cfg: name), \
              patch("tools.registry.registry", mock_registry):
             asyncio.run(
                 _discover_and_register_server("srv", {"command": "test"})
@@ -1313,10 +1332,13 @@ class TestToolsetInjection:
 
         fake_config = {"fs": {"command": "npx", "args": []}}
 
+        # Pin the fingerprint to the bare name (see test_schema_format_correct)
+        # so toolset-name assertions below stay simple.
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
              patch("tools.mcp_tool._servers", fresh_servers), \
              patch("tools.mcp_tool._load_mcp_config", return_value=fake_config), \
              patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
+             patch("tools.mcp_tool._get_mcp_config_fingerprint", side_effect=lambda name, cfg: name), \
              patch("tools.registry.registry", mock_registry):
             from tools.mcp_tool import discover_mcp_tools
             result = discover_mcp_tools()
@@ -1351,10 +1373,13 @@ class TestToolsetInjection:
         }
         fake_config = {"terminal": {"command": "npx", "args": []}}
 
+        # Pin the fingerprint to the bare name (see test_schema_format_correct)
+        # so toolset-name assertions below stay simple.
         with patch("tools.mcp_tool._MCP_AVAILABLE", True), \
              patch("tools.mcp_tool._servers", fresh_servers), \
              patch("tools.mcp_tool._load_mcp_config", return_value=fake_config), \
              patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
+             patch("tools.mcp_tool._get_mcp_config_fingerprint", side_effect=lambda name, cfg: name), \
              patch("tools.registry.registry", mock_registry), \
              patch("toolsets.TOOLSETS", fake_toolsets):
             from tools.mcp_tool import discover_mcp_tools
@@ -2642,7 +2667,10 @@ class TestUtilityToolRegistration:
             server._tools = []
             return server
 
+        # Pin the fingerprint to the bare name (see test_schema_format_correct)
+        # so the toolset-name assertions below stay simple.
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
+             patch("tools.mcp_tool._get_mcp_config_fingerprint", side_effect=lambda name, cfg: name), \
              patch("tools.registry.registry", mock_registry):
             asyncio.run(
                 _discover_and_register_server("myserv", {"command": "test"})
@@ -2671,7 +2699,11 @@ class TestUtilityToolRegistration:
             server._tools = []
             return server
 
+        # Pin the fingerprint to the bare name (see test_schema_format_correct)
+        # so `_servers["chk"]` below addresses the right entry — _servers is
+        # keyed by fingerprint, which defaults to "<name>:<hash>" otherwise.
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
+             patch("tools.mcp_tool._get_mcp_config_fingerprint", side_effect=lambda name, cfg: name), \
              patch("tools.registry.registry", mock_registry):
             asyncio.run(
                 _discover_and_register_server("chk", {"command": "test"})
@@ -4030,7 +4062,10 @@ class TestMCPBuiltinCollisionGuard:
             server._tools = mock_tools
             return server
 
+        # Pin the fingerprint to the bare name (see test_schema_format_correct)
+        # so the toolset-name assertion below stays simple.
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
+             patch("tools.mcp_tool._get_mcp_config_fingerprint", side_effect=lambda name, cfg: name), \
              patch("tools.registry.registry", mock_registry):
             registered = asyncio.run(
                 _discover_and_register_server("minimax", {"command": "test", "args": []})
@@ -4068,7 +4103,10 @@ class TestMCPBuiltinCollisionGuard:
             server._tools = mock_tools
             return server
 
+        # Pin the fingerprint to the bare name (see test_schema_format_correct)
+        # so the toolset-name assertion below stays simple.
         with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
+             patch("tools.mcp_tool._get_mcp_config_fingerprint", side_effect=lambda name, cfg: name), \
              patch("tools.registry.registry", mock_registry):
             registered = asyncio.run(
                 _discover_and_register_server("srv", {"command": "test", "args": []})

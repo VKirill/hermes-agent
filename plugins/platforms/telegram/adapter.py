@@ -2780,19 +2780,25 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id: int,
         thread_id: int,
         name: str,
+        icon_custom_emoji_id: Optional[str] = None,
     ) -> None:
-        """Rename a forum topic in a private (DM) chat."""
+        """Rename a forum topic in a private (DM) chat.
+
+        ``icon_custom_emoji_id`` is forwarded to Telegram's ``edit_forum_topic``
+        only when explicitly set — omitting the field (rather than sending an
+        empty/None value) is what tells the Bot API to leave the topic's
+        current icon untouched, so a plain rename never resets it.
+        """
         if not self._bot:
             return
         try:
             chat_id_arg = int(chat_id)
         except (TypeError, ValueError):
             chat_id_arg = chat_id
-        await self._bot.edit_forum_topic(
-            chat_id=chat_id_arg,
-            message_thread_id=int(thread_id),
-            name=name,
-        )
+        kwargs = {"chat_id": chat_id_arg, "message_thread_id": int(thread_id), "name": name}
+        if icon_custom_emoji_id is not None:
+            kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
+        await self._bot.edit_forum_topic(**kwargs)
         logger.info(
             "[%s] Renamed DM topic in chat %s thread_id=%s -> '%s'",
             self.name, chat_id, thread_id, name,
@@ -3607,6 +3613,83 @@ class TelegramAdapter(BasePlatformAdapter):
         else:  # "first" (default)
             return chunk_index == 0
 
+    def _apply_system_topic_redirect(
+        self,
+        chat_id: str,
+        content: str,
+        metadata: Optional[Dict[str, Any]],
+    ) -> tuple[str, Optional[Dict[str, Any]]]:
+        """Redirect non-agent DM-topic system/status pings to the ``System`` topic.
+
+        Hermes-managed DM topic lanes fan a session out across per-purpose
+        Telegram forum topics (Development, System, ...). Agent conversational
+        replies stay in their originating topic, but internal/status pings
+        (kanban notifications, lifecycle updates, errors — anything without
+        ``is_agent``) are centralized into the chat's ``System`` topic instead
+        of scattering across every DM topic, so operators have one place to
+        watch. The content is prefixed with the origin topic's name (e.g.
+        ``📍 *[Development]*``) so a centralized message still says what it's
+        about; the reply anchor is dropped since it belongs to the origin
+        topic's message, not System's.
+
+        No-ops (returns content/metadata unchanged) when: not a DM-topic-
+        fallback send, the chat has no registered System topic, the send is
+        already targeting System, or the current thread can't be resolved to
+        a known topic name. Also no-ops for genuine agent-to-user output:
+        a final/notified reply (``notify``) is never redirected regardless of
+        other flags, and a plain agent reply (``is_agent`` without
+        ``is_commentary``) stays put — but agent *commentary* (tool-use
+        narration, ``is_agent`` + ``is_commentary``) is treated as system
+        noise and still redirected, same as a plain status/error ping.
+        """
+        if not metadata or not metadata.get("telegram_dm_topic_reply_fallback"):
+            return content, metadata
+        if metadata.get("notify"):
+            return content, metadata
+        if metadata.get("is_agent") and not metadata.get("is_commentary"):
+            return content, metadata
+
+        dm_topics = getattr(self, "_dm_topics", None) or {}
+        system_thread_id = dm_topics.get(f"{chat_id}:System")
+        if system_thread_id is None:
+            return content, metadata
+
+        current_thread_id = self._metadata_thread_id(metadata)
+        try:
+            already_system = current_thread_id is not None and int(current_thread_id) == int(system_thread_id)
+        except (TypeError, ValueError):
+            already_system = False
+        if already_system:
+            return content, metadata
+
+        origin_name = None
+        prefix = f"{chat_id}:"
+        for key, tid in dm_topics.items():
+            if not key.startswith(prefix) or current_thread_id is None:
+                continue
+            try:
+                if int(tid) == int(current_thread_id):
+                    origin_name = key[len(prefix):]
+                    break
+            except (TypeError, ValueError):
+                continue
+        if origin_name is None:
+            return content, metadata
+
+        redirected_metadata = dict(metadata)
+        redirected_metadata["thread_id"] = str(system_thread_id)
+        redirected_metadata.pop("telegram_reply_to_message_id", None)
+        # The dropped anchor belonged to the origin topic's message, not
+        # System's — this redirect is anchor-less BY DEFINITION, same as the
+        # kanban notifier/other non-session system pings; opt in explicitly
+        # so the fail-loud "DM topic delivery requires a reply anchor"
+        # contract doesn't refuse the send.
+        redirected_metadata["telegram_dm_topic_anchorless_ok"] = True
+        # Double-asterisk (GFM bold) — format_message() renders a single `*`
+        # as MarkdownV2 italic (`_..._`); the desired MarkdownV2 output is
+        # bold (`*..*`), which comes from GFM `**..**` input.
+        return f"📍 **[{origin_name}]**\n{content}", redirected_metadata
+
     async def send(
         self,
         chat_id: str,
@@ -3625,7 +3708,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-        
+
+        content, metadata = self._apply_system_topic_redirect(chat_id, content, metadata)
+
         try:
             # Bot API 10.1 rich fast-path: send the raw agent markdown via
             # sendRichMessage so tables/task lists/etc. render natively. Falls

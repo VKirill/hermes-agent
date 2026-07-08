@@ -1609,13 +1609,20 @@ def test_session_key_for_source_honors_profile_override(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_handle_profile_command_switches_profile(tmp_path):
+async def test_handle_profile_command_switches_profile(tmp_path, monkeypatch):
     """Verify that /profile <name> updates and /profile default clears the override."""
     from gateway.slash_commands import GatewaySlashCommandsMixin
     from gateway.platforms.base import MessageEvent
     from gateway.session import SessionSource
     from gateway.config import Platform
     from unittest.mock import patch, MagicMock
+
+    # This Hermes install's bot-facing UI is Russian (see locales/ru.yaml);
+    # force it explicitly rather than relying on the process default so the
+    # test doesn't depend on ambient config/env state.
+    monkeypatch.setenv("HERMES_LANGUAGE", "ru")
+    from agent.i18n import reset_language_cache
+    reset_language_cache()
 
     class TestSlashCommands(GatewaySlashCommandsMixin):
         def __init__(self):

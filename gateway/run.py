@@ -13695,6 +13695,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_id=str(source.chat_id),
                     thread_id=str(source.thread_id),
                     name=topic_name,
+                    icon_custom_emoji_id=None,
                 )
                 return
 

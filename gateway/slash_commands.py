@@ -340,14 +340,11 @@ class GatewaySlashCommandsMixin:
                     pass
                 event.source.profile = None
                 self._evict_cached_agent(session_key)
-                return (
-                    "Cleared the topic profile binding. Now using the global "
-                    f"active profile '{self._active_profile_name()}'."
-                )
+                return t("gateway.profile.cleared", profile=self._active_profile_name())
 
             if profile_input not in valid_profiles:
                 available = ", ".join(f"`{name}`" for name in sorted(valid_profiles))
-                return f"Unknown profile '{profile_input}'. Available profiles: {available}."
+                return t("gateway.profile.unknown", profile=profile_input, available=available)
 
             try:
                 _save_topic_profile(topic_key, profile_input)
@@ -355,7 +352,7 @@ class GatewaySlashCommandsMixin:
                 pass
             event.source.profile = profile_input
             self._evict_cached_agent(session_key)
-            return f"Pinned this topic to profile `{profile_input}`."
+            return t("gateway.profile.pinned", profile=profile_input)
 
         # No args: show the active profile + the list of profiles this topic can switch to.
         topic_profile = event.source.profile or get_active_profile_name()
@@ -363,13 +360,13 @@ class GatewaySlashCommandsMixin:
             t("gateway.profile.header", profile=topic_profile),
             t("gateway.profile.home", home=display_hermes_home()),
             "",
-            "Available profiles (tap to switch):",
+            t("gateway.profile.available_tap"),
         ]
         for name in sorted(valid_profiles):
             bullet = "*" if name == topic_profile else "-"
             lines.append(f"{bullet} `/profile {name}`")
         lines.append("")
-        lines.append("To clear the binding: `/profile default`")
+        lines.append(t("gateway.profile.clear_hint"))
         return "\n".join(lines)
 
     async def _handle_whoami_command(self, event: MessageEvent) -> str:
