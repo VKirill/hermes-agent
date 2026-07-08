@@ -12144,7 +12144,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return self._format_session_info()
         return self._format_session_info()
 
-    def _format_session_info(self) -> str:
+    def _format_session_info(self, source: Optional["SessionSource"] = None) -> str:
         """Resolve current model config and return a formatted info block.
 
         Surfaces model, provider, context length, and endpoint so gateway

@@ -167,6 +167,13 @@ def _skills_dir() -> Path:
         return configured
     return get_hermes_home() / "skills"
 
+
+# Alias kept after the catchup merge: the profile-isolation branch carried the
+# ``get_skills_dir`` name across tool modules; expose it here too so callers and
+# tests importing ``skill_manager_tool.get_skills_dir`` resolve identically.
+get_skills_dir = _skills_dir
+
+
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
 
