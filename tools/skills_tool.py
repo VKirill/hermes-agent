@@ -97,6 +97,7 @@ logger = logging.getLogger(__name__)
 HERMES_HOME = get_hermes_home()
 SKILLS_DIR = HERMES_HOME / "skills"
 _IMPORT_SKILLS_DIR = SKILLS_DIR
+_SKILLS_DIR_AT_IMPORT = SKILLS_DIR
 
 
 def get_skills_dir() -> Path:
@@ -105,6 +106,22 @@ def get_skills_dir() -> Path:
     if configured != _IMPORT_SKILLS_DIR:
         return configured
     return _active_skills_dir()
+
+
+def _skills_dir() -> Path:
+    """Return the active profile's skills directory at call time.
+
+    Some long-lived runtimes import this module before the active profile has
+    set HERMES_HOME. Keep the legacy SKILLS_DIR module attribute for tests and
+    external patchers, but when it has not been patched, resolve from the live
+    profile-scoped HERMES_HOME on every call. Kept as an alias of
+    ``get_skills_dir`` after the catchup merge so both call conventions resolve
+    identically.
+    """
+    configured = Path(SKILLS_DIR)
+    if configured != _SKILLS_DIR_AT_IMPORT:
+        return configured
+    return get_hermes_home() / "skills"
 
 # Anthropic-recommended limits for progressive disclosure efficiency
 MAX_NAME_LENGTH = 64

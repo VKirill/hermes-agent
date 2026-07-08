@@ -204,9 +204,14 @@ async def _lifespan(app: "FastAPI"):
         )
         cron_thread.start()
 
+    # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
+    pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
+
     try:
         yield
     finally:
+        pty_reaper_task.cancel()
+        await PTY_REGISTRY.close_all()
         if cron_stop is not None:
             cron_stop.set()
 
@@ -707,6 +712,14 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
             "Terminal updates always ask, regardless of this setting."
         ),
         "options": ["stash", "discard"],
+    },
+    "updates.refresh_cua_driver": {
+        "type": "bool",
+        "description": (
+            "Refresh an already-installed cua-driver during hermes update. "
+            "Disable this on non-admin macOS accounts where /Applications is "
+            "not writable."
+        ),
     },
 }
 
@@ -2255,6 +2268,136 @@ async def git_branch_switch_route(body: GitBranchSwitchBody):
     return await _git_op(_web_git.branch_switch, _git_path(body.path), body.branch)
 
 
+# Host TCP ports each port-binding gateway platform listens on, as
+# ``platform-name -> (config port key, adapter default)``.  Mirrors
+# ``_PORT_BINDING_PLATFORM_VALUES`` in gateway/run.py and each adapter's
+# DEFAULT_PORT / DEFAULT_WEBHOOK_PORT constant.  Used only for the dashboard's
+# gateway-topology readout — best-effort display data, not a bind source.
+_PORT_BINDING_PLATFORM_PORTS: Dict[str, Tuple[str, int]] = {
+    "webhook": ("port", 8644),
+    "api_server": ("port", 8642),
+    "msgraph_webhook": ("port", 8646),
+    "feishu": ("webhook_port", 8765),
+    "wecom_callback": ("port", 8645),
+    "bluebubbles": ("webhook_port", 8645),
+    "sms": ("webhook_port", 8080),
+    "whatsapp_cloud": ("webhook_port", 8090),
+    "line": ("port", 8646),
+}
+
+# Platform states that mean the adapter is NOT serving its port right now.
+_PLATFORM_DEAD_STATES = frozenset({"fatal", "disconnected", "stopped"})
+
+
+def _profile_platform_ports(profile_home: Path, runtime: Optional[dict]) -> Dict[str, int]:
+    """Best-effort map of ``platform -> host TCP port`` for one profile's gateway.
+
+    Reads the platforms the running gateway reported in its
+    ``gateway_state.json`` and resolves each port-binding platform's port from
+    the profile's ``config.yaml`` (top-level ``platforms:`` wins over
+    ``gateway.platforms:``, matching ``load_gateway_config`` precedence),
+    falling back to the adapter default.  Display-only: env-var port overrides
+    (e.g. ``WEBHOOK_PORT`` in that profile's .env) are not resolved here.
+    """
+    platforms = (runtime or {}).get("platforms") or {}
+    active = [
+        name for name, state in platforms.items()
+        if name in _PORT_BINDING_PLATFORM_PORTS
+        and isinstance(state, dict)
+        and state.get("state") not in _PLATFORM_DEAD_STATES
+    ]
+    if not active:
+        return {}
+
+    blocks: Dict[str, dict] = {}
+    try:
+        with open(profile_home / "config.yaml", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        gateway_cfg = cfg.get("gateway") if isinstance(cfg.get("gateway"), dict) else {}
+        # gateway.platforms first, top-level platforms second — later wins,
+        # matching the precedence in gateway.config.load_gateway_config().
+        for src in ((gateway_cfg or {}).get("platforms"), cfg.get("platforms")):
+            if not isinstance(src, dict):
+                continue
+            for plat_name, plat_block in src.items():
+                if isinstance(plat_block, dict):
+                    blocks.setdefault(plat_name, {}).update(plat_block)
+    except Exception:
+        blocks = {}
+
+    ports: Dict[str, int] = {}
+    for name in active:
+        port_key, default_port = _PORT_BINDING_PLATFORM_PORTS[name]
+        block = blocks.get(name) or {}
+        extra = block.get("extra") if isinstance(block.get("extra"), dict) else {}
+        raw = block.get(port_key, (extra or {}).get(port_key, default_port))
+        try:
+            ports[name] = int(raw)
+        except (TypeError, ValueError):
+            ports[name] = default_port
+    return ports
+
+
+def _collect_profile_gateway_topology() -> Dict[str, Any]:
+    """Enumerate profiles and the gateways serving them for ``/api/status``.
+
+    Returns ``{"profiles": [...], "gateway_mode": ..., "gateways": [...]}``:
+
+    * ``profiles`` — every profile on the host (default + named), from
+      ``profiles_to_serve(True)`` (the cheap enumeration chokepoint — no
+      per-profile config reads or skill counts).
+    * ``gateways`` — one entry per profile with a LIVE gateway process:
+      ``{"profile", "ports", "served_profiles"?}``.  Liveness reuses
+      ``_check_gateway_running`` so this agrees with the profiles sidebar.
+    * ``gateway_mode`` — ``"multiplex"`` when the default gateway serves
+      multiple profiles (gateway.multiplex_profiles), ``"single"`` for one
+      live gateway, ``"multiple"`` for independent per-profile gateways,
+      ``"none"`` when nothing is running.
+    """
+    try:
+        from hermes_cli.profiles import _check_gateway_running, profiles_to_serve
+        from gateway.status import read_runtime_status
+        homes = profiles_to_serve(True)
+    except Exception:
+        _log.debug("profile/gateway topology enumeration failed", exc_info=True)
+        return {"profiles": [], "gateway_mode": "unknown", "gateways": []}
+
+    profile_names = [name for name, _home in homes]
+    gateways: List[Dict[str, Any]] = []
+    multiplex = False
+    for name, home in homes:
+        try:
+            if not _check_gateway_running(home):
+                continue
+        except Exception:
+            continue
+        try:
+            runtime = read_runtime_status(home / "gateway_state.json")
+        except Exception:
+            runtime = None
+        served = [str(p) for p in ((runtime or {}).get("served_profiles") or [])]
+        if name == "default" and len(served) > 1:
+            multiplex = True
+        entry: Dict[str, Any] = {
+            "profile": name,
+            "ports": _profile_platform_ports(home, runtime),
+        }
+        if served:
+            entry["served_profiles"] = served
+        gateways.append(entry)
+
+    if multiplex:
+        mode = "multiplex"
+    elif len(gateways) > 1:
+        mode = "multiple"
+    elif len(gateways) == 1:
+        mode = "single"
+    else:
+        mode = "none"
+
+    return {"profiles": profile_names, "gateway_mode": mode, "gateways": gateways}
+
+
 @app.get("/api/status")
 async def get_status(profile: Optional[str] = None):
     status_scope = None
@@ -2408,6 +2551,21 @@ async def get_status(profile: Optional[str] = None):
             # Module not importable yet (early startup) — leave as [].
             pass
 
+        # Nous bootstrap-session validity for the NAS health sweep. A hosted
+        # agent whose Nous auth dies terminally (invalid_grant / quarantine)
+        # looks HEALTHY to every liveness/connectivity probe — the machine,
+        # relay, and this dashboard all stay up — yet every inference turn
+        # fails. This is the ONLY signal that surfaces that condition, and it
+        # is determinable with no working token (local auth-store state). NAS
+        # re-mints the bootstrap session when it reads "terminal". Best-effort:
+        # never let auth classification break the public liveness probe.
+        nous_session_valid = "unknown"
+        try:
+            from hermes_cli.auth import get_nous_session_validity
+            nous_session_valid = get_nous_session_validity()
+        except Exception:
+            nous_session_valid = "unknown"
+
         # Always-public liveness + auth-gate shape. Safe for external uptime
         # probes (NAS's wildcard-subdomain liveness probe), the SPA's pre-login
         # bootstrap, and anyone who can curl the host — i.e. exactly the audience
@@ -2430,6 +2588,7 @@ async def get_status(profile: Optional[str] = None):
             "active_sessions": active_sessions,
             "auth_required": auth_required,
             "auth_providers": auth_providers,
+            "nous_session_valid": nous_session_valid,
         }
 
         # Absolute host paths, the gateway PID, and the internal gateway health
@@ -2443,12 +2602,23 @@ async def get_status(profile: Optional[str] = None):
         # dashboard is local-only and the caller is already inside the trust
         # envelope — the same loopback/gated split ``should_require_auth`` draws.
         if not auth_required:
+            # Profile + gateway topology: which profiles exist, whether one
+            # multiplexed gateway or several per-profile gateways serve them,
+            # and which host ports the live gateways' port-binding platforms
+            # listen on.  Enumerating profiles walks the filesystem and probes
+            # the process table, so keep it off the event loop.
+            topology = await asyncio.get_running_loop().run_in_executor(
+                None, _collect_profile_gateway_topology
+            )
             status.update({
                 "hermes_home": str(get_hermes_home()),
                 "config_path": str(get_config_path()),
                 "env_path": str(get_env_path()),
                 "gateway_pid": gateway_pid,
                 "gateway_health_url": _GATEWAY_HEALTH_URL,
+                "profiles": topology["profiles"],
+                "gateway_mode": topology["gateway_mode"],
+                "gateways": topology["gateways"],
             })
 
         return status
@@ -4588,7 +4758,12 @@ _AUX_TASK_SLOTS: Tuple[str, ...] = (
 
 
 @app.get("/api/model/options")
-def get_model_options(profile: Optional[str] = None, refresh: bool = False):
+def get_model_options(
+    profile: Optional[str] = None,
+    refresh: bool = False,
+    include_unconfigured: bool = False,
+    explicit_only: bool = False,
+):
     """Return authenticated providers + their curated model lists.
 
     REST equivalent of the ``model.options`` JSON-RPC on tui_gateway, so the
@@ -4607,24 +4782,22 @@ def get_model_options(profile: Optional[str] = None, refresh: bool = False):
     try:
         from hermes_cli.inventory import build_models_payload, load_picker_context
 
-        # include_unconfigured + picker_hints + canonical_order mirror the
-        # tui_gateway `model.options` JSON-RPC handler exactly, so every GUI
-        # surface fed by this endpoint (Settings → Model, the first-run
-        # onboarding picker) sees the SAME full provider universe `hermes model`
-        # exposes — not just the authenticated subset. Unconfigured providers
-        # come back as skeleton rows carrying `authenticated=False` +
-        # `auth_type`/`key_env`/`warning` so the GUI can render a setup
-        # affordance instead of hiding the provider entirely.
+        # Most desktop surfaces should only list providers the user has already
+        # configured. Onboarding opts into the full provider universe via
+        # include_unconfigured=1 so it can still render setup affordances for
+        # providers that are not yet authenticated.
         with _profile_scope(profile):
             return build_models_payload(
                 load_picker_context(),
-                include_unconfigured=True,
+                explicit_only=bool(explicit_only),
+                include_unconfigured=bool(include_unconfigured),
                 picker_hints=True,
                 canonical_order=True,
                 pricing=True,
                 capabilities=True,
                 refresh=bool(refresh),
                 probe_custom_providers=bool(refresh),
+                probe_current_custom_provider=not bool(refresh),
             )
     except HTTPException:
         raise
@@ -6746,11 +6919,11 @@ def _anthropic_oauth_status() -> Dict[str, Any]:
     try:
         from agent.anthropic_adapter import (
             read_hermes_oauth_credentials,
-            _HERMES_OAUTH_FILE,
+            _get_hermes_oauth_file,
         )
     except ImportError:
         read_hermes_oauth_credentials = None  # type: ignore
-        _HERMES_OAUTH_FILE = None  # type: ignore
+        _get_hermes_oauth_file = None  # type: ignore
 
     hermes_creds = None
     if read_hermes_oauth_credentials:
@@ -6762,7 +6935,7 @@ def _anthropic_oauth_status() -> Dict[str, Any]:
         return {
             "logged_in": True,
             "source": "hermes_pkce",
-            "source_label": f"Hermes PKCE ({_HERMES_OAUTH_FILE})",
+            "source_label": f"Hermes PKCE ({_get_hermes_oauth_file() if _get_hermes_oauth_file else None})",
             "token_preview": _truncate_token(hermes_creds.get("accessToken")),
             "expires_at": hermes_creds.get("expiresAt"),
             "has_refresh_token": bool(hermes_creds.get("refreshToken")),
@@ -7200,9 +7373,10 @@ async def disconnect_oauth_provider(
         if provider_id == "anthropic":
             cleared = False
             try:
-                from agent.anthropic_adapter import _HERMES_OAUTH_FILE
-                if _HERMES_OAUTH_FILE.exists():
-                    _HERMES_OAUTH_FILE.unlink()
+                from agent.anthropic_adapter import _get_hermes_oauth_file
+                oauth_file = _get_hermes_oauth_file()
+                if oauth_file.exists():
+                    oauth_file.unlink()
                     cleared = True
             except Exception:
                 pass
@@ -7346,32 +7520,22 @@ def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_a
     Mirrors what auth_commands.add_command does so the dashboard flow leaves
     the system in the same state as ``hermes auth add anthropic``.
     """
-    from agent.anthropic_adapter import _HERMES_OAUTH_FILE
+    from agent.anthropic_adapter import _get_hermes_oauth_file
+    oauth_file = _get_hermes_oauth_file()
     payload = {
         "accessToken": access_token,
         "refreshToken": refresh_token,
         "expiresAt": expires_at_ms,
     }
-    _HERMES_OAUTH_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = _HERMES_OAUTH_FILE.with_name(
-        f"{_HERMES_OAUTH_FILE.name}.tmp.{os.getpid()}.{secrets.token_hex(8)}"
-    )
-    try:
-        with tmp_path.open("w", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, indent=2))
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp_path, _HERMES_OAUTH_FILE)
-        try:
-            _HERMES_OAUTH_FILE.chmod(stat.S_IRUSR | stat.S_IWUSR)
-        except OSError:
-            pass
-    finally:
-        try:
-            if tmp_path.exists():
-                tmp_path.unlink()
-        except OSError:
-            pass
+    # atomic_json_write creates the temp with mode 0o600 (via mkstemp) *before*
+    # any content is written, then fsyncs and atomically replaces the target.
+    # The previous os.replace + post-hoc chmod left a TOCTOU window in which the
+    # OAuth token file was world-readable at the default umask (0o644 on most
+    # hosts) between the rename and the chmod. atomic_json_write also preserves
+    # the existing file's owner and cleans up its temp on failure.
+    from utils import atomic_json_write
+
+    atomic_json_write(oauth_file, payload, indent=2, mode=0o600)
     # Best-effort credential-pool insert. Failure here doesn't invalidate
     # the file write — pool registration only matters for the rotation
     # strategy, not for runtime credential resolution.
@@ -8520,24 +8684,110 @@ async def export_session_endpoint(session_id: str, profile: Optional[str] = None
 
 
 class SessionPrune(BaseModel):
-    older_than_days: int = 90
+    older_than_days: Optional[float] = 90
     source: Optional[str] = None
     profile: Optional[str] = None
+    # Extended filters (all optional, AND together — mirrors the CLI flags)
+    started_before: Optional[float] = None  # epoch seconds
+    started_after: Optional[float] = None  # epoch seconds
+    title_like: Optional[str] = None
+    end_reason: Optional[str] = None
+    cwd_prefix: Optional[str] = None
+    min_messages: Optional[int] = None
+    max_messages: Optional[int] = None
+    model_like: Optional[str] = None
+    provider: Optional[str] = None
+    user_id: Optional[str] = None
+    chat_id: Optional[str] = None
+    chat_type: Optional[str] = None
+    branch_like: Optional[str] = None
+    min_tokens: Optional[int] = None
+    max_tokens: Optional[int] = None
+    min_cost: Optional[float] = None
+    max_cost: Optional[float] = None
+    min_tool_calls: Optional[int] = None
+    max_tool_calls: Optional[int] = None
+    include_archived: bool = False
+    dry_run: bool = False
 
 
 @app.post("/api/sessions/prune")
 async def prune_sessions_endpoint(body: SessionPrune):
-    """Delete ended sessions older than N days (mirrors `hermes sessions prune`)."""
-    if body.older_than_days < 1:
+    """Delete ended sessions matching filters (mirrors `hermes sessions prune`)."""
+    has_window = (
+        body.started_before is not None or body.started_after is not None
+    )
+    if body.older_than_days is not None and body.older_than_days < 1 and not has_window:
         raise HTTPException(status_code=400, detail="older_than_days must be >= 1")
+    # Mirror the CLI: the implicit 90-day cutoff only applies to a truly bare
+    # prune. Any attribute filter (source, title, model, ...) suppresses it
+    # unless the caller explicitly sent older_than_days.
+    _attr_filters_set = any(
+        getattr(body, f) is not None
+        for f in (
+            "source", "title_like", "end_reason", "cwd_prefix",
+            "min_messages", "max_messages", "model_like", "provider",
+            "user_id", "chat_id", "chat_type", "branch_like",
+            "min_tokens", "max_tokens", "min_cost", "max_cost",
+            "min_tool_calls", "max_tool_calls",
+        )
+    )
+    _older_than_explicit = "older_than_days" in body.model_fields_set
+    _effective_older_than = body.older_than_days
+    if has_window or (_attr_filters_set and not _older_than_explicit):
+        _effective_older_than = None
     profile_home = _cron_profile_home(body.profile)[1] if body.profile else get_hermes_home()
     db = _open_session_db_for_profile(body.profile)
     try:
+        filters = dict(
+            older_than_days=_effective_older_than,
+            source=(body.source or None),
+            started_before=body.started_before,
+            started_after=body.started_after,
+            title_like=(body.title_like or None),
+            end_reason=(body.end_reason or None),
+            cwd_prefix=(body.cwd_prefix or None),
+            min_messages=body.min_messages,
+            max_messages=body.max_messages,
+            model_like=(body.model_like or None),
+            provider=(body.provider or None),
+            user_id=(body.user_id or None),
+            chat_id=(body.chat_id or None),
+            chat_type=(body.chat_type or None),
+            branch_like=(body.branch_like or None),
+            min_tokens=body.min_tokens,
+            max_tokens=body.max_tokens,
+            min_cost=body.min_cost,
+            max_cost=body.max_cost,
+            min_tool_calls=body.min_tool_calls,
+            max_tool_calls=body.max_tool_calls,
+            archived=None if body.include_archived else False,
+        )
+        if body.dry_run:
+            rows = db.list_prune_candidates(**filters)
+            return {
+                "ok": True,
+                "removed": 0,
+                "matched": len(rows),
+                # Rows are ordered oldest-first.
+                "oldest_started_at": rows[0]["started_at"] if rows else None,
+                "newest_started_at": rows[-1]["started_at"] if rows else None,
+                "sessions": [
+                    {
+                        "id": r["id"],
+                        "source": r["source"],
+                        "title": r.get("title"),
+                        "model": r.get("model"),
+                        "started_at": r["started_at"],
+                        "message_count": r["message_count"],
+                    }
+                    for r in rows
+                ],
+            }
         sessions_dir = profile_home / "sessions"
         removed = db.prune_sessions(
-            older_than_days=body.older_than_days,
-            source=(body.source or None),
             sessions_dir=sessions_dir if sessions_dir.exists() else None,
+            **filters,
         )
         return {"ok": True, "removed": removed}
     finally:
@@ -9473,8 +9723,15 @@ async def auth_mcp_server(name: str, profile: Optional[str] = None):
                 # The default 30s connect timeout would kill the flow while the
                 # user is still on the consent screen — give the browser
                 # round-trip the full callback window (300s in mcp_oauth) plus
-                # headroom so the connect wrapper can't pre-empt it.
-                tools = _probe_single_server(name, cfg, connect_timeout=315)
+                # headroom so the connect wrapper can't pre-empt it. Honor a
+                # larger configured connect_timeout when the user set one.
+                try:
+                    _cfg_timeout = float(cfg.get("connect_timeout", 0))
+                except (TypeError, ValueError):
+                    _cfg_timeout = 0.0
+                tools = _probe_single_server(
+                    name, cfg, connect_timeout=max(_cfg_timeout, 315)
+                )
             except Exception:
                 storage.restore(backup)
                 raise
@@ -12758,6 +13015,105 @@ else:
 
 _RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
 _PTY_READ_CHUNK_TIMEOUT = 0.2
+
+# Keep-alive PTY sessions: a terminal connecting with ``?attach=<token>`` is
+# bound to a process that survives disconnect/refresh and is reattachable.
+from hermes_cli.pty_session import PtySessionRegistry, RegistryFull, run_reaper  # noqa: E402
+
+PTY_REGISTRY = PtySessionRegistry(
+    ttl=30 * 60,
+    max_sessions=16,
+    buffer_cap=1 * 1024 * 1024,
+    read_timeout=_PTY_READ_CHUNK_TIMEOUT,
+)
+
+
+async def _legacy_pump(ws: "WebSocket", bridge) -> None:
+    """Original 1:1 socket<->PTY pump: stream until disconnect, then close the
+    bridge. Used when no ``?attach=`` token is supplied (keep-alive opt-in).
+
+    Behavior is identical to the pre-keep-alive ``pty_ws`` body, including the
+    #54028 half-open-socket protection (reader EOF → close the WS so the
+    writer's ``ws.receive()`` unparks) and the #53227 ``to_thread`` offloads
+    for the blocking ``bridge.close()``.
+    """
+    loop = asyncio.get_running_loop()
+
+    # --- reader task: PTY master → WebSocket ----------------------------
+    async def pump_pty_to_ws() -> None:
+        try:
+            while True:
+                chunk = await loop.run_in_executor(
+                    None, bridge.read, _PTY_READ_CHUNK_TIMEOUT
+                )
+                if chunk is None:  # EOF
+                    return
+                if not chunk:  # no data this tick; yield control and retry
+                    await asyncio.sleep(0)
+                    continue
+                try:
+                    await ws.send_bytes(chunk)
+                except Exception:
+                    return
+        finally:
+            # The child has exited (EOF) or the send side broke.  Close the
+            # WebSocket so the writer loop's ``ws.receive()`` returns instead
+            # of blocking forever — otherwise, when the browser's socket is
+            # half-open (no FIN delivered, common on macOS/launchd) the
+            # handler never reaches its ``finally`` and the PTY's fds leak.
+            # With dashboard auto-reconnect (#52962) every dropped socket then
+            # stacks a fresh PTY on top of the orphaned one, exhausting fds.
+            #
+            # Reap the bridge here too (close() is idempotent): on child EOF the
+            # writer loop's ``finally`` is the usual closer, but if the handler
+            # task is cancelled the instant we close the WS, that ``finally``
+            # can be skipped, leaking the PTY. Closing from the EOF path makes
+            # the reap independent of that cancellation race (#54028).
+            try:
+                await asyncio.to_thread(bridge.close)
+            except Exception:
+                pass
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    reader_task = asyncio.create_task(pump_pty_to_ws())
+
+    # --- writer loop: WebSocket → PTY master ----------------------------
+    try:
+        while True:
+            try:
+                msg = await ws.receive()
+            except RuntimeError:
+                # Raised when ws.receive() is called after the socket is
+                # already disconnected (e.g. closed by the reader task above).
+                break
+            if msg.get("type") == "websocket.disconnect":
+                break
+            raw = msg.get("bytes")
+            if raw is None:
+                text = msg.get("text")
+                raw = text.encode("utf-8") if isinstance(text, str) else b""
+            if not raw:
+                continue
+            # Resize escape is consumed locally, never written to the PTY.
+            match = _RESIZE_RE.match(raw)
+            if match and match.end() == len(raw):
+                bridge.resize(cols=int(match.group(1)), rows=int(match.group(2)))
+                continue
+            bridge.write(raw)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        reader_task.cancel()
+        try:
+            await reader_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        await asyncio.to_thread(bridge.close)
+
+
 _VALID_CHANNEL_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 # Starlette's TestClient reports the peer as "testclient"; treat it as
 # loopback so tests don't need to rewrite request scope.
@@ -13060,6 +13416,17 @@ def _resolve_chat_argv(
     # the dashboard PTY path.
     env.setdefault("HERMES_TUI_DISABLE_MOUSE", "1")
     env.setdefault("HERMES_TUI_INLINE", "1")
+    # The dashboard terminal is xterm.js, which always renders 24-bit RGB.
+    # But chalk inside the TUI child decides its color depth from the
+    # SERVER process env — and hosted/cloud deploys run the dashboard under
+    # a process manager (container init, systemd) with no COLORTERM, so
+    # chalk downgrades every hex color to the xterm 256 palette. The skin's
+    # bronze border #CD7F32 snaps to palette 173 (#D7875F, salmon-red) and
+    # the banner reads red/yellow instead of gold. Local launches dodge
+    # this only because the operator's interactive terminal leaks
+    # COLORTERM=truecolor into os.environ. Backfill it for the PTY child;
+    # setdefault so an explicit operator value still wins.
+    env.setdefault("COLORTERM", "truecolor")
     env["HERMES_TUI_DASHBOARD"] = "1"
 
     if profile_dir is not None:
@@ -13088,6 +13455,44 @@ def _resolve_chat_argv(
     return list(argv), str(cwd) if cwd else None, env
 
 
+# Hosts that mean "listen on every interface" — the server should bind to
+# them, but an in-container client must NOT dial them: dialing 0.0.0.0
+# resolves to "any local interface", which on most platforms routes through
+# the kernel's wildcard stack and behind a forward proxy (HTTPS_PROXY with
+# a NO_PROXY that doesn't list 0.0.0.0) gets MITM'd into a failed handshake
+# (issue #58993).  The fix is to use a loopback address for the client
+# netloc while leaving the bind host alone.
+_WILDCARD_HOSTS = frozenset({"0.0.0.0", "::"})
+
+
+def _resolve_client_ws_host() -> Optional[str]:
+    """Return the host the in-container WS client should dial.
+
+    Resolution order:
+
+    1. Explicit ``HERMES_DASHBOARD_WS_HOST`` env var — wins always. Operators
+       running the dashboard behind a forward proxy can pin a routable host
+       (e.g. ``127.0.0.1``, the container's internal IP, or a sidecar DNS
+       name) and bypass auto-detection entirely.
+    2. The configured bind host — if it's a wildcard (``0.0.0.0`` / ``::``),
+       substitute ``127.0.0.1`` since both the dashboard and its TUI child
+       run in the same container.
+    3. Any other bind host (loopback or LAN IP) — preserved verbatim.
+    """
+    explicit = os.environ.get("HERMES_DASHBOARD_WS_HOST", "").strip()
+    if explicit:
+        return explicit
+
+    host = getattr(app.state, "bound_host", None)
+    if not host:
+        return None
+
+    if host in _WILDCARD_HOSTS:
+        return "127.0.0.1"
+
+    return host
+
+
 def _build_gateway_ws_url() -> Optional[str]:
     """ws:// URL the PTY child should attach to for JSON-RPC gateway traffic.
 
@@ -13099,7 +13504,7 @@ def _build_gateway_ws_url() -> Optional[str]:
     the child reads this URL once at startup and reuses it on every reconnect,
     and a 30s-TTL ticket can expire before a slow cold boot even dials.
     """
-    host = getattr(app.state, "bound_host", None)
+    host = _resolve_client_ws_host()
     port = getattr(app.state, "bound_port", None)
 
     if not host or not port:
@@ -13166,7 +13571,7 @@ def _build_sidecar_url(channel: str) -> Optional[str]:
     Connections authenticated this way are recorded under the
     ``server-internal`` identity in the audit log.
     """
-    host = getattr(app.state, "bound_host", None)
+    host = _resolve_client_ws_host()
     port = getattr(app.state, "bound_port", None)
 
     if not host or not port:
@@ -13925,71 +14330,57 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
 
+    attach_token = ws.query_params.get("attach") or None
+
+    def _spawn():
+        return PtyBridge.spawn(argv, cwd=cwd, env=env)
+
+    if attach_token is None:
+        # Legacy path: 1:1 socket<->PTY, killed on disconnect (unchanged).
+        try:
+            bridge = _spawn()
+        except PtyUnavailableError as exc:
+            await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
+            await ws.close(code=1011)
+            return
+        except (FileNotFoundError, OSError) as exc:
+            await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
+            await ws.close(code=1011)
+            return
+        await _legacy_pump(ws, bridge)
+        return
+
+    # Keep-alive path: the PTY outlives this socket; reattach by token.
     try:
-        bridge = await asyncio.to_thread(PtyBridge.spawn, argv, cwd=cwd, env=env)
+        session, _created = await PTY_REGISTRY.attach_or_spawn(
+            attach_token, spawn=_spawn
+        )
     except PtyUnavailableError as exc:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
         return
-    except (FileNotFoundError, OSError) as exc:
-        await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
+    except (FileNotFoundError, OSError, RegistryFull) as exc:
+        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)
         return
 
-    loop = asyncio.get_running_loop()
-
-    # --- reader task: PTY master → WebSocket ----------------------------
-    async def pump_pty_to_ws() -> None:
-        try:
-            while True:
-                chunk = await loop.run_in_executor(
-                    None, bridge.read, _PTY_READ_CHUNK_TIMEOUT
-                )
-                if chunk is None:  # EOF
-                    return
-                if not chunk:  # no data this tick; yield control and retry
-                    await asyncio.sleep(0)
-                    continue
-                try:
-                    await ws.send_bytes(chunk)
-                except Exception:
-                    return
-        finally:
-            # The child has exited (EOF) or the send side broke.  Close the
-            # WebSocket so the writer loop's ``ws.receive()`` returns instead
-            # of blocking forever — otherwise, when the browser's socket is
-            # half-open (no FIN delivered, common on macOS/launchd) the
-            # handler never reaches its ``finally`` and the PTY's fds leak.
-            # With dashboard auto-reconnect (#52962) every dropped socket then
-            # stacks a fresh PTY on top of the orphaned one, exhausting fds.
-            #
-            # Reap the bridge here too (close() is idempotent): on child EOF the
-            # writer loop's ``finally`` is the usual closer, but if the handler
-            # task is cancelled the instant we close the WS, that ``finally``
-            # can be skipped, leaking the PTY. Closing from the EOF path makes
-            # the reap independent of that cancellation race (#54028).
-            try:
-                await asyncio.to_thread(bridge.close)
-            except Exception:
-                pass
-            try:
-                await ws.close()
-            except Exception:
-                pass
-
-    reader_task = asyncio.create_task(pump_pty_to_ws())
+    await session.attach(ws)
 
     # --- writer loop: WebSocket → PTY master ----------------------------
+    # No reader task here: the session's drain task (spawned once per PTY,
+    # inside the registry) forwards PTY output to whichever socket is
+    # attached and rings-buffers it while detached.  On child EOF the drain
+    # closes the attached socket with 4410, which unparks ``ws.receive()``
+    # below — same half-open-socket protection the legacy pump has (#54028).
     try:
         while True:
             try:
                 msg = await ws.receive()
             except RuntimeError:
-                # Raised when ws.receive() is called after the socket is
-                # already disconnected (e.g. closed by the reader task above).
+                # ws.receive() after the socket is already disconnected
+                # (e.g. closed by the drain task on process exit).
                 break
-            msg_type = msg.get("type")
-            if msg_type == "websocket.disconnect":
+            if msg.get("type") == "websocket.disconnect":
                 break
             raw = msg.get("bytes")
             if raw is None:
@@ -14001,21 +14392,16 @@ async def pty_ws(ws: WebSocket) -> None:
             # Resize escape is consumed locally, never written to the PTY.
             match = _RESIZE_RE.match(raw)
             if match and match.end() == len(raw):
-                cols = int(match.group(1))
-                rows = int(match.group(2))
-                bridge.resize(cols=cols, rows=rows)
+                session.bridge.resize(cols=int(match.group(1)), rows=int(match.group(2)))
                 continue
 
-            bridge.write(raw)
+            session.bridge.write(raw)
     except WebSocketDisconnect:
         pass
     finally:
-        reader_task.cancel()
-        try:
-            await reader_task
-        except (asyncio.CancelledError, Exception):
-            pass
-        await asyncio.to_thread(bridge.close)
+        # Detach only — the PTY keeps running for a reattach; the registry
+        # reaper closes it after the TTL (or immediately on process exit).
+        PTY_REGISTRY.detach(attach_token, ws)
 
 
 # ---------------------------------------------------------------------------
@@ -14158,13 +14544,21 @@ def mount_spa(application: FastAPI):
     and the SPA's runtime ``__HERMES_BASE_PATH__`` honour that prefix
     without rebuilding the bundle.
     """
-    if not WEB_DIST.exists():
+    # `hermes serve` is the headless backend: it must NEVER serve the browser
+    # SPA, even if a dist is lying around from a prior `dashboard`/build. Take
+    # the no-frontend path so only the JSON-RPC/WS/API surface is reachable.
+    _headless = os.environ.get("HERMES_SERVE_HEADLESS") == "1"
+    if _headless or not WEB_DIST.exists():
+        _msg = (
+            "Headless backend (hermes serve): web UI disabled — use "
+            "`hermes dashboard` for the browser UI."
+            if _headless
+            else "Frontend not built. Run: cd web && npm run build"
+        )
+
         @application.get("/{full_path:path}")
         async def no_frontend(full_path: str):
-            return JSONResponse(
-                {"error": "Frontend not built. Run: cd web && npm run build"},
-                status_code=404,
-            )
+            return JSONResponse({"error": _msg}, status_code=404)
         return
 
     _index_path = WEB_DIST / "index.html"
@@ -15404,6 +15798,7 @@ def start_server(
     open_browser: bool = True,
     allow_public: bool = False,
     initial_profile: str = "",
+    headless: bool = False,
 ):
     """Start the web UI server.
 
@@ -15411,6 +15806,10 @@ def start_server(
     URL as ``?profile=<name>`` so the SPA's profile switcher preselects it
     — used when a profile alias (``<profile> dashboard``) routes to the
     machine dashboard.
+
+    ``headless`` is the ``serve`` path: the JSON-RPC/WS backend with no UI
+    build and no SPA mount (mount_spa() honours ``HERMES_SERVE_HEADLESS``), so
+    the banner announces the bind rather than a browser URL.
     """
     import uvicorn
 
@@ -15567,8 +15966,17 @@ def start_server(
             app.state.bound_port = actual_port
 
             _write_dashboard_ready_file(actual_port)
-            print(f"HERMES_DASHBOARD_READY port={actual_port}", flush=True)
-            print(f"  Hermes Web UI → http://{host}:{actual_port}")
+            # Port-discovery sentinel parsed by the desktop spawn. `serve` is a
+            # plain backend, not a dashboard, so it announces a neutral token;
+            # `dashboard` keeps the legacy one. The desktop matches either.
+            ready_token = "HERMES_BACKEND_READY" if headless else "HERMES_DASHBOARD_READY"
+            print(f"{ready_token} port={actual_port}", flush=True)
+            if headless:
+                # No SPA, and the JSON-RPC/WS endpoints are auth-gated — don't
+                # advertise a paste-and-connect URL, just announce the bind.
+                print(f"  Hermes backend listening on {host}:{actual_port}")
+            else:
+                print(f"  Hermes Web UI → http://{host}:{actual_port}")
             _maybe_open_browser(host, actual_port, open_browser, initial_profile)
 
             # Collapse the peer-hangup teardown flood (#50005). When the Desktop
