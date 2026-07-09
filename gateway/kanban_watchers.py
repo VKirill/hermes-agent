@@ -341,6 +341,22 @@ class GatewayKanbanWatchersMixin:
                     # exists to fix). The helper returns None only when the profile
                     # (or default) genuinely has no adapter for the platform.
                     adapter = self._authorization_adapter(plat, sub_profile or None)
+                    if adapter is None and single_adapter_mode and sub_profile:
+                        # Single-adapter multiplex + a HEADLESS owner profile: the
+                        # pm_* gateways run with dispatch_in_gateway=false and have
+                        # NO adapter-registry entry of their own, so the stamped
+                        # lookup above fail-closes to None. There is exactly ONE
+                        # shared bot in this topology, so delivering through the
+                        # default adapter is correct and carries no wrong-bot risk.
+                        # Guard on an ABSENT registry entry (same test the owner
+                        # gate above uses): a profile that HAS an entry but lacks
+                        # this platform is a real mis-config and must still fail
+                        # closed (no cross-profile mis-delivery). Without this the
+                        # claim is rewound every tick and the origin topic never
+                        # hears back — last_event_id stays 0 forever for every
+                        # pm_*-owned subscription (blocked/completed pings lost).
+                        if not getattr(self, "_profile_adapters", {}).get(sub_profile):
+                            adapter = self._authorization_adapter(plat, None)
                     if adapter is None:
                         logger.debug(
                             "kanban notifier: adapter %s disconnected before delivery for %s; rewinding claim",

@@ -307,3 +307,58 @@ def _unseen_terminal_events_for(tid, chat_id):
         return events
     finally:
         conn.close()
+
+
+def test_notifier_single_adapter_delivers_headless_profile_via_default(tmp_path, monkeypatch):
+    """single_adapter multiplex + a HEADLESS owner profile (no _profile_adapters
+    entry at all, e.g. pm_* with dispatch_in_gateway=false) must deliver through
+    the ONE shared/default adapter instead of rewinding forever.
+
+    Regression for the "topic never hears back" bug: pm_andyspark-owned subs sat
+    at last_event_id=0 because _authorization_adapter fail-closed to None and the
+    claim was rewound every tick. Reverting the single_adapter None-fallback in
+    kanban_watchers.py makes this test FAIL (default_adapter receives nothing and
+    the event stays unseen).
+    """
+    import hermes_cli.config as _cfgmod
+
+    db_path = tmp_path / "single-adapter-headless.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owned by headless pm", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-pm",
+            notifier_profile="pm_andyspark",
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+
+    # Force single_adapter multiplex on; keep the notifier enabled.
+    monkeypatch.setattr(
+        _cfgmod, "load_config",
+        lambda *a, **k: {
+            "kanban": {"dispatch_in_gateway": True},
+            "gateway": {"topic_profile_routing": {"single_adapter": True}},
+        },
+    )
+
+    default_adapter = RecordingAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.TELEGRAM: default_adapter}
+    # Headless owner: pm_andyspark has NO registry entry at all.
+    runner._profile_adapters = {}
+    runner._kanban_sub_fail_counts = {}
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    # Delivered via the shared/default adapter …
+    assert [d["chat_id"] for d in default_adapter.sent] == ["chat-pm"], (
+        f"headless-profile sub must deliver via default adapter; got {default_adapter.sent!r}"
+    )
+    # … and the cursor advanced (event consumed, not rewound).
+    assert _unseen_terminal_events_for(tid, "chat-pm") == []
