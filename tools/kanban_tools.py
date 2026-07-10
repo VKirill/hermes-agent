@@ -1155,6 +1155,33 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
+
+        # If the task has a client tenant with a registered topic, do NOT also
+        # auto-subscribe the *origin chat* (e.g. life LIVE). That dual-sub is
+        # what leaked Pisateli/Gas completions into the wrong Telegram topic.
+        try:
+            tenant = _kb._resolve_task_tenant(conn, task_id)
+            tenant_entries = _kb._tenant_notify_entries(tenant) if tenant else []
+        except Exception:
+            tenant_entries = []
+        if tenant_entries:
+            want_threads = {
+                (str(e.get("platform") or "telegram"), str(e.get("chat_id") or ""), str(e.get("thread_id") or ""))
+                for e in tenant_entries
+            }
+            origin_key = (
+                str(platform or "telegram"),
+                str(chat_id or ""),
+                str(thread_id or ""),
+            )
+            if origin_key not in want_threads:
+                # Still attach the real client topic(s).
+                try:
+                    _kb.ensure_task_notify_subs(conn, task_id, tenant=tenant)
+                except Exception:
+                    pass
+                return False
+
         _kb.add_notify_sub(
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,

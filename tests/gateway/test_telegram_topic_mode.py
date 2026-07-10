@@ -1668,8 +1668,8 @@ async def test_handle_profile_command_switches_profile(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_telegram_system_message_redirection(monkeypatch):
-    """Verify that system messages (non-agent, non-status) are redirected to the System topic."""
+async def test_telegram_system_message_redirection_disabled_by_default(monkeypatch):
+    """System-topic redirect is retired: status/commentary stay in origin topic."""
     # Stub telegram package
     import sys
     import types
@@ -1710,6 +1710,7 @@ async def test_telegram_system_message_redirection(monkeypatch):
     monkeypatch.setitem(sys.modules, "telegram.constants", fake_constants)
     monkeypatch.setitem(sys.modules, "telegram.ext", fake_ext)
     monkeypatch.setitem(sys.modules, "telegram.request", fake_request)
+    monkeypatch.delenv("HERMES_TELEGRAM_SYSTEM_TOPIC_REDIRECT", raising=False)
 
     from plugins.platforms.telegram.adapter import TelegramAdapter
 
@@ -1719,150 +1720,38 @@ async def test_telegram_system_message_redirection(monkeypatch):
     a._bot.send_message = AsyncMock()
     a._bot.send_message.return_value = MagicMock(message_id=999)
 
-    # Configure dm topics: System thread is 919159, Development thread is 12345
     chat_id = "208214988"
     a._dm_topics = {
         "208214988:System": 919159,
         "208214988:Development": 12345,
     }
 
-    # Case 1: System message (no is_agent, no is_status) coming from Development topic
+    # Non-agent status-like send must stay in Development (no redirect/prefix)
     metadata = {
         "thread_id": "12345",
         "telegram_dm_topic_reply_fallback": True,
         "telegram_reply_to_message_id": 111,
     }
     await a.send(chat_id=chat_id, content="System error occurred", metadata=metadata)
-    
-    # Assert send_message was called with System topic thread ID, and content was prefixed
+
     a._bot.send_message.assert_called_once()
     kwargs = a._bot.send_message.call_args[1]
     assert kwargs["chat_id"] == 208214988
-    assert kwargs["text"] == "📍 *\\[Development\\]*\nSystem error occurred"
-    assert kwargs["reply_to_message_id"] is None
-    assert kwargs["message_thread_id"] == 919159
-    assert kwargs["disable_notification"] is True
-
-    a._bot.send_message.reset_mock()
-
-    # Case 2: Agent message (is_agent = True) coming from Development topic - should NOT be redirected
-    metadata = {
-        "thread_id": "12345",
-        "is_agent": True,
-        "telegram_dm_topic_reply_fallback": True,
-        "telegram_reply_to_message_id": 111,
-    }
-    await a.send(chat_id=chat_id, content="Hello user!", metadata=metadata)
-
-    # Assert send_message was called with original thread ID and no prefix
-    a._bot.send_message.assert_called_once()
-    kwargs = a._bot.send_message.call_args[1]
-    assert kwargs["chat_id"] == 208214988
-    assert kwargs["text"] == "Hello user\\!"
+    assert kwargs["text"] == "System error occurred"
     assert kwargs["reply_to_message_id"] == 111
     assert kwargs["message_thread_id"] == 12345
-    assert kwargs["disable_notification"] is True
 
     a._bot.send_message.reset_mock()
 
-    # Case 3: Status update (is_status = True) - should be redirected to System topic
-    metadata = {
-        "thread_id": "12345",
-        "is_status": True,
-        "telegram_dm_topic_reply_fallback": True,
-        "telegram_reply_to_message_id": 111,
-    }
-    await a.send(chat_id=chat_id, content="Thinking...", metadata=metadata)
- 
-    # Assert send_message was called with System topic thread ID and prefixed
+    # Opt-in revive still works when env is set
+    monkeypatch.setenv("HERMES_TELEGRAM_SYSTEM_TOPIC_REDIRECT", "1")
+    await a.send(chat_id=chat_id, content="System error occurred", metadata=metadata)
     a._bot.send_message.assert_called_once()
     kwargs = a._bot.send_message.call_args[1]
-    assert kwargs["chat_id"] == 208214988
-    assert kwargs["text"] == "📍 *\\[Development\\]*\nThinking\\.\\.\\."
+    assert kwargs["message_thread_id"] == 919159
     assert kwargs["reply_to_message_id"] is None
-    assert kwargs["message_thread_id"] == 919159
-    assert kwargs["disable_notification"] is True
- 
-    a._bot.send_message.reset_mock()
- 
-    # Case 4: System message coming from System topic itself - should NOT be redirected or prefixed
-    metadata = {
-        "thread_id": "919159",
-        "telegram_dm_topic_reply_fallback": True,
-        "telegram_reply_to_message_id": 222,
-    }
-    await a.send(chat_id=chat_id, content="Database backup complete", metadata=metadata)
- 
-    a._bot.send_message.assert_called_once()
-    kwargs = a._bot.send_message.call_args[1]
-    assert kwargs["chat_id"] == 208214988
-    assert kwargs["text"] == "Database backup complete"
-    assert kwargs["reply_to_message_id"] == 222
-    assert kwargs["message_thread_id"] == 919159
-    assert kwargs["disable_notification"] is True
- 
-    a._bot.send_message.reset_mock()
- 
-    # Case 5: send_or_update_status should set is_status=True and redirect to System topic
-    await a.send_or_update_status(
-        chat_id=chat_id,
-        status_key="lifecycle",
-        content="Initializing...",
-        metadata={
-            "thread_id": "12345",
-            "telegram_dm_topic_reply_fallback": True,
-            "telegram_reply_to_message_id": 111,
-        }
-    )
-    
-    a._bot.send_message.assert_called_once()
-    kwargs = a._bot.send_message.call_args[1]
-    assert kwargs["chat_id"] == 208214988
-    assert kwargs["text"] == "📍 *\\[Development\\]*\nInitializing\\.\\.\\."
-    assert kwargs["reply_to_message_id"] is None
-    assert kwargs["message_thread_id"] == 919159
-    assert kwargs["disable_notification"] is True
- 
-    a._bot.send_message.reset_mock()
- 
-    # Case 6: Commentary message (is_agent = True, is_commentary = True) - should be redirected to System topic
-    metadata = {
-        "thread_id": "12345",
-        "is_agent": True,
-        "is_commentary": True,
-        "telegram_dm_topic_reply_fallback": True,
-        "telegram_reply_to_message_id": 111,
-    }
-    await a.send(chat_id=chat_id, content="Using tool terminal...", metadata=metadata)
- 
-    # Assert send_message was called with System topic thread ID and prefixed
-    a._bot.send_message.assert_called_once()
-    kwargs = a._bot.send_message.call_args[1]
-    assert kwargs["chat_id"] == 208214988
-    assert kwargs["text"] == "📍 *\\[Development\\]*\nUsing tool terminal\\.\\.\\."
-    assert kwargs["reply_to_message_id"] is None
-    assert kwargs["message_thread_id"] == 919159
-    assert kwargs["disable_notification"] is True
- 
-    a._bot.send_message.reset_mock()
- 
-    # Case 7: Final agent response or command output (notify = True) - should NOT be redirected
-    metadata = {
-        "thread_id": "12345",
-        "notify": True,
-        "telegram_dm_topic_reply_fallback": True,
-        "telegram_reply_to_message_id": 111,
-    }
-    await a.send(chat_id=chat_id, content="Here is your final result", metadata=metadata)
- 
-    # Assert send_message was called with original thread ID and no prefix
-    a._bot.send_message.assert_called_once()
-    kwargs = a._bot.send_message.call_args[1]
-    assert kwargs["chat_id"] == 208214988
-    assert kwargs["text"] == "Here is your final result"
-    assert kwargs["reply_to_message_id"] == 111
-    assert kwargs["message_thread_id"] == 12345
-    assert "disable_notification" not in kwargs
+    assert "Development" in kwargs["text"]
+    assert kwargs["text"].startswith("📍")
 
 
 

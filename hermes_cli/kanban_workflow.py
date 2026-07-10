@@ -1,55 +1,66 @@
-"""AIF workflow state machine + convergence-aware review gate.
+"""Multi-template workflow state machines + convergence-aware review gate.
 
 Port of lee-to's aif-handoff orchestration policies (``stateMachine.ts``,
-``reviewGate.ts``, ``autoReviewHandler.ts``) into Hermes kanban terms. This
-module is **pure logic** — no sqlite, no I/O — so every branch of the
-decision tree is unit-testable. ``kanban_db`` applies the returned patches.
+``reviewGate.ts``, ``autoReviewHandler.ts``) into Hermes kanban terms, plus
+Marketing Factory handoff templates (``marketing_fast`` / ``marketing_direct`` /
+``marketing_onboarding``) that reuse the same stage/assignee rewrite pattern.
 
-Mapping between the two worlds
-------------------------------
+This module is **pure logic** — no sqlite, no I/O — so every branch is
+unit-testable. ``kanban_db`` applies the returned patches.
 
-lee-to models ONE task card walking through role stages; Hermes dispatches
-one worker per (task, assignee). The bridge: a task with
-``workflow_template_id='aif'`` carries its stage in ``current_step_key``,
-and every stage transition rewrites ``assignee`` to the stage's role
-profile — so the existing dispatcher routes stages with zero changes.
+Mapping
+-------
+One card walks role stages via ``workflow_template_id`` + ``current_step_key``.
+Each advance rewrites ``assignee`` to the stage role profile so the existing
+dispatcher routes stages without knowing about workflows.
 
-Status mapping (lee-to → Hermes ``(status, current_step_key)``):
+* work stages → ``ready``/``running`` + step key + assignee
+* human gates → ``blocked`` / ``needs_input`` + step key (skipped in auto_mode)
+* ``verified`` → terminal Hermes ``done``
 
-* auto work stages (planning/improve/implementing/verify/review)
-  → ``ready``/``running`` + that step key
-* human gates (plan_ready, done-approval) → ``blocked`` with
-  ``block_kind='needs_input'`` + that step key (auto_mode skips them)
-* ``verified`` (terminal) → Hermes ``status='done'`` + step ``verified``.
-  A workflow card is **never** ``status='done'`` before verification, so
-  parent-gating of child tasks keeps its meaning.
-
-The convergence gate ("never guess convergence from malformed output",
-iteration cap → human) fires on review/verify FAIL verdicts: instead of
-parking the card in ``blocked`` forever or spawning unbounded rework, the
-card is sent back to ``implementing`` with the findings carried in
-``auto_review_state`` — until the cap trips or new blockers appear after
-old ones were closed, at which point a human gets it.
+Convergence on review/verify FAIL returns the card to the workflow's
+**rework** stage (AIF: ``implementing``; marketing: ``copy`` / ``produce`` /
+``distill``) until max iterations or manual handoff.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Optional
+from typing import Any, Mapping, Optional, Sequence
+
+# ---------------------------------------------------------------------------
+# Shared constants
+# ---------------------------------------------------------------------------
 
 AIF_WORKFLOW_ID = "aif"
+MKT_FAST_ID = "marketing_fast"
+MKT_DIRECT_ID = "marketing_direct"
+MKT_ONBOARDING_ID = "marketing_onboarding"
 
-# Stage keys reuse lee-to's vocabulary so their docs/skills read 1:1.
+# AIF stage keys (lee-to vocabulary).
 STAGE_SPEC = "spec"
 STAGE_PLANNING = "planning"
 STAGE_IMPROVE = "improve"
-STAGE_PLAN_READY = "plan_ready"     # human gate (skipped in auto_mode)
+STAGE_PLAN_READY = "plan_ready"
 STAGE_IMPLEMENTING = "implementing"
 STAGE_VERIFY = "verify"
 STAGE_REVIEW = "review"
-STAGE_DONE = "done"                 # human approval gate (skipped in auto_mode)
-STAGE_VERIFIED = "verified"         # terminal
+STAGE_DONE = "done"
+STAGE_VERIFIED = "verified"
+
+# Marketing stage keys (handoff factory).
+MKT_PLAN = "plan"
+MKT_PRODUCE = "produce"
+MKT_COPY = "copy"
+MKT_VERIFY = "verify"
+MKT_REVIEW = "review"
+MKT_ACCEPT = "accept"
+MKT_OWNER_GATE = "owner_gate"
+MKT_SCAFFOLD = "scaffold"
+MKT_INTAKE = "intake"
+MKT_DISTILL = "distill"
+MKT_MEMORY_REVIEW = "memory_review"
 
 WORK_STAGES = (
     STAGE_SPEC, STAGE_PLANNING, STAGE_IMPROVE,
@@ -58,8 +69,6 @@ WORK_STAGES = (
 HUMAN_GATE_STAGES = (STAGE_PLAN_READY, STAGE_DONE)
 ALL_STAGES = WORK_STAGES + HUMAN_GATE_STAGES + (STAGE_VERIFIED,)
 
-# Stage → Hermes profile that works it. Gate stages have no worker: the
-# dispatcher must never spawn for them (see is_dispatchable_stage).
 STAGE_ROLES: dict[str, str] = {
     STAGE_SPEC: "aif_specifier",
     STAGE_PLANNING: "aif_planner",
@@ -69,10 +78,6 @@ STAGE_ROLES: dict[str, str] = {
     STAGE_REVIEW: "aif_reviewer",
 }
 
-# Convergence flags cleared on every clean transition (lee-to
-# CLEAN_STATE_RESET). Keys are tasks-table columns; kanban_db turns this
-# into an UPDATE. The audit trail lives in task_events/comments, not on
-# the live fields that drive future automation decisions.
 CLEAN_STATE_RESET: dict[str, Any] = {
     "rework_requested": 0,
     "review_iteration_count": 0,
@@ -85,51 +90,275 @@ STRATEGY_FULL_RE_REVIEW = "full_re_review"
 STRATEGY_CLOSURE_FIRST = "closure_first"
 VALID_REVIEW_STRATEGIES = (STRATEGY_FULL_RE_REVIEW, STRATEGY_CLOSURE_FIRST)
 
-# Human actions available per stage (port of HUMAN_ACTIONS_BY_STATUS).
-# Only gate stages (and blocked cards) offer actions; auto stages have none.
 HUMAN_ACTIONS_BY_STAGE: dict[str, tuple[str, ...]] = {
     STAGE_PLAN_READY: ("start_implementation", "request_replanning"),
     STAGE_DONE: ("approve_done", "request_changes"),
+    MKT_OWNER_GATE: ("approve_done", "request_changes"),
 }
 
 
+# ---------------------------------------------------------------------------
+# Workflow registry
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class WorkflowSpec:
+    """One handoff pipeline template (AIF or Marketing)."""
+    id: str
+    default_entry: str
+    roles: Mapping[str, str]                 # stage → profile
+    skills: Mapping[str, tuple[str, ...]]    # stage → force-loaded skills
+    chain: tuple[str, ...]                   # ordered work stages (no human/terminal)
+    rework_stage: str                        # where review FAIL returns
+    review_stages: tuple[str, ...]           # stages that use gate_result convergence
+    human_gates: tuple[str, ...]             # optional pause stages
+    clean_reset_stages: tuple[str, ...] = () # stages that clear convergence flags on entry
+
+
+_AIF = WorkflowSpec(
+    id=AIF_WORKFLOW_ID,
+    default_entry=STAGE_PLANNING,
+    roles=STAGE_ROLES,
+    skills={
+        STAGE_SPEC: ("aif-specify", "aif-methodology"),
+        STAGE_PLANNING: ("aif-plan", "aif-methodology"),
+        STAGE_IMPROVE: ("aif-improve", "aif-methodology"),
+        STAGE_IMPLEMENTING: ("aif-implement", "aif-methodology"),
+        STAGE_VERIFY: ("aif-verify", "aif-methodology"),
+        STAGE_REVIEW: ("aif-review", "aif-security-checklist", "aif-methodology"),
+    },
+    chain=(STAGE_SPEC, STAGE_PLANNING, STAGE_IMPROVE, STAGE_IMPLEMENTING,
+           STAGE_VERIFY, STAGE_REVIEW),
+    rework_stage=STAGE_IMPLEMENTING,
+    review_stages=(STAGE_VERIFY, STAGE_REVIEW),
+    human_gates=(STAGE_PLAN_READY, STAGE_DONE),
+    clean_reset_stages=(STAGE_IMPLEMENTING,),
+)
+
+_MKT_FAST = WorkflowSpec(
+    id=MKT_FAST_ID,
+    default_entry=MKT_PRODUCE,
+    roles={
+        MKT_PRODUCE: "marketing_executor",  # overridden by skill routing when set
+        MKT_VERIFY: "marketing_executor",
+        MKT_REVIEW: "marketing_reviewer",
+        MKT_ACCEPT: "client_marketing",
+    },
+    skills={
+        MKT_PRODUCE: ("mkt-produce", "mkt-verify", "marketing-methodology"),
+        MKT_VERIFY: ("mkt-verify", "marketing-methodology"),
+        MKT_REVIEW: ("mkt-review-gate", "marketing-review", "marketing-methodology"),
+        MKT_ACCEPT: ("mkt-accept", "marketing-methodology"),
+    },
+    chain=(MKT_PRODUCE, MKT_VERIFY, MKT_REVIEW, MKT_ACCEPT),
+    rework_stage=MKT_PRODUCE,
+    review_stages=(MKT_VERIFY, MKT_REVIEW),
+    human_gates=(MKT_OWNER_GATE,),
+    clean_reset_stages=(MKT_PRODUCE,),
+)
+
+_MKT_DIRECT = WorkflowSpec(
+    id=MKT_DIRECT_ID,
+    default_entry=MKT_PLAN,
+    roles={
+        MKT_PLAN: "client_marketing",
+        MKT_COPY: "marketing_copywriter",
+        MKT_VERIFY: "marketing_copywriter",
+        MKT_REVIEW: "marketing_reviewer",
+        MKT_ACCEPT: "client_marketing",
+    },
+    skills={
+        MKT_PLAN: ("mkt-campaign-plan", "mkt-workflows", "marketing-methodology"),
+        MKT_COPY: ("mkt-produce", "mkt-verify", "direct-ads-copy", "marketing-methodology"),
+        MKT_VERIFY: ("mkt-verify", "marketing-evals", "marketing-methodology"),
+        MKT_REVIEW: ("mkt-review-gate", "marketing-review", "marketing-methodology"),
+        MKT_ACCEPT: ("mkt-accept", "marketing-methodology"),
+    },
+    chain=(MKT_PLAN, MKT_COPY, MKT_VERIFY, MKT_REVIEW, MKT_ACCEPT),
+    rework_stage=MKT_COPY,
+    review_stages=(MKT_VERIFY, MKT_REVIEW),
+    human_gates=(MKT_OWNER_GATE,),
+    clean_reset_stages=(MKT_COPY,),
+)
+
+_MKT_ONBOARDING = WorkflowSpec(
+    id=MKT_ONBOARDING_ID,
+    default_entry=MKT_SCAFFOLD,
+    roles={
+        MKT_SCAFFOLD: "client_marketing",
+        MKT_INTAKE: "intake_interviewer",
+        MKT_DISTILL: "client_marketing",
+        MKT_MEMORY_REVIEW: "marketing_reviewer",
+        MKT_ACCEPT: "client_marketing",
+    },
+    skills={
+        MKT_SCAFFOLD: ("mkt-brief", "client-knowledge-pack", "marketing-methodology"),
+        MKT_INTAKE: ("mkt-produce", "discovery-interview-pro", "client-knowledge-pack"),
+        MKT_DISTILL: (
+            "client-onboarding-pipeline", "client-knowledge-pack", "marketing-methodology",
+        ),
+        MKT_MEMORY_REVIEW: ("mkt-review-gate", "marketing-review", "client-knowledge-pack"),
+        MKT_ACCEPT: ("mkt-accept", "marketing-methodology"),
+    },
+    chain=(MKT_SCAFFOLD, MKT_INTAKE, MKT_DISTILL, MKT_MEMORY_REVIEW, MKT_ACCEPT),
+    rework_stage=MKT_DISTILL,
+    review_stages=(MKT_MEMORY_REVIEW,),
+    human_gates=(),
+    clean_reset_stages=(MKT_DISTILL,),
+)
+
+WORKFLOWS: dict[str, WorkflowSpec] = {
+    AIF_WORKFLOW_ID: _AIF,
+    MKT_FAST_ID: _MKT_FAST,
+    MKT_DIRECT_ID: _MKT_DIRECT,
+    MKT_ONBOARDING_ID: _MKT_ONBOARDING,
+}
+
+KNOWN_WORKFLOW_IDS: tuple[str, ...] = tuple(WORKFLOWS.keys())
+
+
+def workflow_id_of(row: Mapping[str, Any]) -> str:
+    return (row.get("workflow_template_id") or "").strip()
+
+
+def get_workflow(workflow_id: Optional[str]) -> Optional[WorkflowSpec]:
+    if not workflow_id:
+        return None
+    return WORKFLOWS.get(workflow_id.strip())
+
+
 def is_workflow_task(row: Mapping[str, Any]) -> bool:
-    """True when this tasks row participates in the AIF stage machine."""
-    return (row.get("workflow_template_id") or "").strip() == AIF_WORKFLOW_ID
+    """True when this tasks row participates in any registered stage machine."""
+    return workflow_id_of(row) in WORKFLOWS
 
 
-def normalize_entry_stage(step_key: Optional[str]) -> str:
-    """Stage a new workflow card starts in (default: planning).
-
-    ``spec`` is Hermes's own optional pre-stage (lee-to has no specifier);
-    it is honoured only when explicitly requested at creation.
-    """
+def normalize_entry_stage(
+    step_key: Optional[str],
+    workflow_id: Optional[str] = None,
+) -> str:
+    """Resolve entry/current stage for a workflow (default: template default)."""
     step = (step_key or "").strip()
+    wf = get_workflow(workflow_id) if workflow_id else None
+    if wf is not None:
+        known = set(wf.roles) | set(wf.human_gates) | {STAGE_VERIFIED, STAGE_DONE}
+        if step in known or step in wf.chain:
+            return step
+        return wf.default_entry
+    # Infer from any template (complete_task often omits explicit id on step check)
+    for spec in WORKFLOWS.values():
+        known = set(spec.roles) | set(spec.human_gates) | {STAGE_VERIFIED, STAGE_DONE}
+        if step in known or step in spec.chain:
+            return step
     if step in ALL_STAGES:
         return step
     return STAGE_PLANNING
 
 
-def stage_role(step_key: Optional[str]) -> Optional[str]:
-    return STAGE_ROLES.get((step_key or "").strip())
+def stage_role(
+    step_key: Optional[str],
+    workflow_id: Optional[str] = None,
+    row: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """Profile that owns a stage. Marketing produce may use pre-set assignee."""
+    step = (step_key or "").strip()
+    wf = get_workflow(workflow_id) if workflow_id else None
+    if wf is None and row is not None:
+        wf = get_workflow(workflow_id_of(row))
+    if wf is None:
+        # Infer from stage name (unique marketing stages; AIF-shared last).
+        for spec in WORKFLOWS.values():
+            if step in spec.roles:
+                wf = spec
+                break
+    if wf is not None:
+        role = wf.roles.get(step)
+        # marketing_fast produce: honour explicit assignee if already a known
+        # marketing producer (skill-routed at create time).
+        if (
+            wf.id == MKT_FAST_ID
+            and step == MKT_PRODUCE
+            and row is not None
+        ):
+            existing = (row.get("assignee") or "").strip()
+            producers = {
+                "marketing_executor", "marketing_copywriter", "marketing_designer",
+                "marketing_analyst", "smm_manager", "intake_interviewer",
+            }
+            if existing in producers:
+                return existing
+        return role
+    return STAGE_ROLES.get(step)
 
 
-def is_dispatchable_stage(step_key: Optional[str]) -> bool:
-    """Gate/terminal stages have no worker; the dispatcher must skip them."""
-    return (step_key or "").strip() in STAGE_ROLES
+def stage_skills(
+    step_key: Optional[str],
+    workflow_id: Optional[str] = None,
+) -> tuple[str, ...]:
+    wf = get_workflow(workflow_id)
+    if wf is None:
+        return ()
+    return wf.skills.get((step_key or "").strip(), ())
+
+
+def is_dispatchable_stage(
+    step_key: Optional[str],
+    workflow_id: Optional[str] = None,
+) -> bool:
+    """Gate/terminal stages have no worker; dispatcher must skip them."""
+    return stage_role(step_key, workflow_id) is not None
+
+
+def is_review_gate_stage(
+    step_key: Optional[str],
+    workflow_id: Optional[str] = None,
+) -> bool:
+    """Stages whose FAIL goes through convergence (verify/review/memory_review)."""
+    step = (step_key or "").strip()
+    wf = get_workflow(workflow_id)
+    if wf is not None:
+        return step in wf.review_stages
+    return step in (STAGE_VERIFY, STAGE_REVIEW)
+
+
+def rework_target(row: Mapping[str, Any]) -> tuple[str, Optional[str]]:
+    """(step, assignee) for review-FAIL rework."""
+    wf = get_workflow(workflow_id_of(row))
+    if wf is None:
+        return STAGE_IMPLEMENTING, STAGE_ROLES[STAGE_IMPLEMENTING]
+    step = wf.rework_stage
+    return step, stage_role(step, wf.id, row)
+
+
+def resolve_marketing_producer_from_skills(
+    skills: Optional[Sequence[str]],
+) -> Optional[str]:
+    """Map skill name(s) → marketing profile via routing.yaml (if present)."""
+    if not skills:
+        return None
+    try:
+        from pathlib import Path
+        import yaml  # type: ignore
+        path = Path.home() / ".hermes" / "routing" / "marketing-routing.yaml"
+        if not path.is_file():
+            return None
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        by_skill = data.get("by_skill") or {}
+        for sk in skills:
+            key = str(sk).strip()
+            if key in by_skill:
+                return str(by_skill[key]).strip() or None
+            # prefix match
+            for sk_name, prof in by_skill.items():
+                if key.startswith(str(sk_name)):
+                    return str(prof).strip() or None
+    except Exception:
+        return None
+    return None
 
 
 @dataclass
 class StagePatch:
-    """One state-machine step, expressed as column updates + bookkeeping.
-
-    ``status``/``step``/``assignee`` describe where the card lands.
-    ``terminal`` means "complete for real" (Hermes done + step verified).
-    ``block_reason`` is set when the card lands in ``blocked`` (human gate
-    or manual review handoff). ``events`` are (event_name, payload) pairs
-    for the task_events audit trail; ``comment`` (if any) is a
-    human-readable summary posted to task_comments.
-    """
+    """One state-machine step, expressed as column updates + bookkeeping."""
     status: str
     step: str
     assignee: Optional[str] = None
@@ -138,6 +367,7 @@ class StagePatch:
     columns: dict[str, Any] = field(default_factory=dict)
     events: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
     comment: Optional[str] = None
+    skills: Optional[Sequence[str]] = None  # force-load list for next stage
 
 
 def _flag(row: Mapping[str, Any], key: str, default: bool = False) -> bool:
@@ -147,48 +377,122 @@ def _flag(row: Mapping[str, Any], key: str, default: bool = False) -> bool:
     return bool(val)
 
 
+def _work_patch(
+    *,
+    wf: WorkflowSpec,
+    from_step: str,
+    next_step: str,
+    row: Mapping[str, Any],
+    extra_events: Optional[list] = None,
+) -> StagePatch:
+    cols: dict[str, Any] = {}
+    if next_step in wf.clean_reset_stages:
+        cols = dict(CLEAN_STATE_RESET)
+    skills = stage_skills(next_step, wf.id)
+    return StagePatch(
+        status="ready",
+        step=next_step,
+        assignee=stage_role(next_step, wf.id, row),
+        columns=cols,
+        events=[("workflow_advanced",
+                 {"from": from_step, "to": next_step, "workflow": wf.id})]
+        + (extra_events or []),
+        skills=list(skills) if skills else None,
+    )
+
+
+def _human_gate_patch(
+    *,
+    wf: WorkflowSpec,
+    from_step: str,
+    gate_step: str,
+) -> StagePatch:
+    actions = HUMAN_ACTIONS_BY_STAGE.get(gate_step, ("approve_done", "request_changes"))
+    return StagePatch(
+        status="blocked",
+        step=gate_step,
+        assignee=None,
+        block_reason=f"workflow human gate '{gate_step}' — actions: {', '.join(actions)}",
+        events=[(
+            "workflow_human_gate",
+            {"from": from_step, "gate": gate_step, "workflow": wf.id,
+             "actions": list(actions)},
+        )],
+    )
+
+
+def _terminal_verified(from_step: str, workflow: str, auto_mode: bool = False) -> StagePatch:
+    return StagePatch(
+        status="done",
+        step=STAGE_VERIFIED,
+        terminal=True,
+        columns=dict(CLEAN_STATE_RESET),
+        events=[("workflow_advanced",
+                 {"from": from_step, "to": STAGE_VERIFIED,
+                  "workflow": workflow, "auto_mode": auto_mode})],
+    )
+
+
 def next_stage_on_success(
     row: Mapping[str, Any],
     *,
     run_plan_improve_default: bool = False,
     run_post_verify_default: bool = True,
 ) -> StagePatch:
-    """Advance a workflow card after its current stage completed cleanly.
+    """Advance a workflow card after its current stage completed cleanly."""
+    wf_id = workflow_id_of(row) or AIF_WORKFLOW_ID
+    wf = get_workflow(wf_id)
+    if wf is None:
+        wf = _AIF
+        wf_id = AIF_WORKFLOW_ID
 
-    Port of the coordinator's stage table: planning→plan_ready,
-    implementing→review (via verify when enabled), review→done — with the
-    two human gates collapsed away when ``auto_mode`` is on. Verify/review
-    SUCCESS lands here; their FAIL verdicts go through
-    :func:`evaluate_review_gate` instead.
-    """
-    step = normalize_entry_stage(row.get("current_step_key"))
+    step = normalize_entry_stage(row.get("current_step_key"), wf_id)
     auto_mode = _flag(row, "auto_mode", default=True)
+
+    if wf_id == AIF_WORKFLOW_ID:
+        return _next_aif(
+            row, step=step, auto_mode=auto_mode,
+            run_plan_improve_default=run_plan_improve_default,
+            run_post_verify_default=run_post_verify_default,
+        )
+
+    # Linear marketing chains (fast / direct / onboarding)
+    chain = list(wf.chain)
+    if step in chain:
+        idx = chain.index(step)
+        if idx + 1 < len(chain):
+            return _work_patch(wf=wf, from_step=step, next_step=chain[idx + 1], row=row)
+        # last work stage done → owner_gate (if any and not auto) else verified
+        if wf.human_gates and not auto_mode:
+            return _human_gate_patch(wf=wf, from_step=step, gate_step=wf.human_gates[0])
+        return _terminal_verified(step, wf_id, auto_mode=True)
+
+    if step in wf.human_gates:
+        return _terminal_verified(step, wf_id)
+
+    return _terminal_verified(step, wf_id)
+
+
+def _next_aif(
+    row: Mapping[str, Any],
+    *,
+    step: str,
+    auto_mode: bool,
+    run_plan_improve_default: bool,
+    run_post_verify_default: bool,
+) -> StagePatch:
     run_improve = _flag(row, "run_plan_improve", default=run_plan_improve_default)
     run_verify = _flag(row, "run_post_verify", default=run_post_verify_default)
+    wf = _AIF
 
     def _work(next_step: str, extra_events: Optional[list] = None) -> StagePatch:
-        return StagePatch(
-            status="ready",
-            step=next_step,
-            assignee=STAGE_ROLES[next_step],
-            columns=dict(CLEAN_STATE_RESET) if next_step == STAGE_IMPLEMENTING else {},
-            events=[("workflow_advanced", {"from": step, "to": next_step})]
-            + (extra_events or []),
+        return _work_patch(
+            wf=wf, from_step=step, next_step=next_step, row=row,
+            extra_events=extra_events,
         )
 
     def _human_gate(gate_step: str) -> StagePatch:
-        actions = ", ".join(HUMAN_ACTIONS_BY_STAGE[gate_step])
-        return StagePatch(
-            status="blocked",
-            step=gate_step,
-            assignee=None,
-            block_reason=f"workflow human gate '{gate_step}' — actions: {actions}",
-            events=[(
-                "workflow_human_gate",
-                {"from": step, "gate": gate_step,
-                 "actions": list(HUMAN_ACTIONS_BY_STAGE[gate_step])},
-            )],
-        )
+        return _human_gate_patch(wf=wf, from_step=step, gate_step=gate_step)
 
     if step == STAGE_SPEC:
         return _work(STAGE_PLANNING)
@@ -204,76 +508,57 @@ def next_stage_on_success(
         return _work(STAGE_REVIEW)
     if step == STAGE_REVIEW:
         if auto_mode:
-            # done-approval gate skipped: review PASS is the acceptance
-            # authority (department law) → straight to terminal verified.
-            return StagePatch(
-                status="done",
-                step=STAGE_VERIFIED,
-                terminal=True,
-                columns=dict(CLEAN_STATE_RESET),
-                events=[("workflow_advanced",
-                         {"from": step, "to": STAGE_VERIFIED, "auto_mode": True})],
-            )
+            return _terminal_verified(step, AIF_WORKFLOW_ID, auto_mode=True)
         return _human_gate(STAGE_DONE)
-    # Completing a card already at a gate/terminal step (CLI misuse):
-    # treat as approval of the whole card.
-    return StagePatch(
-        status="done",
-        step=STAGE_VERIFIED,
-        terminal=True,
-        columns=dict(CLEAN_STATE_RESET),
-        events=[("workflow_advanced", {"from": step, "to": STAGE_VERIFIED})],
-    )
+    return _terminal_verified(step, AIF_WORKFLOW_ID)
 
 
 def apply_human_event(row: Mapping[str, Any], event: str) -> StagePatch:
-    """Port of ``applyHumanTaskEvent`` — human actions on gate stages.
-
-    Raises ``ValueError`` with the same guard semantics lee-to uses
-    ("X is only allowed from Y") when the action doesn't fit the stage.
-    """
+    """Human actions on gate stages (AIF plan_ready/done + marketing owner_gate)."""
     step = (row.get("current_step_key") or "").strip()
+    wf_id = workflow_id_of(row) or AIF_WORKFLOW_ID
+    wf = get_workflow(wf_id) or _AIF
 
     if event == "start_implementation":
         if step != STAGE_PLAN_READY:
             raise ValueError("start_implementation is only allowed from plan_ready")
-        return StagePatch(
-            status="ready", step=STAGE_IMPLEMENTING,
-            assignee=STAGE_ROLES[STAGE_IMPLEMENTING],
-            columns=dict(CLEAN_STATE_RESET),
-            events=[("workflow_human_action",
-                     {"action": event, "from": step, "to": STAGE_IMPLEMENTING})],
+        return _work_patch(
+            wf=_AIF, from_step=step, next_step=STAGE_IMPLEMENTING, row=row,
+            extra_events=[("workflow_human_action",
+                           {"action": event, "from": step, "to": STAGE_IMPLEMENTING})],
         )
     if event == "request_replanning":
         if step != STAGE_PLAN_READY:
             raise ValueError("request_replanning is only allowed from plan_ready")
-        return StagePatch(
-            status="ready", step=STAGE_PLANNING,
-            assignee=STAGE_ROLES[STAGE_PLANNING],
-            columns=dict(CLEAN_STATE_RESET),
-            events=[("workflow_human_action",
-                     {"action": event, "from": step, "to": STAGE_PLANNING})],
+        return _work_patch(
+            wf=_AIF, from_step=step, next_step=STAGE_PLANNING, row=row,
+            extra_events=[("workflow_human_action",
+                           {"action": event, "from": step, "to": STAGE_PLANNING})],
         )
     if event == "approve_done":
-        if step != STAGE_DONE:
-            raise ValueError("approve_done is only allowed from done")
+        if step not in (STAGE_DONE, MKT_OWNER_GATE):
+            raise ValueError("approve_done is only allowed from done or owner_gate")
         return StagePatch(
             status="done", step=STAGE_VERIFIED, terminal=True,
             columns=dict(CLEAN_STATE_RESET),
             events=[("workflow_human_action",
-                     {"action": event, "from": step, "to": STAGE_VERIFIED})],
+                     {"action": event, "from": step, "to": STAGE_VERIFIED,
+                      "workflow": wf_id})],
         )
     if event == "request_changes":
-        if step != STAGE_DONE:
-            raise ValueError("request_changes is only allowed from done")
+        if step not in (STAGE_DONE, MKT_OWNER_GATE):
+            raise ValueError("request_changes is only allowed from done or owner_gate")
+        rework_step, rework_assignee = rework_target(row)
         cols = dict(CLEAN_STATE_RESET)
-        cols["rework_requested"] = 1  # reset-then-set, exactly like lee-to
+        cols["rework_requested"] = 1
         return StagePatch(
-            status="ready", step=STAGE_IMPLEMENTING,
-            assignee=STAGE_ROLES[STAGE_IMPLEMENTING],
+            status="ready", step=rework_step,
+            assignee=rework_assignee,
             columns=cols,
+            skills=list(stage_skills(rework_step, wf_id)) or None,
             events=[("workflow_human_action",
-                     {"action": event, "from": step, "to": STAGE_IMPLEMENTING})],
+                     {"action": event, "from": step, "to": rework_step,
+                      "workflow": wf_id})],
         )
     raise ValueError(f"unknown workflow human event: {event}")
 

@@ -13480,45 +13480,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         }
 
     async def _ensure_telegram_system_topic(self, source: SessionSource) -> None:
-        """Create/pin the managed System topic after /topic activation when possible."""
-        adapter = self._adapter_for_source(source)
-        if adapter is None or not source.chat_id:
-            return
+        """No-op: auto-create of a managed System topic is retired.
 
-        thread_id = None
-        create_topic = getattr(adapter, "_create_dm_topic", None)
-        if callable(create_topic):
-            try:
-                thread_id = await create_topic(int(source.chat_id), "System")
-            except Exception:
-                logger.debug("Failed to create Telegram System topic", exc_info=True)
-        if not thread_id:
-            return
-
-        message_id = None
-        try:
-            send_result = await adapter.send(
-                source.chat_id,
-                "System topic for Hermes commands and status.",
-                metadata={"thread_id": str(thread_id)},
-            )
-            message_id = getattr(send_result, "message_id", None)
-        except Exception:
-            logger.debug("Failed to send Telegram System topic intro", exc_info=True)
-        if not message_id:
-            return
-
-        bot = getattr(adapter, "_bot", None)
-        if bot is None or not hasattr(bot, "pin_chat_message"):
-            return
-        try:
-            await bot.pin_chat_message(
-                chat_id=int(source.chat_id),
-                message_id=int(message_id),
-                disable_notification=True,
-            )
-        except Exception:
-            logger.debug("Failed to pin Telegram System topic intro", exc_info=True)
+        A dedicated System dump lane stole status/kanban signals out of work
+        topics and created orphan PM sessions. Do not reintroduce without an
+        explicit product decision; see telegram adapter
+        ``_apply_system_topic_redirect`` (also disabled by default).
+        """
+        return
 
     async def _send_telegram_topic_setup_image(self, source: SessionSource) -> None:
         """Send the bundled BotFather Threads Settings screenshot when available."""

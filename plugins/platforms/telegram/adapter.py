@@ -3619,29 +3619,28 @@ class TelegramAdapter(BasePlatformAdapter):
         content: str,
         metadata: Optional[Dict[str, Any]],
     ) -> tuple[str, Optional[Dict[str, Any]]]:
-        """Redirect non-agent DM-topic system/status pings to the ``System`` topic.
+        """Preserve origin-topic delivery (System-topic redirect retired).
 
-        Hermes-managed DM topic lanes fan a session out across per-purpose
-        Telegram forum topics (Development, System, ...). Agent conversational
-        replies stay in their originating topic, but internal/status pings
-        (kanban notifications, lifecycle updates, errors — anything without
-        ``is_agent``) are centralized into the chat's ``System`` topic instead
-        of scattering across every DM topic, so operators have one place to
-        watch. The content is prefixed with the origin topic's name (e.g.
-        ``📍 *[Development]*``) so a centralized message still says what it's
-        about; the reply anchor is dropped since it belongs to the origin
-        topic's message, not System's.
+        Historical behaviour: non-agent/status/commentary DM-topic pings were
+        rewritten onto a chat-local ``System`` forum topic so operators had one
+        dump lane. In practice that:
 
-        No-ops (returns content/metadata unchanged) when: not a DM-topic-
-        fallback send, the chat has no registered System topic, the send is
-        already targeting System, or the current thread can't be resolved to
-        a known topic name. Also no-ops for genuine agent-to-user output:
-        a final/notified reply (``notify``) is never redirected regardless of
-        other flags, and a plain agent reply (``is_agent`` without
-        ``is_commentary``) stays put — but agent *commentary* (tool-use
-        narration, ``is_agent`` + ``is_commentary``) is treated as system
-        noise and still redirected, same as a plain status/error ping.
+        * stole kanban/status signals out of client/work topics;
+        * created orphan PM sessions under ``:group:<chat>:System`` that never
+          matched the live ``:dm:<chat>:<client_thread>`` session keys;
+        * collided multiple ``pm_*`` profiles on one shared thread when
+          ``multiplex_profiles`` is off.
+
+        Redirect is therefore permanently disabled. Messages stay in the
+        ``thread_id`` the caller set. Opt-in emergency revive:
+        ``HERMES_TELEGRAM_SYSTEM_TOPIC_REDIRECT=1`` plus a registered
+        ``dm_topics`` entry named ``System`` — not recommended.
         """
+        if os.getenv("HERMES_TELEGRAM_SYSTEM_TOPIC_REDIRECT", "").strip() not in (
+            "1", "true", "yes", "on",
+        ):
+            return content, metadata
+
         if not metadata or not metadata.get("telegram_dm_topic_reply_fallback"):
             return content, metadata
         if metadata.get("notify"):
@@ -3679,15 +3678,7 @@ class TelegramAdapter(BasePlatformAdapter):
         redirected_metadata = dict(metadata)
         redirected_metadata["thread_id"] = str(system_thread_id)
         redirected_metadata.pop("telegram_reply_to_message_id", None)
-        # The dropped anchor belonged to the origin topic's message, not
-        # System's — this redirect is anchor-less BY DEFINITION, same as the
-        # kanban notifier/other non-session system pings; opt in explicitly
-        # so the fail-loud "DM topic delivery requires a reply anchor"
-        # contract doesn't refuse the send.
         redirected_metadata["telegram_dm_topic_anchorless_ok"] = True
-        # Double-asterisk (GFM bold) — format_message() renders a single `*`
-        # as MarkdownV2 italic (`_..._`); the desired MarkdownV2 output is
-        # bold (`*..*`), which comes from GFM `**..**` input.
         return f"📍 **[{origin_name}]**\n{content}", redirected_metadata
 
     async def send(

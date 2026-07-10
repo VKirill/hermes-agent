@@ -2578,36 +2578,64 @@ def create_task(
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
 
-    ``workflow='aif'`` opts the card into the AIF stage machine
-    (:mod:`hermes_cli.kanban_workflow`): ``workflow_step`` picks the entry
-    stage (default ``planning``) and the assignee is FORCED to the stage's
-    role profile — the stage owns the role, and every advance rewrites the
-    assignee so the dispatcher routes stages without knowing about
-    workflows. ``auto_mode`` (workflow tasks only) toggles the human gates
-    at plan_ready / done-approval; ``None`` means auto (department default).
+    ``workflow`` opts the card into a registered stage machine
+    (:mod:`hermes_cli.kanban_workflow`): ``aif`` (dev factory) or
+    ``marketing_fast`` / ``marketing_direct`` / ``marketing_onboarding``.
+    ``workflow_step`` picks the entry stage (template default if omitted)
+    and the assignee is FORCED to the stage's role profile — the stage owns
+    the role, and every advance rewrites the assignee so the dispatcher
+    routes stages without knowing about workflows. For ``marketing_fast``
+    produce stage, a skill-routed assignee (copywriter/designer/…) may be
+    preserved when already set. ``auto_mode`` toggles human gates
+    (AIF plan_ready/done; marketing owner_gate); ``None`` means auto.
     """
     assignee = _canonical_assignee(assignee)
     workflow = (workflow or "").strip() or None
     workflow_step_normalized: Optional[str] = None
     if workflow is not None:
         from hermes_cli import kanban_workflow as _kwf
-        if workflow != _kwf.AIF_WORKFLOW_ID:
+        if workflow not in _kwf.KNOWN_WORKFLOW_IDS:
             raise ValueError(
-                f"workflow must be {_kwf.AIF_WORKFLOW_ID!r} or None, got {workflow!r}"
+                f"workflow must be one of {list(_kwf.KNOWN_WORKFLOW_IDS)!r} "
+                f"or None, got {workflow!r}"
             )
-        workflow_step_normalized = _kwf.normalize_entry_stage(workflow_step)
-        stage_assignee = _kwf.stage_role(workflow_step_normalized)
+        workflow_step_normalized = _kwf.normalize_entry_stage(
+            workflow_step, workflow
+        )
+        # marketing_fast: optional skill list → producer profile (routing.yaml)
+        if workflow == _kwf.MKT_FAST_ID and skills is not None:
+            routed = _kwf.resolve_marketing_producer_from_skills(
+                list(skills) if not isinstance(skills, list) else skills
+            )
+            if routed:
+                assignee = _canonical_assignee(routed)
+        # Seed row for produce-stage skill routing on marketing_fast.
+        _seed = {
+            "workflow_template_id": workflow,
+            "assignee": assignee,
+            "current_step_key": workflow_step_normalized,
+        }
+        stage_assignee = _kwf.stage_role(
+            workflow_step_normalized, workflow, _seed
+        )
         if stage_assignee is None:
             raise ValueError(
                 f"workflow_step {workflow_step_normalized!r} is not a "
-                "dispatchable entry stage"
+                f"dispatchable entry stage for workflow {workflow!r}"
             )
-        # Stage owns the role: an explicitly-passed assignee is overridden,
-        # not honoured — a workflow card assigned off-role would deadlock
-        # (its completion handler expects the stage's role to advance it).
+        # Stage owns the role (except marketing_fast produce with prior
+        # skill-routed assignee — stage_role already preserved it).
         assignee = stage_assignee
+        # Pin stage skills when caller did not force a skills list.
+        if skills is None:
+            pinned = _kwf.stage_skills(workflow_step_normalized, workflow)
+            if pinned:
+                skills = list(pinned)
     elif workflow_step:
-        raise ValueError("workflow_step requires workflow='aif'")
+        raise ValueError(
+            "workflow_step requires --workflow "
+            "(aif|marketing_fast|marketing_direct|marketing_onboarding)"
+        )
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -2870,17 +2898,15 @@ def create_task(
                     # OR IGNORE dedupes multi-parent overlaps and pre-existing
                     # identical subs. last_event_id starts at 0 — the child
                     # has its own event stream.
-                    placeholders = ",".join("?" * len(parents))
-                    conn.execute(
-                        f"""INSERT OR IGNORE INTO kanban_notify_subs
-                            (task_id, platform, chat_id, thread_id, user_id,
-                             notifier_profile, created_at, last_event_id)
-                            SELECT ?, platform, chat_id, thread_id, user_id,
-                                   notifier_profile, ?, 0
-                            FROM kanban_notify_subs
-                            WHERE task_id IN ({placeholders})""",
-                        (task_id, int(time.time()), *parents),
+                    _inherit_notify_subs_from(
+                        conn, task_id=task_id, source_ids=list(parents), now=now,
                     )
+                # Out-of-box: tenant → client Telegram topic from
+                # client-topic-registry + config.tenant_notify. Agents never
+                # call notify-subscribe; worker creates have no TG session.
+                ensure_task_notify_subs(
+                    conn, task_id, tenant=tenant, now=now, catch_up_latest=False,
+                )
                 _append_event(
                     conn,
                     task_id,
@@ -3041,6 +3067,14 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         conn.execute(
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
             (parent_id, child_id),
+        )
+        # Late links (create then link) must also inherit parent notify
+        # targets — otherwise site-fix / rework children complete into silence.
+        _inherit_notify_subs_from(
+            conn,
+            task_id=child_id,
+            source_ids=[parent_id],
+            now=int(time.time()),
         )
         # If child was ready but parent is not yet done, demote child to todo.
         parent_status = conn.execute(
@@ -4313,6 +4347,9 @@ def _apply_stage_patch(
         if patch.status == "blocked":
             sets.append("block_kind = ?")
             params.append("needs_input")
+        if getattr(patch, "skills", None) is not None:
+            sets.append("skills = ?")
+            params.append(json.dumps(list(patch.skills), ensure_ascii=False))
         for col, val in (patch.columns or {}).items():
             sets.append(f"{col} = ?")
             params.append(val)
@@ -4353,7 +4390,8 @@ def _workflow_intercept_complete(
         return None
     defaults = _workflow_defaults()
     row_map = dict(row)
-    step = _kwf.normalize_entry_stage(row_map.get("current_step_key"))
+    wf_id = _kwf.workflow_id_of(row_map)
+    step = _kwf.normalize_entry_stage(row_map.get("current_step_key"), wf_id)
 
     patch = _kwf.next_stage_on_success(
         row_map,
@@ -4362,7 +4400,7 @@ def _workflow_intercept_complete(
     )
 
     gate_result = (metadata or {}).get("gate_result")
-    if step in (_kwf.STAGE_REVIEW, _kwf.STAGE_VERIFY) and gate_result:
+    if _kwf.is_review_gate_stage(step, wf_id) and gate_result:
         # PASS through the convergence gate: record the round's metrics so
         # the audit trail shows the loop ENDED, not just that it ran.
         decision = _kwf.evaluate_review_gate(
@@ -4431,7 +4469,8 @@ def _workflow_intercept_block(
     if row is None:
         return None
     step = (row["current_step_key"] or "").strip()
-    if step not in (_kwf.STAGE_REVIEW, _kwf.STAGE_VERIFY):
+    wf_id = _kwf.workflow_id_of(dict(row))
+    if not _kwf.is_review_gate_stage(step, wf_id):
         return None
 
     defaults = _workflow_defaults()
@@ -4445,10 +4484,12 @@ def _workflow_intercept_block(
     summary_comment = _kwf.build_gate_summary(decision)
 
     if decision.status == "rework":
+        rework_step, rework_assignee = _kwf.rework_target(row_map)
+        rework_skills = _kwf.stage_skills(rework_step, wf_id)
         patch = _kwf.StagePatch(
             status="ready",
-            step=_kwf.STAGE_IMPLEMENTING,
-            assignee=_kwf.STAGE_ROLES[_kwf.STAGE_IMPLEMENTING],
+            step=rework_step,
+            assignee=rework_assignee,
             columns={
                 "review_iteration_count": decision.iteration,
                 "auto_review_state": decision.auto_review_state,
@@ -4457,9 +4498,11 @@ def _workflow_intercept_block(
             },
             events=[(
                 "review_rework",
-                {"from": step, "reason": reason, **decision.metrics},
+                {"from": step, "to": rework_step, "reason": reason,
+                 "workflow": wf_id, **decision.metrics},
             )],
             comment=summary_comment,
+            skills=list(rework_skills) if rework_skills else None,
         )
         _apply_stage_patch(
             conn, task_id, patch,
@@ -4525,7 +4568,7 @@ def apply_workflow_human_event(
     if row is None:
         raise ValueError(f"unknown task {task_id}")
     if not _kwf.is_workflow_task(dict(row)):
-        raise ValueError(f"task {task_id} is not an AIF workflow card")
+        raise ValueError(f"task {task_id} is not a workflow card")
 
     patch = _kwf.apply_human_event(dict(row), event)
 
@@ -4720,6 +4763,9 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        # Ensure client-topic sub exists so gateway delivers completion even
+        # when create ran without tenant_notify (agents never call subscribe).
+        ensure_task_notify_subs(conn, task_id, catch_up_latest=True)
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -5347,6 +5393,9 @@ def block_task(
                 {"reason": reason, "kind": kind, "recurrences": recurrences},
                 run_id=run_id,
             )
+            # Out-of-box topic ping even if create-time tenant_notify was missed
+            # (profile config without map). catch_up so this blocked event ships.
+            ensure_task_notify_subs(conn, task_id, catch_up_latest=True)
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
@@ -5769,6 +5818,14 @@ def decompose_triage_task(
                 conn, new_id, "created",
                 {"by": author or "decomposer", "from_decompose_of": task_id},
             )
+            # Inline create path (no create_task write_txn): still wire
+            # client-topic notify so fan-out doesn't complete into silence.
+            _inherit_notify_subs_from(
+                conn, task_id=new_id, source_ids=[task_id], now=now,
+            )
+            _apply_tenant_notify_subs(
+                conn, task_id=new_id, tenant=tenant, now=now,
+            )
             child_ids.append(new_id)
 
         # Link children to their sibling parents (within the decomposed graph).
@@ -5780,6 +5837,9 @@ def decompose_triage_task(
                     "INSERT OR IGNORE INTO task_links (parent_id, child_id) "
                     "VALUES (?, ?)",
                     (parent_id, child_id),
+                )
+                _inherit_notify_subs_from(
+                    conn, task_id=child_id, source_ids=[parent_id], now=now,
                 )
                 _append_event(
                     conn, child_id, "linked",
@@ -7494,6 +7554,7 @@ def _record_task_failure(
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            ensure_task_notify_subs(conn, task_id, catch_up_latest=True)
             blocked = True
         else:
             # Below threshold.
@@ -7704,7 +7765,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     if wf_row is not None and (wf_row["workflow_template_id"] or "").strip():
         from hermes_cli import kanban_workflow as _kwf
         if _kwf.is_workflow_task(dict(wf_row)) and _kwf.is_dispatchable_stage(
-            wf_row["current_step_key"]
+            wf_row["current_step_key"],
+            (wf_row["workflow_template_id"] or "").strip(),
         ):
             return None
 
@@ -8010,7 +8072,8 @@ def _dispatch_once_locked(
         if (row["workflow_template_id"] or "").strip():
             from hermes_cli import kanban_workflow as _kwf
             if _kwf.is_workflow_task(dict(row)) and not _kwf.is_dispatchable_stage(
-                row["current_step_key"]
+                row["current_step_key"],
+                (row["workflow_template_id"] or "").strip(),
             ):
                 _log.debug(
                     "kanban dispatch: skipping workflow task %s at "
@@ -8565,6 +8628,29 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    # xAI topic/chat profiles need SOCKS for region access.
+    # Claude Agent SDK breaks on socks5h (UnsupportedProxyProtocol); Chromium
+    # also rejects socks5h (ERR_NO_SUPPORTED_PROXIES). Marketing kanban workers
+    # run Claude or OpenAI Codex — strip proxies for them. Leave SOCKS for
+    # xAI-backed chat profiles (pm_*, etc.) if they ever spawn workers.
+    _assignee_l = (profile_arg or "").lower()
+    _no_socks_assignees = {
+        "landing_qa", "marketing_copywriter", "marketing_reviewer",
+        "aif_reviewer", "marketing_copywriter_sonnet",
+        "marketing_executor", "marketing_designer", "marketing_analyst",
+        "aif_specifier", "aif_planner", "aif_verifier", "client_marketing",
+    }
+    if (
+        _assignee_l in _no_socks_assignees
+        or "anthropic" in _assignee_l
+        or _assignee_l.startswith("marketing_")
+        or _assignee_l.startswith("aif_")
+    ):
+        for _proxy_key in (
+            "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy",
+            "HTTPS_PROXY", "https_proxy", "SOCKS_PROXY", "socks_proxy",
+        ):
+            env.pop(_proxy_key, None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -8848,11 +8934,14 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if wf_row is not None and (wf_row["workflow_template_id"] or "").strip():
         from hermes_cli import kanban_workflow as _kwf
         if _kwf.is_workflow_task(dict(wf_row)):
-            step = _kwf.normalize_entry_stage(wf_row["current_step_key"])
-            lines.append("## AIF workflow stage")
+            wf_id = (wf_row["workflow_template_id"] or "").strip()
+            step = _kwf.normalize_entry_stage(wf_row["current_step_key"], wf_id)
+            role = _kwf.stage_role(step, wf_id, dict(wf_row)) or "gate"
+            label = "AIF" if wf_id == _kwf.AIF_WORKFLOW_ID else "Marketing handoff"
+            lines.append(f"## {label} workflow stage")
             lines.append(
-                f"This card walks the AIF stage machine; you are the "
-                f"**{step}** stage ({_kwf.stage_role(step) or 'gate'}). "
+                f"This card walks the **{wf_id}** stage machine; you are the "
+                f"**{step}** stage ({role}). "
                 "`kanban_complete` = THIS STAGE is done (the card advances "
                 "to the next stage/role automatically) — do NOT do the "
                 "other stages' work. Gate stages (verify/review) MUST pass "
@@ -9164,6 +9253,348 @@ def task_age(task: Task) -> dict:
 # ---------------------------------------------------------------------------
 # Notification subscriptions (used by the gateway kanban-notifier)
 # ---------------------------------------------------------------------------
+
+# Default notifier profile when only client-topic-registry is known (no config override).
+# Delivery still works via single-adapter fallback if the profile has no Telegram adapter.
+_REGISTRY_DEFAULT_NOTIFIER_PROFILE: dict[str, str] = {
+    "andyspark": "client_marketing",
+    "domlogist": "client_marketing",
+    "gas-cleaning": "pm_gascleaning",
+    "pisateli-forest": "pm_pisateli",
+}
+
+
+def _client_registry_paths() -> list:
+    """Candidate paths for MarketingClients client-topic-registry.yaml."""
+    from pathlib import Path
+    import os
+
+    out: list = []
+    env = os.environ.get("HERMES_CLIENT_TOPIC_REGISTRY", "").strip()
+    if env:
+        out.append(Path(env).expanduser())
+    out.append(Path.home() / "MarketingClients" / "client-topic-registry.yaml")
+    out.append(Path("/Users/vechkasov/MarketingClients/client-topic-registry.yaml"))
+    # de-dupe preserve order
+    seen: set[str] = set()
+    uniq = []
+    for p in out:
+        k = str(p)
+        if k not in seen:
+            seen.add(k)
+            uniq.append(p)
+    return uniq
+
+
+def _load_notify_map_from_client_registry() -> dict:
+    """Build tenant → telegram notify entries from client-topic-registry (SSOT).
+
+    Agents never configure this — if a task has ``tenant=<client_slug>`` and the
+    registry has telegram.chat_id + thread_id, notifications go to that topic
+    out of the box.
+    """
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        return {}
+    for path in _client_registry_paths():
+        try:
+            if not path.is_file():
+                continue
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            continue
+        clients = data.get("clients")
+        if not isinstance(clients, list):
+            continue
+        raw: dict = {}
+        for c in clients:
+            if not isinstance(c, dict):
+                continue
+            slug = str(c.get("client_slug") or "").strip()
+            tg = c.get("telegram") if isinstance(c.get("telegram"), dict) else {}
+            chat_id = str(tg.get("chat_id") or "").strip()
+            thread_id = str(tg.get("thread_id") or "").strip()
+            if not slug or not chat_id or not thread_id:
+                continue
+            profile = (
+                str(c.get("notifier_profile") or "").strip()
+                or _REGISTRY_DEFAULT_NOTIFIER_PROFILE.get(slug)
+                or f"pm_{slug.replace('-', '_')}"
+            )
+            raw[slug] = {
+                "platform": "telegram",
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "notifier_profile": profile,
+            }
+        if raw:
+            return raw
+    return {}
+
+
+def _load_notify_map_from_yaml_configs() -> dict:
+    """Load ``kanban.tenant_notify`` from active config + root Hermes home."""
+    raw: dict = {}
+    try:
+        from hermes_cli.config import load_config
+
+        cand = ((load_config() or {}).get("kanban") or {}).get("tenant_notify") or {}
+        if isinstance(cand, dict) and cand:
+            raw = dict(cand)
+    except Exception:
+        pass
+    # Profile home often omits tenant_notify — merge root ~/.hermes/config.yaml
+    try:
+        import os
+        from pathlib import Path
+
+        import yaml  # type: ignore
+
+        home = Path(
+            os.environ.get("HERMES_HOME") or Path.home() / ".hermes"
+        ).expanduser().resolve()
+        candidates = [home / "config.yaml"]
+        if home.parent.name == "profiles":
+            candidates.insert(0, home.parent.parent / "config.yaml")
+        candidates.append(Path.home() / ".hermes" / "config.yaml")
+        seen: set[str] = set()
+        for p in candidates:
+            key = str(p)
+            if key in seen or not p.is_file():
+                continue
+            seen.add(key)
+            try:
+                data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+            except Exception:
+                continue
+            cand = ((data.get("kanban") or {}).get("tenant_notify") or {})
+            if not isinstance(cand, dict):
+                continue
+            for k, v in cand.items():
+                raw[k] = v  # config overrides registry later via merge order
+    except Exception:
+        pass
+    return raw
+
+
+def _load_tenant_notify_map() -> dict:
+    """Tenant → notify targets: client registry (SSOT) + config overrides.
+
+    Out-of-the-box: agents only set ``tenant=<client_slug>`` on create.
+    No explicit notify-subscribe and no per-agent config required.
+
+    Merge order:
+      1. ``MarketingClients/client-topic-registry.yaml`` (telegram.chat_id/thread_id)
+      2. ``kanban.tenant_notify`` in config (root + profile; config wins per key)
+    """
+    base = _load_notify_map_from_client_registry()
+    override = _load_notify_map_from_yaml_configs()
+    if not base and not override:
+        return {}
+    merged = dict(base)
+    for k, v in (override or {}).items():
+        merged[k] = v
+    return merged
+
+
+def _tenant_notify_entries(tenant: Optional[str]) -> list[dict]:
+    """Resolve notify targets for a tenant slug (registry + config).
+
+    Returns [] when tenant is empty/unknown.
+    """
+    if not tenant:
+        return []
+    raw = _load_tenant_notify_map()
+    if not isinstance(raw, dict):
+        return []
+    entry = raw.get(tenant) or raw.get(str(tenant).strip().lower())
+    if not entry:
+        return []
+    items = entry if isinstance(entry, list) else [entry]
+    out: list[dict] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        platform = str(it.get("platform") or "telegram").strip() or "telegram"
+        chat_id = str(it.get("chat_id") or "").strip()
+        if not chat_id:
+            continue
+        out.append(
+            {
+                "platform": platform,
+                "chat_id": chat_id,
+                "thread_id": str(it.get("thread_id") or ""),
+                "user_id": it.get("user_id"),
+                "notifier_profile": it.get("notifier_profile"),
+            }
+        )
+    return out
+
+
+def _inherit_notify_subs_from(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    source_ids: list[str],
+    now: int,
+) -> None:
+    """Copy notify subs from source tasks onto ``task_id`` (OR IGNORE).
+
+    Must be called inside an open write transaction (does not open its own).
+    """
+    if not source_ids:
+        return
+    placeholders = ",".join("?" * len(source_ids))
+    conn.execute(
+        f"""INSERT OR IGNORE INTO kanban_notify_subs
+            (task_id, platform, chat_id, thread_id, user_id,
+             notifier_profile, created_at, last_event_id)
+            SELECT ?, platform, chat_id, thread_id, user_id,
+                   notifier_profile, ?, 0
+            FROM kanban_notify_subs
+            WHERE task_id IN ({placeholders})""",
+        (task_id, int(now), *source_ids),
+    )
+
+
+def _apply_tenant_notify_subs(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    tenant: Optional[str],
+    now: int,
+    last_event_id: int = 0,
+) -> None:
+    """Attach default client-topic subs for ``tenant`` (OR IGNORE).
+
+    Must be called inside an open write transaction.
+
+    ``last_event_id``: for create-time use 0 (deliver full stream of future
+    events). For late ensure (block/complete without prior sub), pass
+    ``max(event_id) - 1`` so the just-written terminal event is still claimed
+    by the notifier on the next tick.
+    """
+    if not tenant:
+        return
+    cursor = int(last_event_id) if last_event_id and last_event_id > 0 else 0
+    tenant_keys: set[tuple[str, str, str]] = set()
+    for e in _tenant_notify_entries(tenant):
+        # INSERT … ON CONFLICT: always stamp the *tenant's* notifier_profile.
+        # Inheritance / session auto-sub can land the right thread_id with the
+        # *wrong* profile (e.g. pm_gascleaning on pisateli-forest topic) — OR IGNORE
+        # then leaves that poison row forever and wakes the wrong PM on complete.
+        conn.execute(
+            """INSERT INTO kanban_notify_subs
+                (task_id, platform, chat_id, thread_id, user_id,
+                 notifier_profile, created_at, last_event_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(task_id, platform, chat_id, thread_id) DO UPDATE SET
+                 notifier_profile = excluded.notifier_profile,
+                 user_id = COALESCE(excluded.user_id, kanban_notify_subs.user_id)
+            """,
+            (
+                task_id,
+                e["platform"],
+                e["chat_id"],
+                e["thread_id"],
+                e.get("user_id"),
+                e.get("notifier_profile"),
+                int(now),
+                cursor,
+            ),
+        )
+        tenant_keys.add(
+            (
+                str(e["platform"]),
+                str(e["chat_id"]),
+                str(e.get("thread_id") or ""),
+            )
+        )
+    # Drop auto_subscribe / inherit rows that point at the *wrong* topic for
+    # this tenant (classic bug: create while chatting in life LIVE → dual sub
+    # to 921176 + client topic; completion pings LIVE instead of client).
+    if tenant_keys:
+        rows = conn.execute(
+            """SELECT platform, chat_id, thread_id FROM kanban_notify_subs
+               WHERE task_id = ?""",
+            (task_id,),
+        ).fetchall()
+        for row in rows:
+            key = (
+                str(row["platform"] if "platform" in row.keys() else row[0]),
+                str(row["chat_id"] if "chat_id" in row.keys() else row[1]),
+                str((row["thread_id"] if "thread_id" in row.keys() else row[2]) or ""),
+            )
+            if key not in tenant_keys:
+                conn.execute(
+                    """DELETE FROM kanban_notify_subs
+                       WHERE task_id = ? AND platform = ? AND chat_id = ?
+                         AND IFNULL(thread_id, '') = ?""",
+                    (task_id, key[0], key[1], key[2]),
+                )
+
+
+def _resolve_task_tenant(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Tenant on the task, else first parent that has a tenant (pipeline children)."""
+    row = conn.execute(
+        "SELECT tenant FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    tenant = (row["tenant"] if "tenant" in row.keys() else None) or None
+    if tenant:
+        return str(tenant).strip() or None
+    parent = conn.execute(
+        """SELECT t.tenant FROM task_links l
+           JOIN tasks t ON t.id = l.parent_id
+           WHERE l.child_id = ? AND t.tenant IS NOT NULL AND t.tenant != ''
+           LIMIT 1""",
+        (task_id,),
+    ).fetchone()
+    if parent is None:
+        return None
+    return str(parent["tenant"]).strip() or None
+
+
+def ensure_task_notify_subs(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    tenant: Optional[str] = None,
+    now: Optional[int] = None,
+    catch_up_latest: bool = False,
+) -> None:
+    """Idempotent out-of-box notify attach. Call on create / block / complete.
+
+    No agent action required: tenant (or parent tenant) → client topic from
+    registry/config. If ``catch_up_latest`` and a brand-new sub is needed after
+    a terminal event was already written, cursor is set so that event is still
+    delivered once.
+    """
+    now_i = int(now if now is not None else time.time())
+    resolved = tenant or _resolve_task_tenant(conn, task_id)
+    if not resolved:
+        return
+    # Already has any sub for this task? Still apply tenant targets (OR IGNORE).
+    last_event_id = 0
+    if catch_up_latest:
+        max_ev = conn.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        max_id = int(max_ev[0] if max_ev is not None else 0)
+        if max_id > 0:
+            # Leave the latest event visible to claim_unseen (cursor < event_id).
+            last_event_id = max_id - 1
+    _apply_tenant_notify_subs(
+        conn,
+        task_id=task_id,
+        tenant=resolved,
+        now=now_i,
+        last_event_id=last_event_id,
+    )
+
 
 def add_notify_sub(
     conn: sqlite3.Connection,

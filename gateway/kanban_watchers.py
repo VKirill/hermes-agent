@@ -568,30 +568,45 @@ class GatewayKanbanWatchersMixin:
                                     )
                                     from gateway.session import SessionSource
                                     from gateway.platforms.base import MessageEvent, MessageType
-                                    # KNOWN LIMITATION (tracked follow-up): the
-                                    # subscription row does not persist the
-                                    # creator's chat_type, and it is not carried
-                                    # on the session-context bridge, so we cannot
-                                    # faithfully reconstruct the creator's real
-                                    # session key here. build_session_key() keys
-                                    # DMs (":dm:<chat_id>") on a wholly different
-                                    # shape from group/thread, so any hardcoded
-                                    # value mis-routes some creators. "group" is
-                                    # the least-surprising default for the
-                                    # dashboard/group flows this wake primarily
-                                    # serves; DM-originated creators are handled
-                                    # by the follow-up that stamps + persists
-                                    # chat_type end-to-end. handle_message()
-                                    # get_or_create_session's the target, so a
-                                    # mismatch degrades to "wake lands in a fresh
-                                    # group session" — never an exception.
+                                    # Reconstruct chat_type so wake lands in the
+                                    # same session key family as live traffic.
+                                    # Telegram private chats (incl. DM topics)
+                                    # use positive chat_id → ":dm:"; groups/
+                                    # supergroups use negative → ":group:".
+                                    # Hardcoding "group" used to create orphan
+                                    # sessions (e.g. pm_* under :group:…:thread)
+                                    # that never matched the live :dm:… session
+                                    # and looked like "signals never arrived".
+                                    _wake_chat_type = "group"
+                                    if platform_str == "telegram":
+                                        try:
+                                            _wake_chat_type = (
+                                                "dm" if int(str(sub["chat_id"])) > 0
+                                                else "group"
+                                            )
+                                        except (TypeError, ValueError):
+                                            _wake_chat_type = "dm"
+                                    # Wake profile: prefer tenant→registry map over
+                                    # stamped sub.notifier_profile (subs can inherit a
+                                    # wrong PM from parent/session — e.g. pm_gascleaning
+                                    # on a pisateli-forest topic sub).
+                                    _wake_profile = sub_profile or None
+                                    try:
+                                        _tenant = getattr(task, "tenant", None) if task else None
+                                        if _tenant:
+                                            from hermes_cli.kanban_db import _tenant_notify_entries
+                                            _tents = _tenant_notify_entries(str(_tenant))
+                                            if _tents and _tents[0].get("notifier_profile"):
+                                                _wake_profile = str(_tents[0]["notifier_profile"])
+                                    except Exception:
+                                        pass
                                     _source = SessionSource(
                                         platform=plat,
                                         chat_id=sub["chat_id"],
-                                        chat_type="group",
+                                        chat_type=_wake_chat_type,
                                         thread_id=sub.get("thread_id") or None,
                                         user_id=sub.get("user_id"),
-                                        profile=sub_profile or None,
+                                        profile=_wake_profile,
                                     )
                                     _synth_event = MessageEvent(
                                         text=_synth,
@@ -602,7 +617,7 @@ class GatewayKanbanWatchersMixin:
                                     await adapter.handle_message(_synth_event)
                                     logger.info(
                                         "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
-                                        sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
+                                        sub["task_id"], platform_str, sub["chat_id"], _wake_profile or "default", _wake_kinds,
                                     )
                             except Exception as _wk_err:
                                 # Best-effort: the notification itself already

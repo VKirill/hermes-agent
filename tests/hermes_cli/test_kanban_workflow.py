@@ -487,3 +487,75 @@ def test_dependency_block_preserves_stage(kanban_home: Path) -> None:
         row = _step(conn, tid)
         assert row["status"] == "todo"
         assert row["current_step_key"] == "implementing"
+
+
+# ---------------------------------------------------------------------------
+# Marketing handoff workflows
+# ---------------------------------------------------------------------------
+
+
+def test_marketing_direct_chain_auto():
+    row = _row(workflow_template_id="marketing_direct", current_step_key="plan")
+    p = kwf.next_stage_on_success(row)
+    assert (p.step, p.assignee) == ("copy", "marketing_copywriter")
+
+    p = kwf.next_stage_on_success(_row(workflow_template_id="marketing_direct", current_step_key="copy"))
+    assert (p.step, p.assignee) == ("verify", "marketing_copywriter")
+
+    p = kwf.next_stage_on_success(_row(workflow_template_id="marketing_direct", current_step_key="verify"))
+    assert (p.step, p.assignee) == ("review", "marketing_reviewer")
+
+    p = kwf.next_stage_on_success(_row(workflow_template_id="marketing_direct", current_step_key="review"))
+    assert (p.step, p.assignee) == ("accept", "client_marketing")
+
+    p = kwf.next_stage_on_success(_row(workflow_template_id="marketing_direct", current_step_key="accept"))
+    assert p.terminal and p.step == "verified"
+
+
+def test_marketing_fast_chain():
+    p = kwf.next_stage_on_success(
+        _row(workflow_template_id="marketing_fast", current_step_key="produce")
+    )
+    assert p.step == "verify"
+    p = kwf.next_stage_on_success(
+        _row(workflow_template_id="marketing_fast", current_step_key="accept")
+    )
+    assert p.terminal
+
+
+def test_marketing_onboarding_chain():
+    p = kwf.next_stage_on_success(
+        _row(workflow_template_id="marketing_onboarding", current_step_key="scaffold")
+    )
+    assert (p.step, p.assignee) == ("intake", "intake_interviewer")
+    p = kwf.next_stage_on_success(
+        _row(workflow_template_id="marketing_onboarding", current_step_key="memory_review")
+    )
+    assert (p.step, p.assignee) == ("accept", "client_marketing")
+
+
+def test_marketing_rework_target_is_copy_not_implementing():
+    step, assignee = kwf.rework_target(
+        _row(workflow_template_id="marketing_direct", current_step_key="review")
+    )
+    assert step == "copy"
+    assert assignee == "marketing_copywriter"
+
+
+def test_marketing_owner_gate_when_not_auto():
+    p = kwf.next_stage_on_success(
+        _row(
+            workflow_template_id="marketing_direct",
+            current_step_key="accept",
+            auto_mode=0,
+        )
+    )
+    assert (p.status, p.step) == ("blocked", "owner_gate")
+    assert not p.terminal
+
+
+def test_known_workflows_include_marketing():
+    assert "marketing_direct" in kwf.KNOWN_WORKFLOW_IDS
+    assert "marketing_fast" in kwf.KNOWN_WORKFLOW_IDS
+    assert "marketing_onboarding" in kwf.KNOWN_WORKFLOW_IDS
+    assert kwf.is_workflow_task({"workflow_template_id": "marketing_direct"})

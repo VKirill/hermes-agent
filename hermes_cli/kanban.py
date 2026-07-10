@@ -378,7 +378,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
-    p_create.add_argument("--workflow", default=None, choices=["aif"],
+    p_create.add_argument(
+        "--workflow", default=None,
+        choices=["aif", "marketing_fast", "marketing_direct", "marketing_onboarding"],
                           help="Opt the card into the AIF stage machine: one "
                                "card walks spec→plan→implement→verify→review→"
                                "verified, each stage worked by its role "
