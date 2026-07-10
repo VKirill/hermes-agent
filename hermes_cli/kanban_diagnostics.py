@@ -145,40 +145,6 @@ def _task_field(task, name, default=None):
     return getattr(task, name, default)
 
 
-def _is_external_runtime_blocker(text: Optional[str]) -> bool:
-    """True for quota/rate/auth/provider walls that Board Health must not fix.
-
-    These are external runtime blockers, not broken task code. Returning a
-    repeated-failure diagnostic for them makes automated Board Health flows
-    create fix-task-on-fix-task cascades that can only hit the same exhausted
-    provider again.
-    """
-    if not text:
-        return False
-    lower = str(text).lower()
-    return any(
-        needle in lower
-        for needle in (
-            "out of extra usage",
-            "quota exhausted",
-            "quota_exhausted",
-            "usage limit",
-            "credits exhausted",
-            "insufficient credits",
-            "rate limit",
-            "rate-limited",
-            "too many requests",
-            "invalid api key",
-            "unauthorized",
-            "expired token",
-            "provider unavailable",
-            "service unavailable",
-            "missing required model capability",
-            "cli transport unavailable",
-        )
-    )
-
-
 def _parse_payload(ev) -> dict:
     """Tolerate event.payload being either a dict or a JSON string."""
     p = _task_field(ev, "payload", None)
@@ -522,9 +488,6 @@ def _rule_prose_phantom_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
     Auto-clears when a fresh clean completion arrives AFTER the
     suspected event.
     """
-    if _task_field(task, "status") in {"done", "archived"}:
-        return []
-
     hits = _active_hallucination_events(events, "suspected_hallucinated_references")
     if not hits:
         return []
@@ -567,10 +530,20 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
 
     Accepts the legacy ``spawn_failure_threshold`` config key for
     back-compat.
-    """
-    if _task_field(task, "status") in {"done", "archived"}:
-        return []
 
+    Terminal statuses are exempt: a done/archived card has nothing left
+    to retry, so a lingering failure streak is history, not a signal.
+    (``complete_task`` resets the counter, but a manual done — e.g. a
+    dashboard drag — ends no run and used to leave the flag stuck.)
+
+    A fresh attempt in flight (``running``) is also exempt: retrying a
+    task should clear the stale failure banner until this attempt also
+    resolves. Otherwise a card that's actively trying again still shows
+    "failed Nx", which reads as a current failure. It re-fires if the new
+    run fails too (status leaves ``running`` with a recorded outcome).
+    """
+    if _task_field(task, "status") in ("done", "archived", "running"):
+        return []
     threshold = _positive_int(cfg.get(
         "failure_threshold",
         cfg.get("spawn_failure_threshold", 3),
@@ -635,8 +608,6 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
 
     severity = "critical" if failures >= threshold * 2 else "error"
     err_text = (last_err or "").strip() if last_err else ""
-    if _is_external_runtime_blocker(err_text):
-        return []
     err_snippet = err_text[:500] + ("…" if len(err_text) > 500 else "") if err_text else ""
     outcome_label = {
         "spawn_failed": "spawn",
@@ -691,10 +662,20 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
     total failures) so the operator gets a crash-specific heads-up
     before the unified rule kicks in. Suppresses itself when the
     unified rule is also about to fire, to avoid double-flagging.
-    """
-    if _task_field(task, "status") in {"done", "archived"}:
-        return []
 
+    Terminal statuses are exempt for the same reason as
+    ``repeated_failures`` — with one extra wrinkle: this rule reads run
+    history, and a manual done (dashboard drag) appends no ``completed``
+    run to break the crash streak, so the flag was permanent (#kanban
+    desktop dogfood). Done means done.
+
+    ``running`` is exempt too: a fresh attempt is in flight, and its
+    in-flight run (no outcome yet) doesn't break the trailing crash scan,
+    so a retried card kept showing "crashed Nx" over an active run. The
+    banner re-fires if the new attempt also crashes.
+    """
+    if _task_field(task, "status") in ("done", "archived", "running"):
+        return []
     failure_threshold = int(cfg.get(
         "failure_threshold",
         cfg.get("spawn_failure_threshold", 3),
@@ -743,8 +724,6 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
     # having to open the logs. Truncate defensively — these can be huge
     # (full tracebacks).
     err_text = (last_err or "").strip() if last_err else ""
-    if _is_external_runtime_blocker(err_text):
-        return []
     err_snippet = err_text[:500] + ("…" if len(err_text) > 500 else "") if err_text else ""
     if err_snippet:
         title = f"Agent crashed {consecutive}x: {err_snippet.splitlines()[0][:160]}"
