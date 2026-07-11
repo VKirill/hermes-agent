@@ -126,12 +126,21 @@ class TestPathResolution:
             fresh_home / "kanban" / "boards" / "other" / "logs"
         )
 
-    def test_env_var_db_override_still_wins(self, fresh_home, tmp_path, monkeypatch):
-        """``HERMES_KANBAN_DB`` pins the file regardless of board= arg."""
+    def test_env_var_db_override_when_no_board(self, fresh_home, tmp_path, monkeypatch):
+        """``HERMES_KANBAN_DB`` pins the file only when board is not explicit.
+
+        Explicit ``board=`` (MCP/CLI --board) must beat the env pin so a
+        worker shell can target marketing/dev without unsetting dispatcher
+        env. Regression: long-lived workers with HERMES_KANBAN_DB set used
+        to ignore board= and create on the wrong DB.
+        """
         forced = tmp_path / "custom.db"
         monkeypatch.setenv("HERMES_KANBAN_DB", str(forced))
         assert kb.kanban_db_path() == forced
-        assert kb.kanban_db_path(board="ignored") == forced
+        # Named board always wins over the pin.
+        assert kb.kanban_db_path(board="marketing") == (
+            fresh_home / "kanban" / "boards" / "marketing" / "kanban.db"
+        )
 
     def test_env_var_workspaces_override(self, fresh_home, tmp_path, monkeypatch):
         forced = tmp_path / "ws"

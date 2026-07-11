@@ -1,10 +1,23 @@
 import asyncio
 from pathlib import Path
 
-
 from gateway.config import Platform
+from gateway.kanban_watchers import _human_notify_line
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
+
+
+def test_human_notify_line_keeps_business_drops_tech():
+    assert "AndySpark" in _human_notify_line(
+        "f02 AndySpark: юрлицо, отзывы и соцсети собраны; кабинеты ещё без доступов"
+    )
+    assert _human_notify_line("done once") == "done once"
+    assert _human_notify_line(
+        "enrichment.json 22KB @ ~/HermesWork/tenants/x/enrichment.json Confidence high"
+    ) == ""
+    assert _human_notify_line("see t_2a4782c0 next") == ""
+    long_ok = "Pisateli Forest: семантика — 33 группы, 112 фраз, реестр готов"
+    assert _human_notify_line(long_ok) == long_ok
 
 
 class RecordingAdapter:
@@ -84,8 +97,11 @@ def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monke
     asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     assert len(adapter.sent) == 1
-    assert "Задача" in adapter.sent[0]["text"]
-    assert tid in adapter.sent[0]["text"]
+    text = adapter.sent[0]["text"]
+    assert text.startswith("✔")
+    assert "notify once" in text
+    # Completed auto-notify is client-facing: no raw task_id dump.
+    assert tid not in text
 
 
 def test_kanban_notifier_claim_prevents_second_watcher_send(tmp_path, monkeypatch):

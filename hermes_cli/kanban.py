@@ -629,6 +629,47 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="JSON dict of structured facts to store on the latest completed run.",
     )
 
+    p_set_tenant = sub.add_parser(
+        "set-tenant",
+        help="Set or backfill the tenant column on existing task(s)",
+    )
+    p_set_tenant.add_argument(
+        "task_id",
+        nargs="?",
+        default=None,
+        help="Task id to update (omit with --infer-workspace for bulk backfill)",
+    )
+    p_set_tenant.add_argument(
+        "tenant",
+        nargs="?",
+        default=None,
+        help="Tenant slug to set (e.g. andyspark). Omit with --infer-workspace.",
+    )
+    p_set_tenant.add_argument(
+        "--infer-workspace",
+        action="store_true",
+        help=(
+            "Infer tenant from each task's workspace_path under …/tenants/<slug>. "
+            "With task_id, only that card; without task_id, all null-tenant cards "
+            "on the board that have a tenants path."
+        ),
+    )
+    p_set_tenant.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show planned changes without writing",
+    )
+    p_set_tenant.add_argument(
+        "--reason",
+        default=None,
+        help="Optional audit reason recorded on the tenant_set event",
+    )
+    p_set_tenant.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON",
+    )
+
     p_block = sub.add_parser("block", help="Mark one or more tasks blocked")
     p_block.add_argument("task_id")
     p_block.add_argument("reason", nargs="*", help="Reason (also appended as a comment)")
@@ -1028,6 +1069,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "comment":  _cmd_comment,
             "complete": _cmd_complete,
             "edit":     _cmd_edit,
+            "set-tenant": _cmd_set_tenant,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
@@ -1403,42 +1445,47 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn,
-            title=args.title,
-            body=args.body,
-            assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind,
-            workspace_path=ws_path,
-            branch_name=branch_name,
-            project_id=getattr(args, "project", None),
-            tenant=args.tenant,
-            priority=args.priority,
-            parents=tuple(args.parent or ()),
-            triage=bool(getattr(args, "triage", False)),
-            session_id=(getattr(args, "session", None)
-                        or os.environ.get("HERMES_SESSION_ID") or None),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime,
-            skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries,
-            goal_mode=bool(getattr(args, "goal_mode", False)),
-            goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
-            workflow=getattr(args, "workflow", None),
-            workflow_step=getattr(args, "workflow_step", None),
-            auto_mode=(
-                False if getattr(args, "human_gates", False) else None
-            ),
-            use_subagents=(
-                None if getattr(args, "delegation", None) is None
-                else getattr(args, "delegation") == "subagents"
-            ),
-            model_override=getattr(args, "model_override", None),
-        )
-        task = kb.get_task(conn, task_id)
+    try:
+        with kb.connect_closing() as conn:
+            task_id = kb.create_task(
+                conn,
+                title=args.title,
+                body=args.body,
+                assignee=args.assignee,
+                created_by=args.created_by or _profile_author(),
+                workspace_kind=ws_kind,
+                workspace_path=ws_path,
+                branch_name=branch_name,
+                project_id=getattr(args, "project", None),
+                tenant=args.tenant,
+                priority=args.priority,
+                parents=tuple(args.parent or ()),
+                triage=bool(getattr(args, "triage", False)),
+                session_id=(getattr(args, "session", None)
+                            or os.environ.get("HERMES_SESSION_ID") or None),
+                idempotency_key=getattr(args, "idempotency_key", None),
+                max_runtime_seconds=max_runtime,
+                skills=getattr(args, "skills", None) or None,
+                max_retries=max_retries,
+                goal_mode=bool(getattr(args, "goal_mode", False)),
+                goal_max_turns=getattr(args, "goal_max_turns", None),
+                initial_status=getattr(args, "initial_status", "running"),
+                workflow=getattr(args, "workflow", None),
+                workflow_step=getattr(args, "workflow_step", None),
+                auto_mode=(
+                    False if getattr(args, "human_gates", False) else None
+                ),
+                use_subagents=(
+                    None if getattr(args, "delegation", None) is None
+                    else getattr(args, "delegation") == "subagents"
+                ),
+                model_override=getattr(args, "model_override", None),
+            )
+            task = kb.get_task(conn, task_id)
+    except ValueError as exc:
+        # Includes review→fix deadlock / fix-round cap refusals from create_task.
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -2030,6 +2077,108 @@ def _cmd_edit(args: argparse.Namespace) -> int:
             )
             return 1
     print(f"Edited {args.task_id}")
+    return 0
+
+
+def _cmd_set_tenant(args: argparse.Namespace) -> int:
+    """Set tenant on one card, or backfill from workspace_path."""
+    task_id = getattr(args, "task_id", None)
+    tenant = getattr(args, "tenant", None)
+    infer = bool(getattr(args, "infer_workspace", False))
+    dry_run = bool(getattr(args, "dry_run", False))
+    reason = getattr(args, "reason", None)
+    as_json = bool(getattr(args, "json", False))
+
+    if infer and tenant:
+        print(
+            "kanban: set-tenant: pass either TENANT or --infer-workspace, not both",
+            file=sys.stderr,
+        )
+        return 2
+    if not infer and not tenant:
+        print(
+            "kanban: set-tenant: require TENANT slug or --infer-workspace",
+            file=sys.stderr,
+        )
+        return 2
+    if not infer and not task_id:
+        print(
+            "kanban: set-tenant: task_id is required unless --infer-workspace",
+            file=sys.stderr,
+        )
+        return 2
+
+    with kb.connect_closing() as conn:
+        if infer and not task_id:
+            changes = kb.backfill_tenants_from_workspace(
+                conn, dry_run=dry_run, only_null=True,
+            )
+            if as_json:
+                print(json.dumps({"changes": changes}, indent=2, ensure_ascii=False))
+            else:
+                if not changes:
+                    print("No null-tenant tasks with inferable …/tenants/<slug> path")
+                for ch in changes:
+                    verb = "would set" if dry_run else "set"
+                    print(
+                        f"{verb} {ch['id']}: {ch['previous']!r} → {ch['inferred']!r}"
+                    )
+                if dry_run and changes:
+                    print(f"(dry-run) {len(changes)} change(s) not applied")
+            return 0
+
+        if infer and task_id:
+            task = kb.get_task(conn, task_id)
+            if task is None:
+                print(f"kanban: no such task: {task_id}", file=sys.stderr)
+                return 1
+            inferred = kb.infer_tenant_from_workspace_path(task.workspace_path)
+            if not inferred:
+                print(
+                    f"kanban: cannot infer tenant from workspace_path="
+                    f"{task.workspace_path!r}",
+                    file=sys.stderr,
+                )
+                return 1
+            tenant = inferred
+            if not reason:
+                reason = "set-tenant --infer-workspace"
+
+        if dry_run:
+            task = kb.get_task(conn, task_id)
+            if task is None:
+                print(f"kanban: no such task: {task_id}", file=sys.stderr)
+                return 1
+            payload = {
+                "id": task_id,
+                "previous": task.tenant,
+                "tenant": tenant,
+                "dry_run": True,
+            }
+            if as_json:
+                print(json.dumps(payload, indent=2, ensure_ascii=False))
+            else:
+                print(f"would set {task_id}: {task.tenant!r} → {tenant!r}")
+            return 0
+
+        if not kb.set_task_tenant(
+            conn,
+            task_id,
+            tenant,
+            reason=reason or "set-tenant",
+        ):
+            print(f"kanban: no such task: {task_id}", file=sys.stderr)
+            return 1
+        task = kb.get_task(conn, task_id)
+        payload = {
+            "id": task_id,
+            "tenant": task.tenant if task else tenant,
+            "applied": True,
+        }
+        if as_json:
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(f"Set tenant on {task_id}: {payload['tenant']}")
     return 0
 
 

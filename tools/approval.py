@@ -527,9 +527,12 @@ def _hardline_block_result(description: str) -> dict:
     }
 
 
+# Absolute path tokens for write-guard scanning.
+# Root component must be a full path segment: "/var/tmp" and "/var" match,
+# but "/variants/..." must NOT match via a prefix of "var".
 _POSIX_ABSOLUTE_PATH_RE = re.compile(
     r"/(?:Users|Volumes|private|tmp|var|opt|home|etc|usr|srv|mnt|workspace)"
-    r"[^\s'\"`)]*"
+    r"(?:/[^\s'\"`)]*)?(?=[\s'\"`)]|$)"
 )
 _OPEN_WRITE_MODE = r"['\"](?:[awx](?:[bt])?\+?|r(?:[bt])?\+)['\"]"
 # Builtin open(path, "w"/"a"/"x"/... or mode=...); Path.open("w"...).
@@ -546,6 +549,38 @@ _KANBAN_PROFILE_WRITE_INTENT_RE = re.compile(
     ,
     re.IGNORECASE | re.DOTALL,
 )
+# Shared infra CLIs (gen-image.sh, direct_limits_check.py, …) are *executed*,
+# not written. When a command also writes under allowed roots, mentioning
+# these scripts must not hard-block for "path outside write roots".
+_TOOLING_EXEC_PATH_RE = re.compile(
+    r"(?:^|/)infra/scripts/[^/\s]+\.(?:sh|py|bash)$"
+    r"|(?:^|/)Work/infra/scripts/[^/\s]+\.(?:sh|py|bash)$",
+    re.IGNORECASE,
+)
+
+
+def _is_shared_tooling_exec_path(path: Path) -> bool:
+    """True for shared infra scripts that workers run, not write into."""
+    try:
+        text = str(path)
+    except Exception:
+        return False
+    if _TOOLING_EXEC_PATH_RE.search(text):
+        return True
+    # Also accept resolved path ending under …/infra/scripts/*.{sh,py}
+    try:
+        parts = path.parts
+        if "infra" in parts and "scripts" in parts:
+            i = parts.index("scripts")
+            if i > 0 and parts[i - 1] == "infra" and path.suffix.lower() in {
+                ".sh",
+                ".py",
+                ".bash",
+            }:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def _path_under_any(path: Path, roots: list[Path]) -> bool:
@@ -649,6 +684,9 @@ def _check_kanban_profile_terminal_write_guard(
         try:
             resolved = Path(raw_path).expanduser().resolve()
         except Exception:
+            continue
+        # Executable tooling path (gen-image.sh etc.) is not a write target.
+        if _is_shared_tooling_exec_path(resolved):
             continue
         if not _path_under_any(resolved, roots):
             forbidden.append(str(resolved))

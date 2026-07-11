@@ -102,6 +102,22 @@ _log = logging.getLogger(__name__)
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
+# Parents that no longer gate children (see recompute_ready).
+_TERMINAL_PARENT_STATUSES = frozenset({"done", "archived"})
+
+# Marketing multi-card review→fix (mkt-review-gate Step 2.5): after review
+# round N>=3 still hard-FAIL → triage, not another fix. Idempotency keys of the
+# form fix:…:roundN are rejected when N >= this cap. Soft skill text alone was
+# ignored (andyspark reached review-20).
+MAX_MKT_FIX_ROUND = 2  # allowed keys: :round1 and :round2 only
+
+_FIX_KEY_RE = re.compile(r"(?i)^fix:")
+_FIX_ROUND_RE = re.compile(r"(?i):round(\d+)\s*$")
+_FIX_TITLE_RE = re.compile(
+    r"(?i)^(?:\[[^\]]+\]\s*)*(?:fix\b|rework\b|исправить\b)"
+)
+_FIX_SKILL_NAMES = frozenset({"mkt-fix", "aif-fix"})
+
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
 # instead of all landing in one undifferentiated ``blocked`` bucket that a cron
@@ -135,6 +151,192 @@ BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
+
+# Tenant slug: first path segment under a ``tenants/`` directory, e.g.
+# ``~/HermesWork/tenants/andyspark/...`` → ``andyspark``. Used when callers
+# forget to pass ``tenant=`` but still pin a tenant workspace.
+_TENANT_SLUG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+
+
+def infer_tenant_from_workspace_path(path: Optional[str]) -> Optional[str]:
+    """Infer a tenant slug from a workspace path under ``…/tenants/<slug>``.
+
+    Returns ``None`` when the path does not contain a ``tenants/<slug>``
+    segment or the slug fails a conservative character check. Explicit
+    ``tenant=`` always wins over this helper.
+    """
+    if not path:
+        return None
+    try:
+        raw = os.path.expanduser(str(path).strip())
+    except Exception:
+        return None
+    if not raw:
+        return None
+    # Prefer absolute form so relative ``tenants/foo`` still matches, but
+    # do not require the path to exist on disk (create-time inference).
+    try:
+        parts = Path(raw).parts
+    except Exception:
+        return None
+    for i, part in enumerate(parts):
+        if part == "tenants" and i + 1 < len(parts):
+            slug = str(parts[i + 1]).strip()
+            if slug and _TENANT_SLUG_RE.fullmatch(slug):
+                return slug
+    return None
+
+
+def resolve_create_tenant(
+    conn: sqlite3.Connection,
+    *,
+    tenant: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+    parents: Iterable[str] = (),
+) -> Optional[str]:
+    """Resolve the tenant column for a new task.
+
+    Precedence (first non-empty wins):
+      1. explicit ``tenant`` argument
+      2. ``HERMES_TENANT`` env (set by dispatcher for workers)
+      3. first parent task that already has a tenant
+      4. slug inferred from ``workspace_path`` under ``…/tenants/<slug>``
+    """
+    if tenant is not None:
+        cleaned = str(tenant).strip()
+        if cleaned:
+            return cleaned
+    env_tenant = (os.environ.get("HERMES_TENANT") or "").strip()
+    if env_tenant:
+        return env_tenant
+    parent_ids = tuple(p for p in (parents or ()) if p)
+    if parent_ids:
+        placeholders = ",".join("?" * len(parent_ids))
+        # Preserve parent order: first parent with a tenant wins.
+        rows = conn.execute(
+            f"SELECT id, tenant FROM tasks WHERE id IN ({placeholders})",
+            parent_ids,
+        ).fetchall()
+        by_id = {
+            r["id"]: (str(r["tenant"]).strip() if r["tenant"] else None)
+            for r in rows
+        }
+        for pid in parent_ids:
+            t = by_id.get(pid)
+            if t:
+                return t
+    return infer_tenant_from_workspace_path(workspace_path)
+
+
+def set_task_tenant(
+    conn: sqlite3.Connection,
+    task_id: str,
+    tenant: Optional[str],
+    *,
+    reason: Optional[str] = None,
+    attach_notify: bool = True,
+) -> bool:
+    """Set (or clear) a task's tenant. Emits a ``tenant_set`` event.
+
+    When ``attach_notify`` is true and a non-empty tenant is applied,
+    also runs :func:`ensure_task_notify_subs` so client-topic notify
+    wiring picks up the corrected slug without a recreate.
+
+    Returns False when the task does not exist.
+    """
+    cleaned: Optional[str]
+    if tenant is None:
+        cleaned = None
+    else:
+        cleaned = str(tenant).strip() or None
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT tenant FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        previous = row["tenant"]
+        if (previous or None) == cleaned:
+            # Still (re)attach notify when requested — ops may re-run after
+            # registry updates even if the column was already correct.
+            if attach_notify and cleaned:
+                ensure_task_notify_subs(
+                    conn, task_id, tenant=cleaned, now=now, catch_up_latest=False,
+                )
+            return True
+        conn.execute(
+            "UPDATE tasks SET tenant = ? WHERE id = ?",
+            (cleaned, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "tenant_set",
+            {
+                "tenant": cleaned,
+                "previous": previous,
+                "reason": reason,
+            },
+        )
+        if attach_notify and cleaned:
+            ensure_task_notify_subs(
+                conn, task_id, tenant=cleaned, now=now, catch_up_latest=False,
+            )
+    return True
+
+
+def backfill_tenants_from_workspace(
+    conn: sqlite3.Connection,
+    *,
+    dry_run: bool = False,
+    only_null: bool = True,
+) -> list[dict]:
+    """Infer and optionally apply tenant from ``workspace_path`` for existing tasks.
+
+    Returns a list of change dicts:
+    ``{id, previous, inferred, applied}``.
+    """
+    if only_null:
+        rows = conn.execute(
+            "SELECT id, tenant, workspace_path FROM tasks "
+            "WHERE (tenant IS NULL OR tenant = '') "
+            "AND workspace_path IS NOT NULL AND workspace_path != ''"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, tenant, workspace_path FROM tasks "
+            "WHERE workspace_path IS NOT NULL AND workspace_path != ''"
+        ).fetchall()
+    changes: list[dict] = []
+    for row in rows:
+        inferred = infer_tenant_from_workspace_path(row["workspace_path"])
+        if not inferred:
+            continue
+        previous = (str(row["tenant"]).strip() if row["tenant"] else None) or None
+        if previous == inferred:
+            continue
+        if only_null and previous:
+            continue
+        applied = False
+        if not dry_run:
+            applied = set_task_tenant(
+                conn,
+                row["id"],
+                inferred,
+                reason="backfill-from-workspace",
+            )
+        changes.append(
+            {
+                "id": row["id"],
+                "previous": previous,
+                "inferred": inferred,
+                "workspace_path": row["workspace_path"],
+                "applied": applied if not dry_run else False,
+                "dry_run": dry_run,
+            }
+        )
+    return changes
 
 
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
@@ -517,20 +719,24 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
 
     Resolution (highest precedence first):
 
-    1. ``HERMES_KANBAN_DB`` env var — pins the path directly. Honoured for
-       back-compat and for the dispatcher→worker handoff (defense in
-       depth: dispatcher injects this into worker env so workers are
-       immune to any path-resolution disagreement).
-    2. When ``board`` arg is None, the active board from
-       :func:`get_current_board` is used.
-    3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
+    1. Explicit ``board`` argument (or CLI ``--board`` via
+       :func:`scoped_current_board`) — always wins. Ops must be able to
+       target another board from a worker shell without unsetting env.
+    2. ``HERMES_KANBAN_DB`` env var — pins the path when no board was
+       requested. Used for dispatcher→worker handoff defense-in-depth.
+    3. Active board from :func:`get_current_board`.
+    4. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
        Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
     """
-    override = os.environ.get("HERMES_KANBAN_DB", "").strip()
-    if override:
-        return Path(override).expanduser()
     slug = _normalize_board_slug(board)
     if slug is None:
+        # ContextVar set by CLI --board / scoped_current_board: treat as
+        # an explicit board selection that must beat HERMES_KANBAN_DB.
+        ctx = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+        if not ctx:
+            override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+            if override:
+                return Path(override).expanduser()
         slug = get_current_board()
     if slug == DEFAULT_BOARD:
         return kanban_home() / "kanban.db"
@@ -2704,6 +2910,9 @@ def create_task(
 
     parents = tuple(p for p in parents if p)
 
+    # Refuse fix:…:roundN past marketing convergence cap (prose was ignored).
+    _reject_fix_round_cap(idempotency_key)
+
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
     # invisibly splatter a comma-joined string into one argv slot — the
@@ -2749,6 +2958,22 @@ def create_task(
             )
         skills_list = cleaned
 
+    # Review→fix deadlock + round-cap guards (before write_txn so CLI/MCP
+    # get a clean ValueError without a half-written row).
+    if parents:
+        missing_early = _find_missing_parents(conn, parents)
+        if missing_early:
+            raise ValueError(
+                f"unknown parent task(s): {', '.join(missing_early)}"
+            )
+        _reject_open_parents_for_fix(
+            conn,
+            parents,
+            title=title,
+            idempotency_key=idempotency_key,
+            skills=skills_list,
+        )
+
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
     # and to avoid holding a write lock during the lookup. Race is
@@ -2786,6 +3011,16 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    # Tenant resolution: explicit → HERMES_TENANT → parent → workspace path.
+    # Marketing launcher cards often pass workspace_path under
+    # HermesWork/tenants/<slug> without an explicit tenant=; keep the slug.
+    tenant = resolve_create_tenant(
+        conn,
+        tenant=tenant,
+        workspace_path=workspace_path,
+        parents=parents,
+    )
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -2808,6 +3043,15 @@ def create_task(
                         missing = _find_missing_parents(conn, parents)
                         if missing:
                             raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+                        # Fix cards must not wait on open parents (review→fix
+                        # deadlock). Validate before status assignment.
+                        _reject_open_parents_for_fix(
+                            conn,
+                            parents,
+                            title=title,
+                            idempotency_key=idempotency_key,
+                            skills=skills_list,
+                        )
                         # If any parent is not yet done, we're todo.
                         rows = conn.execute(
                             "SELECT status FROM tasks WHERE id IN "
@@ -3050,6 +3294,99 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 
 
 # ---------------------------------------------------------------------------
+# Review→fix anti-recursion (multi-card marketing / AIF handoff DAGs)
+# ---------------------------------------------------------------------------
+
+def _looks_like_fix_task(
+    *,
+    title: str,
+    idempotency_key: Optional[str] = None,
+    skills: Optional[Iterable[str]] = None,
+) -> bool:
+    """True for fix/rework cards (not re-review, not ordinary produce).
+
+    Agents historically set parents=[current_review] on FAIL, which deadlocks:
+    review blocks waiting for fix while the dispatcher keeps fix in todo until
+    review is done. Structural reject is cheaper than another unlink rescue.
+    """
+    key = (idempotency_key or "").strip()
+    if key and _FIX_KEY_RE.match(key):
+        return True
+    if skills is not None:
+        for s in skills:
+            if s and str(s).strip().lower() in _FIX_SKILL_NAMES:
+                return True
+    return bool(_FIX_TITLE_RE.match((title or "").strip()))
+
+
+def _reject_fix_round_cap(idempotency_key: Optional[str]) -> None:
+    """Refuse fix:…:roundN beyond mkt-review-gate Step 2.5 (round < 3)."""
+    if not idempotency_key:
+        return
+    m = _FIX_ROUND_RE.search(str(idempotency_key).strip())
+    if not m:
+        return
+    n = int(m.group(1))
+    if n > MAX_MKT_FIX_ROUND:
+        raise ValueError(
+            f"review→fix recursion refused: idempotency_key "
+            f"{idempotency_key!r} has round {n} > cap {MAX_MKT_FIX_ROUND}. "
+            f"After review round ≥3 still hard-FAIL: create ONE triage card "
+            f"(assignee marketing_lead / lead, key triage:<tenant>:<bundle>) "
+            f"and stop the fix loop — do not spawn another fix. "
+            f"See mkt-review-gate Step 2.5."
+        )
+
+
+def _reject_open_parents_for_fix(
+    conn: sqlite3.Connection,
+    parents: Iterable[str],
+    *,
+    title: str,
+    idempotency_key: Optional[str] = None,
+    skills: Optional[Iterable[str]] = None,
+) -> None:
+    """Fix cards must not wait on open (non-done) parents.
+
+    Correct multi-card shape:
+      review FAIL → create fix with no open parents → complete/block review
+      → re-review card with parents=[fix_id] (re-review waits on fix).
+    Never: fix.parents = [running/blocked review].
+    """
+    parent_ids = tuple(p for p in parents if p)
+    if not parent_ids:
+        return
+    if not _looks_like_fix_task(
+        title=title, idempotency_key=idempotency_key, skills=skills
+    ):
+        return
+    rows = conn.execute(
+        "SELECT id, status, title FROM tasks WHERE id IN ("
+        + ",".join("?" * len(parent_ids))
+        + ")",
+        parent_ids,
+    ).fetchall()
+    by_id = {r["id"]: r for r in rows}
+    open_parents = []
+    for pid in parent_ids:
+        row = by_id.get(pid)
+        if row is None:
+            continue
+        if row["status"] not in _TERMINAL_PARENT_STATUSES:
+            open_parents.append(f"{pid}(status={row['status']})")
+    if open_parents:
+        raise ValueError(
+            "review→fix deadlock refused: a fix/rework task cannot list open "
+            f"parents {', '.join(open_parents)}. Create the fix with no parents "
+            "(or only done/archived parents). Then either (1) complete this "
+            "review with FAIL summary + spawn re-review with --parent <fix_id>, "
+            "or (2) kanban_block(kind=dependency) on the review without a graph "
+            "edge. NEVER --parent <this_review_id> / parents=[HERMES_KANBAN_TASK] "
+            "for fix cards. See mkt-review-gate Step 3 / aif-review multi-card."
+        )
+
+
+# ---------------------------------------------------------------------------
 # Links
 # ---------------------------------------------------------------------------
 
@@ -3063,6 +3400,33 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(
                 f"linking {parent_id} -> {child_id} would create a cycle"
+            )
+        # Late link of open review → fix recreates the same deadlock as create.
+        child_row = conn.execute(
+            "SELECT title, idempotency_key, skills FROM tasks WHERE id = ?",
+            (child_id,),
+        ).fetchone()
+        if child_row is not None:
+            skills = None
+            keys = child_row.keys()
+            raw_skills = child_row["skills"] if "skills" in keys else None
+            if raw_skills:
+                try:
+                    parsed = json.loads(raw_skills)
+                    if isinstance(parsed, list):
+                        skills = [str(s) for s in parsed if s]
+                except (TypeError, ValueError):
+                    skills = None
+            _reject_open_parents_for_fix(
+                conn,
+                [parent_id],
+                title=child_row["title"] or "",
+                idempotency_key=(
+                    child_row["idempotency_key"]
+                    if "idempotency_key" in keys
+                    else None
+                ),
+                skills=skills,
             )
         conn.execute(
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
@@ -8618,6 +8982,143 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+_PROXY_ENV_KEYS = (
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "SOCKS_PROXY",
+    "socks_proxy",
+)
+
+
+def _read_profile_model_provider(profile_home: Optional[str]) -> str:
+    """Return ``model.provider`` from a profile's config.yaml (lowercase), or ''."""
+    if not profile_home:
+        return ""
+    cfg_path = Path(profile_home) / "config.yaml"
+    if not cfg_path.is_file():
+        return ""
+    try:
+        import yaml
+
+        data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        model = data.get("model") or {}
+        if isinstance(model, dict):
+            return str(model.get("provider") or "").strip().lower()
+    except Exception as exc:
+        _log.debug(
+            "kanban worker: could not read model.provider from %s (%s)",
+            cfg_path,
+            exc,
+        )
+    return ""
+
+
+def _load_managed_socks_proxy() -> Optional[str]:
+    """SOCKS URL for xAI region access — same as terminal ``grok`` wrapper.
+
+    Prefers already-exported env, then root ``~/.hermes/.env`` managed block,
+    then the assignee profile ``.env`` if present.
+    """
+    for key in ("HTTPS_PROXY", "ALL_PROXY", "HTTP_PROXY", "https_proxy", "all_proxy"):
+        val = (os.environ.get(key) or "").strip()
+        if val and "socks" in val.lower():
+            return val
+
+    candidates = [
+        Path.home() / ".hermes" / ".env",
+    ]
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                if k.strip() in ("HTTPS_PROXY", "ALL_PROXY", "HTTP_PROXY") and "socks" in v.lower():
+                    return v.strip().strip('"').strip("'")
+        except Exception:
+            continue
+    return None
+
+
+def _apply_worker_proxy_policy(
+    env: dict,
+    profile_arg: str,
+    profile_home: Optional[str],
+    *,
+    task: Optional[Task] = None,
+) -> None:
+    """Inject SOCKS for xAI Grok workers; strip SOCKS for everyone else.
+
+    Terminal launches Grok under a SOCKS wrapper (see ~/.zshrc ``_grok_with_proxy``).
+    Hermes kanban workers must do the same for ``xai-oauth`` / ``xai`` profiles,
+    otherwise api.x.ai returns HTTP 403 region denied. Claude SDK and Chromium
+    reject socks5h, so non-xAI workers keep a clean env.
+    """
+    provider = _read_profile_model_provider(profile_home)
+    override = ""
+    if task is not None:
+        override = str(getattr(task, "model_override", None) or "").strip().lower()
+
+    needs_socks = (
+        provider in ("xai-oauth", "xai", "x-ai")
+        or override.startswith("grok")
+        or "xai" in override
+        or (profile_arg or "").lower() in ("hermes_dev", "life", "review")
+    )
+
+    if needs_socks:
+        proxy = _load_managed_socks_proxy()
+        # Prefer proxy already in profile .env once child loads dotenv; still
+        # inject into the spawn env so first HTTP client sees it even before
+        # dotenv if parent gateway had proxies stripped.
+        if not proxy and profile_home:
+            p_env = Path(profile_home) / ".env"
+            if p_env.is_file():
+                try:
+                    for line in p_env.read_text(encoding="utf-8", errors="replace").splitlines():
+                        line = line.strip()
+                        if line.startswith("HTTPS_PROXY=") or line.startswith("ALL_PROXY="):
+                            v = line.split("=", 1)[1].strip().strip('"').strip("'")
+                            if "socks" in v.lower():
+                                proxy = v
+                                break
+                except Exception:
+                    pass
+        if proxy:
+            for key in ("ALL_PROXY", "HTTPS_PROXY", "HTTP_PROXY", "all_proxy", "https_proxy", "http_proxy"):
+                env[key] = proxy
+            no_proxy = (
+                env.get("NO_PROXY")
+                or os.environ.get("NO_PROXY")
+                or "localhost,127.0.0.1,::1,.local,169.254.0.0/16,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,api.telegram.org,telegram.org"
+            )
+            env["NO_PROXY"] = no_proxy
+            env["no_proxy"] = no_proxy
+            _log.debug(
+                "kanban worker: SOCKS proxy enabled for xAI profile=%s provider=%s",
+                profile_arg,
+                provider or override or "xai",
+            )
+        else:
+            _log.warning(
+                "kanban worker: profile %s needs SOCKS for xAI but no proxy URL found "
+                "in env or ~/.hermes/.env — expect region 403 on grok",
+                profile_arg,
+            )
+        return
+
+    # Non-xAI: strip inherited SOCKS so Claude/Codex/Chromium stay healthy.
+    for _proxy_key in _PROXY_ENV_KEYS:
+        env.pop(_proxy_key, None)
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -8646,29 +9147,6 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
-    # xAI topic/chat profiles need SOCKS for region access.
-    # Claude Agent SDK breaks on socks5h (UnsupportedProxyProtocol); Chromium
-    # also rejects socks5h (ERR_NO_SUPPORTED_PROXIES). Marketing kanban workers
-    # run Claude or OpenAI Codex — strip proxies for them. Leave SOCKS for
-    # xAI-backed chat profiles (pm_*, etc.) if they ever spawn workers.
-    _assignee_l = (profile_arg or "").lower()
-    _no_socks_assignees = {
-        "landing_qa", "marketing_copywriter", "marketing_reviewer",
-        "aif_reviewer", "marketing_copywriter_sonnet",
-        "marketing_executor", "marketing_designer", "marketing_analyst",
-        "aif_specifier", "aif_planner", "aif_verifier", "client_marketing",
-    }
-    if (
-        _assignee_l in _no_socks_assignees
-        or "anthropic" in _assignee_l
-        or _assignee_l.startswith("marketing_")
-        or _assignee_l.startswith("aif_")
-    ):
-        for _proxy_key in (
-            "ALL_PROXY", "all_proxy", "HTTP_PROXY", "http_proxy",
-            "HTTPS_PROXY", "https_proxy", "SOCKS_PROXY", "socks_proxy",
-        ):
-            env.pop(_proxy_key, None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -8680,14 +9158,23 @@ def _default_spawn(
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
     from hermes_cli.profiles import resolve_profile_env
+    _profile_home = None
     try:
-        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+        _profile_home = resolve_profile_env(profile_arg)
+        env["HERMES_HOME"] = _profile_home
     except FileNotFoundError:
         # Profile dir doesn't exist — defer resolution to the CLI's
         # _apply_profile_override() via HERMES_PROFILE (set below).
         # This only happens in test fixtures where the isolated
         # HERMES_HOME never had profiles created.
         pass
+
+    # Proxy policy (mirror terminal `grok` wrapper in ~/.zshrc):
+    # - xAI Grok needs SOCKS (region gate → HTTP 403 without it)
+    # - Claude Agent SDK / Chromium break on socks5h → strip for non-xAI
+    # Decide by actual profile model.provider, not assignee name prefix alone
+    # (aif_* used to be blanket-stripped even when a worker still hit xai-oauth).
+    _apply_worker_proxy_policy(env, profile_arg, _profile_home, task=task)
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id

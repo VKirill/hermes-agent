@@ -94,6 +94,8 @@ class ProcessSession:
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
     session_key: str = ""                       # Gateway session key (for reset protection)
+    agent_profile: str = ""                     # Routed gateway profile name
+    agent_hermes_home: str = ""                 # Routed profile HERMES_HOME
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
     env_ref: Any = None                         # Reference to the environment object
@@ -309,6 +311,8 @@ class ProcessRegistry:
                 self.completion_queue.put({
                     "session_id": session.id,
                     "session_key": session.session_key,
+                    "agent_profile": session.agent_profile,
+                    "agent_hermes_home": session.agent_hermes_home,
                     "command": session.command,
                     "type": "watch_disabled",
                     "suppressed": session._watch_suppressed,
@@ -340,6 +344,8 @@ class ProcessRegistry:
         self.completion_queue.put({
             "session_id": session.id,
             "session_key": session.session_key,
+            "agent_profile": session.agent_profile,
+            "agent_hermes_home": session.agent_hermes_home,
             "command": session.command,
             "type": "watch_match",
             "pattern": matched_pattern,
@@ -687,6 +693,8 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        agent_profile: str = "",
+        agent_hermes_home: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -697,12 +705,16 @@ class ProcessRegistry:
             use_pty: If True, use a pseudo-terminal via ptyprocess for interactive
                      CLI tools (Codex, Claude Code, Python REPL). Falls back to
                      subprocess.Popen if ptyprocess is not installed.
+            agent_profile: Routed gateway profile name (for completion routing).
+            agent_hermes_home: Routed profile HERMES_HOME (checkpoint/scope isolation).
         """
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
             task_id=task_id,
             session_key=session_key,
+            agent_profile=agent_profile or "",
+            agent_hermes_home=agent_hermes_home or "",
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
@@ -826,6 +838,8 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        agent_profile: str = "",
+        agent_hermes_home: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -843,6 +857,8 @@ class ProcessRegistry:
             command=command,
             task_id=task_id,
             session_key=session_key,
+            agent_profile=agent_profile or "",
+            agent_hermes_home=agent_hermes_home or "",
             cwd=cwd,
             started_at=time.time(),
             env_ref=env,
@@ -1086,6 +1102,8 @@ class ProcessRegistry:
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
+                "agent_profile": session.agent_profile,
+                "agent_hermes_home": session.agent_hermes_home,
                 "command": session.command,
                 "exit_code": session.exit_code,
                 "completion_reason": session.completion_reason,
@@ -1811,6 +1829,8 @@ class ProcessRegistry:
                             "started_at": s.started_at,
                             "task_id": s.task_id,
                             "session_key": s.session_key,
+                            "agent_profile": s.agent_profile,
+                            "agent_hermes_home": s.agent_hermes_home,
                             "watcher_platform": s.watcher_platform,
                             "watcher_chat_id": s.watcher_chat_id,
                             "watcher_user_id": s.watcher_user_id,
@@ -1878,26 +1898,34 @@ class ProcessRegistry:
                     )
                 continue
 
+            raw_agent_profile = str(entry.get("agent_profile", "") or "").strip()
+            raw_agent_home = str(entry.get("agent_hermes_home", "") or "").strip()
+            # Profile-only legacy checkpoints lack a home path — do not rearm
+            # watchers/notify, and drop the stale profile tag so scope filtering
+            # does not pin the session to a dead profile routing key.
+            legacy_profile_without_home = bool(raw_agent_profile and not raw_agent_home)
             session = ProcessSession(
                 id=entry["session_id"],
                 command=entry.get("command", "unknown"),
                 task_id=entry.get("task_id", ""),
                 session_key=entry.get("session_key", ""),
+                agent_profile="" if legacy_profile_without_home else raw_agent_profile,
+                agent_hermes_home=raw_agent_home,
                 pid=pid,
                 host_start_time=recorded_start,
                 pid_scope=pid_scope,
                 cwd=entry.get("cwd"),
                 started_at=entry.get("started_at", time.time()),
                 detached=True,  # Can't read output, but can report status + kill
-                watcher_platform=entry.get("watcher_platform", ""),
-                watcher_chat_id=entry.get("watcher_chat_id", ""),
-                watcher_user_id=entry.get("watcher_user_id", ""),
-                watcher_user_name=entry.get("watcher_user_name", ""),
-                watcher_thread_id=entry.get("watcher_thread_id", ""),
-                watcher_message_id=entry.get("watcher_message_id", ""),
-                watcher_interval=entry.get("watcher_interval", 0),
-                notify_on_complete=entry.get("notify_on_complete", False),
-                watch_patterns=entry.get("watch_patterns", []),
+                watcher_platform="" if legacy_profile_without_home else entry.get("watcher_platform", ""),
+                watcher_chat_id="" if legacy_profile_without_home else entry.get("watcher_chat_id", ""),
+                watcher_user_id="" if legacy_profile_without_home else entry.get("watcher_user_id", ""),
+                watcher_user_name="" if legacy_profile_without_home else entry.get("watcher_user_name", ""),
+                watcher_thread_id="" if legacy_profile_without_home else entry.get("watcher_thread_id", ""),
+                watcher_message_id="" if legacy_profile_without_home else entry.get("watcher_message_id", ""),
+                watcher_interval=0 if legacy_profile_without_home else entry.get("watcher_interval", 0),
+                notify_on_complete=False if legacy_profile_without_home else entry.get("notify_on_complete", False),
+                watch_patterns=[] if legacy_profile_without_home else entry.get("watch_patterns", []),
             )
             with self._lock:
                 self._running[session.id] = session
@@ -1910,6 +1938,8 @@ class ProcessRegistry:
                     "session_id": session.id,
                     "check_interval": session.watcher_interval,
                     "session_key": session.session_key,
+                    "agent_profile": session.agent_profile,
+                    "agent_hermes_home": session.agent_hermes_home,
                     "platform": session.watcher_platform,
                     "chat_id": session.watcher_chat_id,
                     "user_id": session.watcher_user_id,

@@ -2154,6 +2154,43 @@ class TestKanbanProfileTerminalWriteGuard:
         assert result.get("hardline") is True
         assert "kanban profile write guard" in result["message"]
 
+    def test_variants_path_is_not_parsed_as_var(self, tmp_path, monkeypatch):
+        """'/variants/...' must not match absolute-path scanner via '/var' prefix."""
+        from tools import approval as mod
+
+        self._profile_home(tmp_path, monkeypatch)
+        cmd = (
+            "python3 - <<'PY'\n"
+            "open('/tmp/out.png', 'wb').write(b'x')\n"
+            "print('/variants/angle1-/gen.png')\n"
+            "PY"
+        )
+        found = mod._POSIX_ABSOLUTE_PATH_RE.findall(cmd)
+        assert not any(p.startswith("/variants") for p in found)
+        result = mod.check_all_command_guards(cmd, "local")
+        assert result["approved"] is True
+
+    def test_gen_image_script_path_ignored_when_write_is_allowed(self, tmp_path, monkeypatch):
+        """Write under allowed root + invoke gen-image.sh must not hard-block on script path."""
+        from tools import approval as mod
+
+        _root, _profile_home, workspace = self._profile_home(tmp_path, monkeypatch)
+        out = workspace / "out.png"
+        cmd = (
+            "python3 - <<'PY'\n"
+            "import subprocess\n"
+            f"open({str(out)!r}, 'wb').write(b'x')\n"
+            "subprocess.run(['/Users/vechkasov/Work/infra/scripts/gen-image.sh',"
+            "'prompt', '/tmp/x.png'], check=False)\n"
+            "PY"
+        )
+        assert mod._is_shared_tooling_exec_path(
+            Path("/Users/vechkasov/Work/infra/scripts/gen-image.sh")
+        )
+        result = mod.check_all_command_guards(cmd, "local")
+        assert result["approved"] is True
+        assert mod._check_kanban_profile_terminal_write_guard(cmd) is None
+
 
 
 # =========================================================================

@@ -160,7 +160,23 @@ gateway:
       blocked:             "blocked; needs attention"
       status_default:      "status changed"
       status_joiner:       ", "
-      message:             "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+      message:             |
+        [kanban-wake] ВНУТРЕННИЙ сигнал — не пересылай этот блок Кириллу как есть.
+        Задача {task_id} {status}.
+        Title: {title}
+        Assignee: @{assignee}
+        Board: {board}
+
+        Протокол (face/PM):
+        1. Прочитай задачу: summary, result, comments, artifacts; открой human MD если есть (cluster_summary / copy-overview / review-NN / …).
+        2. Промежуточный микрошаг → ответь ровно [SILENT] (auto-✔ уже ушёл; второй дамп не нужен).
+        3. Milestone / блокер / owner-gate → один русский rich mini-отчёт:
+           - **жирный lead** (клиент + исход)
+           - 2–5 пунктов: что изменилось / важные цифры / что дальше
+           - опционально <details> с мясом; ||спойлер|| только для коротких чувствительных кусков
+           - owner-gate только если деньги / live / publish
+        4. Не вставляй: сырые стены worker summary, пути, t_id, JSON/YAML-ключи, API-enum, имена моделей.
+        5. Скиллы: mkt-accept + ru-text-quick (kirill-client-pm-style) + telegram-rich-formatting.
 
   personality:
     none_configured:       "В `{path}/config.yaml` не настроено ни одной личности"

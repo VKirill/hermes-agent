@@ -1252,6 +1252,129 @@ def test_create_session_id_absent_when_env_unset(monkeypatch, worker_env):
         conn.close()
 
 
+def test_create_infers_tenant_from_workspace_path(worker_env, tmp_path, monkeypatch):
+    """MCP kanban_create without tenant= still stamps …/tenants/<slug>.
+
+    Regression t_672dca0a / t_dee0f56a: launcher-style marketing cards pass
+    workspace_path under HermesWork/tenants/<slug> and omit tenant; create
+    + show must round-trip the inferred slug.
+    """
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.delenv("HERMES_TENANT", raising=False)
+    tenant_root = tmp_path / "HermesWork" / "tenants" / "andyspark"
+    tenant_root.mkdir(parents=True)
+
+    out = kt._handle_create({
+        "title": "Direct draft cycle",
+        "assignee": "lead",
+        "workspace_kind": "dir",
+        "workspace_path": str(tenant_root),
+        # intentionally no tenant=
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d.get("tenant") == "andyspark", d
+
+    show = json.loads(kt._handle_show({"task_id": d["task_id"]}))
+    assert show["task"]["tenant"] == "andyspark"
+    assert show["task"]["workspace_path"] == str(tenant_root)
+
+    with kb.connect() as conn:
+        row = kb.get_task(conn, d["task_id"])
+        assert row.tenant == "andyspark"
+        created = [e for e in kb.list_events(conn, d["task_id"]) if e.kind == "created"]
+        assert created and created[0].payload.get("tenant") == "andyspark"
+
+
+def test_create_inherits_tenant_from_parent(worker_env, monkeypatch):
+    """Parent tenant wins when workspace path has no tenants/<slug> segment."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.delenv("HERMES_TENANT", raising=False)
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn, title="f16 parent", assignee="ops", tenant="andyspark"
+        )
+
+    out = kt._handle_create({
+        "title": "child of f16",
+        "assignee": "lead",
+        "parents": [parent],
+        # no tenant, no tenant workspace path
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d.get("tenant") == "andyspark", d
+    show = json.loads(kt._handle_show({"task_id": d["task_id"]}))
+    assert show["task"]["tenant"] == "andyspark"
+
+
+def test_create_tenant_from_workspace_on_named_board_with_db_pin(
+    worker_env, tmp_path, monkeypatch
+):
+    """board= + workspace tenant inference, even under HERMES_KANBAN_DB pin.
+
+    Mirrors MCP create on marketing while a worker/dispatcher env pins the
+    default board DB. Explicit board must route to marketing and stamp
+    tenant from workspace + parent.
+    """
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.delenv("HERMES_TENANT", raising=False)
+    # Pin default board DB the way the dispatcher does for workers.
+    default_db = kb.kanban_db_path()
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(default_db))
+
+    kb.create_board("marketing")
+    tenant_root = tmp_path / "HermesWork" / "tenants" / "andyspark"
+    tenant_root.mkdir(parents=True)
+
+    with kb.connect(board="marketing") as conn:
+        parent = kb.create_task(
+            conn,
+            title="onboarding f16",
+            assignee="ops",
+            tenant="andyspark",
+        )
+
+    out = kt._handle_create({
+        "title": "Direct full draft",
+        "assignee": "lead",
+        "parents": [parent],
+        "workspace_kind": "dir",
+        "workspace_path": str(tenant_root),
+        "board": "marketing",
+        # no tenant=
+    })
+    d = json.loads(out)
+    assert d["ok"] is True, d
+    assert d.get("tenant") == "andyspark", d
+
+    # Landed on marketing board, not the pinned default DB.
+    with kb.connect(board="marketing") as conn:
+        task = kb.get_task(conn, d["task_id"])
+        assert task is not None
+        assert task.tenant == "andyspark"
+        assert task.workspace_path == str(tenant_root)
+        parents = [r["parent_id"] for r in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ?",
+            (d["task_id"],),
+        ).fetchall()]
+        assert parent in parents
+
+    with kb.connect() as conn:
+        assert kb.get_task(conn, d["task_id"]) is None
+
+    show = json.loads(kt._handle_show({
+        "task_id": d["task_id"], "board": "marketing",
+    }))
+    assert show["task"]["tenant"] == "andyspark"
+
+
 def test_create_rejects_no_title(worker_env):
     from tools import kanban_tools as kt
     assert json.loads(kt._handle_create({"assignee": "x"})).get("error")
@@ -1411,9 +1534,11 @@ def test_unlink_promotes_child_after_removing_blocking_parent(worker_env):
     try:
         parent = kb.create_task(conn, title="blocked review", assignee="review")
         kb.claim_task(conn, parent, claimer="review:1")
+        # Non-fix title: ordinary fan-out may wait on open parents.
+        # (fix/* titles are rejected — see review→fix deadlock guards.)
         child = kb.create_task(
             conn,
-            title="fix",
+            title="apply blockers from review",
             assignee="implementer",
             parents=[parent],
         )
@@ -1431,6 +1556,98 @@ def test_unlink_promotes_child_after_removing_blocking_parent(worker_env):
         assert kb.get_task(conn, child).status == "ready"
     finally:
         conn.close()
+
+
+def test_create_rejects_fix_parented_on_open_review(worker_env):
+    """Root of marketing review↔fix thrash: fix.parents=[open review]."""
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        review = kb.create_task(conn, title="independent review bundle", assignee="review")
+        kb.claim_task(conn, review, claimer="review:1")
+        assert kb.get_task(conn, review).status == "running"
+        try:
+            kb.create_task(
+                conn,
+                title="fix claims after review",
+                assignee="copy",
+                parents=[review],
+                idempotency_key="fix:andyspark:bundle:round1",
+            )
+            raised = False
+        except ValueError as e:
+            raised = True
+            assert "deadlock" in str(e).lower() or "open parents" in str(e).lower()
+        assert raised, "expected ValueError refusing open-parent fix"
+        # Healthy shape: fix with no open parents starts ready.
+        fix = kb.create_task(
+            conn,
+            title="fix claims after review",
+            assignee="copy",
+            idempotency_key="fix:andyspark:bundle:round1",
+        )
+        assert kb.get_task(conn, fix).status == "ready"
+        # Re-review may wait on the fix.
+        rereview = kb.create_task(
+            conn,
+            title="re-review after fix",
+            assignee="review",
+            parents=[fix],
+        )
+        assert kb.get_task(conn, rereview).status == "todo"
+    finally:
+        conn.close()
+
+
+def test_create_rejects_fix_round_past_cap(worker_env):
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        try:
+            kb.create_task(
+                conn,
+                title="fix claims round 3",
+                assignee="copy",
+                idempotency_key="fix:andyspark:bundle:round3",
+            )
+            raised = False
+        except ValueError as e:
+            raised = True
+            assert "round" in str(e).lower() or "recursion" in str(e).lower()
+        assert raised
+        # round2 still allowed
+        tid = kb.create_task(
+            conn,
+            title="fix claims round 2",
+            assignee="copy",
+            idempotency_key="fix:andyspark:bundle:round2",
+        )
+        assert tid
+    finally:
+        conn.close()
+
+
+def test_link_rejects_open_review_to_fix_child(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        review = kb.create_task(conn, title="review card", assignee="review")
+        kb.claim_task(conn, review, claimer="review:1")
+        fix = kb.create_task(
+            conn,
+            title="fix card free",
+            assignee="copy",
+            idempotency_key="fix:tenant:b:round1",
+        )
+    finally:
+        conn.close()
+
+    out = kt._handle_link({"parent_id": review, "child_id": fix})
+    err = json.loads(out).get("error") or ""
+    assert err, "expected link refusal"
+    assert "deadlock" in err.lower() or "open" in err.lower()
 
 
 def test_unlink_rejects_missing_or_unknown_edge(worker_env):

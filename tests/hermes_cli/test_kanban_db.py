@@ -222,6 +222,91 @@ def test_create_task_no_parents_is_ready(kanban_home):
     assert t.workspace_kind == "scratch"
 
 
+def test_infer_tenant_from_workspace_path():
+    assert (
+        kb.infer_tenant_from_workspace_path(
+            "/Users/vechkasov/HermesWork/tenants/andyspark"
+        )
+        == "andyspark"
+    )
+    assert (
+        kb.infer_tenant_from_workspace_path(
+            "/Users/vechkasov/HermesWork/tenants/pisateli-forest/knowledge"
+        )
+        == "pisateli-forest"
+    )
+    assert kb.infer_tenant_from_workspace_path("/tmp/scratch-ws") is None
+    assert kb.infer_tenant_from_workspace_path(None) is None
+
+
+def test_create_task_infers_tenant_from_workspace_path(kanban_home, tmp_path):
+    tenant_root = tmp_path / "HermesWork" / "tenants" / "andyspark"
+    tenant_root.mkdir(parents=True)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="video recon",
+            assignee="ops",
+            workspace_kind="dir",
+            workspace_path=str(tenant_root),
+        )
+        t = kb.get_task(conn, tid)
+    assert t.tenant == "andyspark"
+
+
+def test_create_task_explicit_tenant_wins_over_path(kanban_home, tmp_path):
+    tenant_root = tmp_path / "HermesWork" / "tenants" / "andyspark"
+    tenant_root.mkdir(parents=True)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="override",
+            workspace_kind="dir",
+            workspace_path=str(tenant_root),
+            tenant="domlogist",
+        )
+        t = kb.get_task(conn, tid)
+    assert t.tenant == "domlogist"
+
+
+def test_create_task_inherits_tenant_from_parent(kanban_home):
+    with kb.connect() as conn:
+        parent = kb.create_task(
+            conn, title="parent", tenant="andyspark", assignee="face"
+        )
+        child = kb.create_task(
+            conn, title="child", parents=[parent], assignee="ops"
+        )
+        assert kb.get_task(conn, child).tenant == "andyspark"
+
+
+def test_set_task_tenant_and_backfill(kanban_home, tmp_path):
+    tenant_root = tmp_path / "HermesWork" / "tenants" / "andyspark"
+    tenant_root.mkdir(parents=True)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="legacy", workspace_kind="scratch")
+        conn.execute(
+            "UPDATE tasks SET tenant = NULL, workspace_kind = 'dir', "
+            "workspace_path = ? WHERE id = ?",
+            (str(tenant_root), tid),
+        )
+        conn.commit()
+        assert kb.get_task(conn, tid).tenant is None
+
+        dry = kb.backfill_tenants_from_workspace(conn, dry_run=True)
+        assert len(dry) == 1
+        assert dry[0]["id"] == tid
+        assert dry[0]["inferred"] == "andyspark"
+        assert kb.get_task(conn, tid).tenant is None
+
+        applied = kb.backfill_tenants_from_workspace(conn, dry_run=False)
+        assert applied[0]["applied"] is True
+        assert kb.get_task(conn, tid).tenant == "andyspark"
+        events = kb.list_events(conn, tid)
+        kinds = [e.kind for e in events]
+        assert "tenant_set" in kinds
+
+
 def test_create_task_with_parent_is_todo_until_parent_done(kanban_home):
     with kb.connect() as conn:
         p = kb.create_task(conn, title="parent")

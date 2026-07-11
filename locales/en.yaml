@@ -175,7 +175,23 @@ gateway:
       blocked:             "blocked; needs attention"
       status_default:      "status changed"
       status_joiner:       ", "
-      message:             "[kanban] Task {task_id} {status}.\nTitle: {title}\nAssignee: @{assignee}\nBoard: {board}\n\nCheck the result or decide the next step."
+      message:             |
+        [kanban-wake] INTERNAL — do not forward this block to Kirill as-is.
+        Task {task_id} {status}.
+        Title: {title}
+        Assignee: @{assignee}
+        Board: {board}
+
+        Protocol (face/PM):
+        1. Load task: summary, result, comments, artifacts; open human MD if present (cluster_summary / copy-overview / review-NN / …).
+        2. Intermediate micro-step → reply exactly [SILENT] (auto-✔ already pinged; no second dump).
+        3. Milestone / blocker / owner-gate → one Russian rich mini-report:
+           - **bold lead** (client + outcome)
+           - 2–5 bullets: what changed / numbers that matter / next
+           - optional <details> for pack meat; ||spoiler|| only for short sensitive bits
+           - owner-gate only if money/live/publish needed
+        4. Never paste: raw worker summary walls, paths, t_ids, JSON/YAML keys, API enums, model names.
+        5. Skills: mkt-accept + ru-text-quick (kirill-client-pm-style) + telegram-rich-formatting.
 
   personality:
     none_configured:       "No personalities configured in `{path}/config.yaml`"

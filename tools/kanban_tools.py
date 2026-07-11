@@ -968,6 +968,9 @@ def _handle_create(args: dict, **kw) -> str:
         )
     body = args.get("body")
     parents = args.get("parents") or []
+    # Explicit tenant preferred; create_task also resolves HERMES_TENANT /
+    # parent / workspace-path inference. Workers inherit self-task tenant
+    # when spawning follow-ups without an explicit value.
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
@@ -1018,17 +1021,21 @@ def _handle_create(args: dict, **kw) -> str:
         try:
             # Inherit the spawning worker's own task workspace when the
             # caller didn't specify one (see resolution note above).
-            if _inherit_workspace:
-                _self_tid = os.environ.get("HERMES_KANBAN_TASK")
-                if _self_tid:
-                    _self_task = kb.get_task(conn, _self_tid)
-                    if _self_task is not None and _self_task.workspace_kind:
-                        workspace_kind = _self_task.workspace_kind
-                        workspace_path = _self_task.workspace_path
-                        # Keep follow-up children inside the same project so the
-                        # whole subtree shares one repo + branch convention.
-                        if project_id is None and _self_task.project_id:
-                            project_id = _self_task.project_id
+            _self_tid = os.environ.get("HERMES_KANBAN_TASK")
+            _self_task = None
+            if _self_tid:
+                _self_task = kb.get_task(conn, _self_tid)
+            if _inherit_workspace and _self_task is not None and _self_task.workspace_kind:
+                workspace_kind = _self_task.workspace_kind
+                workspace_path = _self_task.workspace_path
+                # Keep follow-up children inside the same project so the
+                # whole subtree shares one repo + branch convention.
+                if project_id is None and _self_task.project_id:
+                    project_id = _self_task.project_id
+            # Keep children in the same tenant namespace even when the model
+            # omits tenant= (common for marketing launcher-style cards).
+            if not tenant and _self_task is not None and _self_task.tenant:
+                tenant = _self_task.tenant
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1060,6 +1067,7 @@ def _handle_create(args: dict, **kw) -> str:
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
+                tenant=new_task.tenant if new_task else tenant,
                 subscribed=subscribed,
             )
         finally:
@@ -1404,9 +1412,13 @@ KANBAN_COMPLETE_SCHEMA = {
             "summary": {
                 "type": "string",
                 "description": (
-                    "Human-readable handoff, 1-3 sentences. Appears in "
-                    "Run History on the dashboard and in downstream "
-                    "workers' context."
+                    "Human-readable handoff. FIRST LINE is client-facing "
+                    "Telegram auto-notify: one business sentence, ≤~160 "
+                    "chars, client + outcome + key numbers. No absolute "
+                    "paths, .json/.yaml names, task ids, INN, OAuth, "
+                    "confidence, or API enums. Extra lines OK for "
+                    "dashboard/workers; technical detail belongs in "
+                    "result/artifacts, not line 1."
                 ),
             },
             "metadata": {
@@ -1607,12 +1619,16 @@ KANBAN_COMMENT_SCHEMA = {
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
-        "Create a new kanban task, optionally as a child of the current "
-        "one (pass the current task id in ``parents``). Used by "
-        "orchestrator workers to fan out — decompose work into child "
-        "tasks with specific assignees, link them into a pipeline, "
-        "then complete your own task. The dispatcher picks up the new "
-        "tasks on its next tick and spawns the assigned profiles."
+        "Create a new kanban task, optionally gated on parent tasks "
+        "(``parents`` = task ids that must reach done first). Used by "
+        "orchestrator workers to fan out. The dispatcher spawns assigned "
+        "profiles on the next tick. "
+        "ANTI-DEADLOCK: for fix/rework cards (title FIX/fix/…, "
+        "idempotency_key fix:…, skill mkt-fix/aif-fix) do NOT pass the "
+        "current open review as a parent — the child stays todo forever "
+        "while the review waits on the fix. Create the fix with no open "
+        "parents; put the re-review as the child of the fix. "
+        "fix:…:roundN with N>2 is refused (marketing convergence cap)."
     ),
     "parameters": {
         "type": "object",
@@ -1642,9 +1658,11 @@ KANBAN_CREATE_SCHEMA = {
                 "type": "array",
                 "items": {"type": "string"},
                 "description": (
-                    "Parent task ids. The new task stays in 'todo' "
-                    "until every parent reaches 'done'; then it "
-                    "auto-promotes to 'ready'. Typical fan-in: list "
+                    "Parent task ids that must finish first. Child stays "
+                    "'todo' until every parent is done/archived, then "
+                    "auto-promotes to 'ready'. For re-review after a fix: "
+                    "parents=[fix_id]. NEVER parents=[open review] on a "
+                    "fix card (deadlock). Typical fan-in: list "
                     "all the researcher task ids when creating a "
                     "synthesizer task."
                 ),
@@ -1652,8 +1670,11 @@ KANBAN_CREATE_SCHEMA = {
             "tenant": {
                 "type": "string",
                 "description": (
-                    "Optional namespace for multi-project isolation. "
-                    "Defaults to HERMES_TENANT env if set."
+                    "Optional namespace for multi-project isolation "
+                    "(e.g. marketing client slug 'andyspark'). "
+                    "Defaults: HERMES_TENANT env → parent task tenant → "
+                    "slug inferred from workspace_path under …/tenants/<slug>. "
+                    "Pass explicitly for launcher-style marketing cards."
                 ),
             },
             "priority": {

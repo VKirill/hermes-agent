@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -23,6 +24,60 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+# Client-facing auto-notify must stay a short business ping. Technical
+# worker dumps (paths, JSON names, OAuth, multi-sentence research walls)
+# go to the PM/face wake path — not into the Telegram ✔ line.
+_TECH_NOTIFY_MARKERS = (
+    "~/",
+    "/users/",
+    "/home/",
+    "hermeswork",
+    "hermes_home",
+    ".json",
+    ".yaml",
+    ".yml",
+    ".csv",
+    ".xlsx",
+    "confidence",
+    "oauth",
+    "metadata",
+    "artifacts/",
+    "task_id",
+    "kanban_complete",
+    "enrichment.",
+    "инн ",
+    "inn ",
+)
+_TECH_NOTIFY_RE = re.compile(
+    r"(?:^|\s)(?:/[\w.-]+){2,}"  # absolute-ish paths
+    r"|t_[0-9a-f]{6,}"  # task ids
+    r"|\b[A-Z]{2,}[_-][A-Z0-9_]+\b",  # API enums like WB_MAXIMUM_CLICKS
+    re.IGNORECASE,
+)
+
+
+def _human_notify_line(text: Optional[str], limit: int = 160) -> str:
+    """Return a client-safe one-liner for auto-notify, or empty if technical.
+
+    First line only. Drops path dumps, JSON filenames, task ids, API enums,
+    and other worker-internal residue so Kirill sees business language.
+    Full context belongs to the face/PM wake mini-report, not this ping.
+    """
+    if not text:
+        return ""
+    line = str(text).strip().splitlines()[0].strip()
+    if not line:
+        return ""
+    low = line.lower()
+    if any(marker in low for marker in _TECH_NOTIFY_MARKERS):
+        return ""
+    if _TECH_NOTIFY_RE.search(line):
+        return ""
+    # Multi-clause technical walls: keep short business lines only.
+    if len(line) > limit:
+        line = line[: max(1, limit - 1)].rstrip() + "…"
+    return line
 
 
 def _resolve_auto_decompose_settings(
@@ -380,26 +435,20 @@ class GatewayKanbanWatchersMixin:
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
                         if kind == "completed":
-                            # Prefer the run's summary (the worker's
-                            # intentional human-facing handoff, carried
-                            # in the event payload), then fall back to
-                            # task.result for legacy rows written before
-                            # runs shipped.
+                            # Client-facing ✔ ping only. Prefer human one-liner
+                            # from summary (or legacy result); drop technical
+                            # residue. Face/PM wake owns the rich mini-report.
                             handoff = ""
                             payload_summary = None
                             if ev.payload and ev.payload.get("summary"):
                                 payload_summary = str(ev.payload["summary"])
-                            if payload_summary:
-                                lines = payload_summary.strip().splitlines()
-                                h = lines[0][:200] if lines else payload_summary[:200]
-                                handoff = f"\n{h}"
-                            elif task and task.result:
-                                lines = task.result.strip().splitlines()
-                                r = lines[0][:160] if lines else task.result[:160]
-                                handoff = f"\n{r}"
+                            human = _human_notify_line(payload_summary)
+                            if not human and task and task.result:
+                                human = _human_notify_line(task.result)
+                            if human:
+                                handoff = f"\n{human}"
                             msg = (
-                                f"✔ {board_tag}{tag}Задача {sub['task_id']} выполнена"
-                                f" — {title}{handoff}"
+                                f"✔ {board_tag}{tag}— {title}{handoff}"
                             )
                         elif kind == "blocked":
                             reason = ""

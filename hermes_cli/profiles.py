@@ -1208,14 +1208,68 @@ def _skills_dir_signature(skills_dir: Path) -> float:
     return sig
 
 
+def _read_external_skills_dirs(profile_dir: Path) -> List[Path]:
+    """Return validated ``skills.external_dirs`` from profile config.yaml.
+
+    Profiles often keep only empty category stubs under ``profile/skills/`` and
+    load the real skill pack via ``skills.external_dirs`` (e.g. shared
+    ``~/.hermes/skills``). UI skill counts must include those dirs — otherwise
+    marketing workers show «Навыки: 0» while ``hermes skills list`` shows 200+.
+    """
+    cfg_path = profile_dir / "config.yaml"
+    if not cfg_path.is_file():
+        return []
+    try:
+        import yaml
+
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    raw = (data.get("skills") or {}).get("external_dirs") or []
+    if not isinstance(raw, list):
+        return []
+    out: List[Path] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not item:
+            continue
+        try:
+            p = Path(str(item)).expanduser().resolve()
+        except OSError:
+            continue
+        if not p.is_dir():
+            continue
+        key = str(p)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(p)
+    return out
+
+
 def _count_skills(profile_dir: Path) -> int:
-    """Count installed skills in a profile (cached by skills-dir signature)."""
+    """Count skills visible to a profile: local ``skills/`` + ``external_dirs``.
+
+    Dedupes by skill directory name (local wins name collisions, matching
+    runtime skill index). Cached by signature of all scanned roots.
+    """
     skills_dir = profile_dir / "skills"
-    if not skills_dir.is_dir():
+    external_dirs = _read_external_skills_dirs(profile_dir)
+    roots: List[Path] = []
+    if skills_dir.is_dir():
+        roots.append(skills_dir)
+    for d in external_dirs:
+        if d not in roots:
+            roots.append(d)
+    if not roots:
         return 0
 
-    key = str(skills_dir)
-    signature = _skills_dir_signature(skills_dir)
+    # Cache key covers every root so external_dirs edits invalidate.
+    key = "|".join(str(r) for r in roots)
+    signature = sum(_skills_dir_signature(r) for r in roots)
     now = time.time()
     cached = _SKILL_COUNT_CACHE.get(key)
     if (
@@ -1225,11 +1279,18 @@ def _count_skills(profile_dir: Path) -> int:
     ):
         return cached[2]
 
+    # Dedupe by frontmatter-ish folder name: parent of SKILL.md
+    seen_names: set[str] = set()
     count = 0
-    for md in skills_dir.rglob("SKILL.md"):
-        if is_excluded_skill_path(md):
-            continue
-        count += 1
+    for root in roots:
+        for md in root.rglob("SKILL.md"):
+            if is_excluded_skill_path(md):
+                continue
+            name = md.parent.name
+            if name in seen_names:
+                continue
+            seen_names.add(name)
+            count += 1
     _SKILL_COUNT_CACHE[key] = (signature, now, count)
     return count
 
