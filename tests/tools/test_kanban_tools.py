@@ -56,7 +56,7 @@ def test_kanban_tools_visible_with_env_var(monkeypatch, tmp_path):
     kanban = {n for n in names if n and n.startswith("kanban_")}
     expected = {
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
-        "kanban_comment", "kanban_create", "kanban_link",
+        "kanban_comment", "kanban_create", "kanban_link", "kanban_unlink",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
 
@@ -136,7 +136,7 @@ def test_kanban_tools_visible_with_toolset_config(monkeypatch, tmp_path):
     expected = {
         "kanban_list",
         "kanban_show", "kanban_complete", "kanban_block", "kanban_heartbeat",
-        "kanban_comment", "kanban_create", "kanban_link",
+        "kanban_comment", "kanban_create", "kanban_link", "kanban_unlink",
         "kanban_unblock",
     }
     assert kanban == expected, f"expected {expected}, got {kanban}"
@@ -1402,6 +1402,42 @@ def test_link_rejects_cycle(worker_env):
         conn.close()
     from tools import kanban_tools as kt
     out = kt._handle_link({"parent_id": b, "child_id": a})
+    assert json.loads(out).get("error")
+
+
+def test_unlink_promotes_child_after_removing_blocking_parent(worker_env):
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="blocked review", assignee="review")
+        kb.claim_task(conn, parent, claimer="review:1")
+        child = kb.create_task(
+            conn,
+            title="fix",
+            assignee="implementer",
+            parents=[parent],
+        )
+        assert kb.get_task(conn, child).status == "todo"
+    finally:
+        conn.close()
+
+    from tools import kanban_tools as kt
+    out = kt._handle_unlink({"parent_id": parent, "child_id": child})
+    assert json.loads(out)["ok"] is True
+
+    conn = kb.connect()
+    try:
+        assert kb.parent_ids(conn, child) == []
+        assert kb.get_task(conn, child).status == "ready"
+    finally:
+        conn.close()
+
+
+def test_unlink_rejects_missing_or_unknown_edge(worker_env):
+    from tools import kanban_tools as kt
+
+    assert json.loads(kt._handle_unlink({"parent_id": "x"})).get("error")
+    out = kt._handle_unlink({"parent_id": "t_missing", "child_id": worker_env})
     assert json.loads(out).get("error")
 
 

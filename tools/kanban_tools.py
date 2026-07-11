@@ -1247,6 +1247,35 @@ def _handle_link(args: dict, **kw) -> str:
         return tool_error(f"kanban_link: {e}")
 
 
+def _handle_unlink(args: dict, **kw) -> str:
+    """Remove a parent→child dependency edge and recompute child readiness."""
+    parent_id = args.get("parent_id")
+    child_id = args.get("child_id")
+    if not parent_id or not child_id:
+        return tool_error("both parent_id and child_id are required")
+    board = args.get("board")
+    try:
+        kb, conn = _connect(board=board)
+        try:
+            removed = kb.unlink_tasks(
+                conn,
+                parent_id=str(parent_id),
+                child_id=str(child_id),
+            )
+            if not removed:
+                return tool_error(
+                    f"kanban_unlink: dependency {parent_id} -> {child_id} not found"
+                )
+            return _ok(parent_id=str(parent_id), child_id=str(child_id))
+        finally:
+            conn.close()
+    except ValueError as e:
+        return tool_error(f"kanban_unlink: {e}")
+    except Exception as e:
+        logger.exception("kanban_unlink failed")
+        return tool_error(f"kanban_unlink: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
@@ -1780,6 +1809,25 @@ KANBAN_LINK_SCHEMA = {
     },
 }
 
+KANBAN_UNLINK_SCHEMA = {
+    "name": "kanban_unlink",
+    "description": (
+        "Remove an existing parent→child dependency edge. The child is "
+        "immediately re-evaluated and promotes to 'ready' when no unfinished "
+        "parents remain. Use this to break review→fix deadlocks without "
+        "marking a failed review as done."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "parent_id": {"type": "string", "description": "Parent task id."},
+            "child_id": {"type": "string", "description": "Child task id."},
+            "board": _board_schema_prop(),
+        },
+        "required": ["parent_id", "child_id"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Registration
@@ -1864,4 +1912,13 @@ registry.register(
     handler=_handle_link,
     check_fn=_check_kanban_mode,
     emoji="🔗",
+)
+
+registry.register(
+    name="kanban_unlink",
+    toolset="kanban",
+    schema=KANBAN_UNLINK_SCHEMA,
+    handler=_handle_unlink,
+    check_fn=_check_kanban_mode,
+    emoji="✂️",
 )
