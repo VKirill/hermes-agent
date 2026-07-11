@@ -531,9 +531,16 @@ _POSIX_ABSOLUTE_PATH_RE = re.compile(
     r"/(?:Users|Volumes|private|tmp|var|opt|home|etc|usr|srv|mnt|workspace)"
     r"[^\s'\"`)]*"
 )
+_OPEN_WRITE_MODE = r"['\"](?:[awx](?:[bt])?\+?|r(?:[bt])?\+)['\"]"
+# Builtin open(path, "w"/"a"/"x"/... or mode=...); Path.open("w"...).
+# Intentionally does NOT match open("/path/with-letter-a.json") read calls —
+# that false-positive blocked marketing_designer gen-image.sh runs when any
+# absolute tooling path (e.g. ~/Work/infra/scripts/gen-image.sh) appeared in
+# the same command as open(...manifest...).
 _KANBAN_PROFILE_WRITE_INTENT_RE = re.compile(
     r"(?:\.\s*(?:write_text|write_bytes)\s*\(|"
-    r"\bopen\s*\([^\n)]*['\"][^'\"]*[wax][^'\"]*['\"]|"
+    r"\bopen\s*\([^\n)]*,\s*(?:mode\s*=\s*)?" + _OPEN_WRITE_MODE + r"|"
+    r"\.\s*open\s*\(\s*(?:mode\s*=\s*)?" + _OPEN_WRITE_MODE + r"|"
     r"(?:^|[;&|\n])\s*(?:sudo\s+(?:-[^\s]+\s+)*)?(?:tee|cp|mv|install)\b|"
     r"(?:^|[;&|\n])[^#\n]*(?:>|>>)\s*['\"]?/)"
     ,

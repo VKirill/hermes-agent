@@ -2101,6 +2101,61 @@ class TestKanbanProfileTerminalWriteGuard:
         assert result["approved"] is True
 
 
+    def test_open_path_with_letter_a_is_not_write_intent(self, tmp_path, monkeypatch):
+        """open('...manifest...') must not trip write intent via letters a/w/x."""
+        from tools import approval as mod
+
+        self._profile_home(tmp_path, monkeypatch)
+        cmd = (
+            "python3 - <<'PY'\n"
+            "import json\n"
+            "m=json.load(open('/Users/vechkasov/MarketingClients/c/source-manifest.json'))\n"
+            "print(len(m))\n"
+            "PY"
+        )
+        assert mod._KANBAN_PROFILE_WRITE_INTENT_RE.search(cmd) is None
+        result = mod.check_all_command_guards(cmd, "local")
+        assert result["approved"] is True
+
+    def test_gen_image_batch_with_manifest_open_is_allowed(self, tmp_path, monkeypatch):
+        """marketing_designer regression: gen-image.sh + open(manifest) was hard-blocked."""
+        from tools import approval as mod
+
+        self._profile_home(tmp_path, monkeypatch)
+        cmd = (
+            "set -euo pipefail\n"
+            "ROOT=/Users/vechkasov/MarketingClients/pisateli-forest/creatives/x\n"
+            "python3 - <<'PY'\n"
+            "import json, subprocess\n"
+            "root='/Users/vechkasov/MarketingClients/pisateli-forest/creatives/x'\n"
+            "m=json.load(open(root+'/source-manifest.json'))\n"
+            "cmd=['/Users/vechkasov/Work/infra/scripts/gen-image.sh','--ref',"
+            "'/Users/vechkasov/MarketingClients/c/ref.jpg','p',"
+            "'/Users/vechkasov/MarketingClients/c/out.png','1024x1024','high']\n"
+            "subprocess.run(cmd, check=False)\n"
+            "PY"
+        )
+        assert mod._KANBAN_PROFILE_WRITE_INTENT_RE.search(cmd) is None
+        result = mod.check_all_command_guards(cmd, "local")
+        assert result["approved"] is True
+        assert mod._check_kanban_profile_terminal_write_guard(cmd) is None
+
+    def test_open_write_mode_still_blocks_outside_roots(self, tmp_path, monkeypatch):
+        from tools import approval as mod
+
+        self._profile_home(tmp_path, monkeypatch)
+        cmd = (
+            "python3 - <<'PY'\n"
+            "open('/Users/agent/tools/ohmy-seo/x.ts', 'w').write('x')\n"
+            "PY"
+        )
+        result = mod.check_all_command_guards(cmd, "local")
+        assert result["approved"] is False
+        assert result.get("hardline") is True
+        assert "kanban profile write guard" in result["message"]
+
+
+
 # =========================================================================
 # Gateway approval timeout = deny, NOT consent (#24912)
 #
