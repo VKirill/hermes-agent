@@ -397,20 +397,26 @@ class GatewayKanbanWatchersMixin:
                     # (or default) genuinely has no adapter for the platform.
                     adapter = self._authorization_adapter(plat, sub_profile or None)
                     if adapter is None and single_adapter_mode and sub_profile:
-                        # Single-adapter multiplex + a HEADLESS owner profile: the
-                        # pm_* gateways run with dispatch_in_gateway=false and have
-                        # NO adapter-registry entry of their own, so the stamped
-                        # lookup above fail-closes to None. There is exactly ONE
-                        # shared bot in this topology, so delivering through the
-                        # default adapter is correct and carries no wrong-bot risk.
-                        # Guard on an ABSENT registry entry (same test the owner
-                        # gate above uses): a profile that HAS an entry but lacks
-                        # this platform is a real mis-config and must still fail
-                        # closed (no cross-profile mis-delivery). Without this the
-                        # claim is rewound every tick and the origin topic never
-                        # hears back — last_event_id stays 0 forever for every
-                        # pm_*-owned subscription (blocked/completed pings lost).
-                        if not getattr(self, "_profile_adapters", {}).get(sub_profile):
+                        # Single-adapter multiplex has exactly ONE shared bot. Two
+                        # owner shapes may safely use it when strict stamped lookup
+                        # returns no adapter:
+                        #
+                        # 1. A HEADLESS routed profile has no registry entry.
+                        # 2. The gateway's own serving profile may have a registry
+                        #    entry for routed/auxiliary platforms but still owns the
+                        #    shared adapter in ``self.adapters``.  Refusing fallback
+                        #    for this second shape wedges correctly-stamped
+                        #    subscriptions at last_event_id=0 forever.
+                        #
+                        # An unrelated profile with a non-empty registry entry still
+                        # fails closed, preserving cross-bot isolation.
+                        _profile_adapters = getattr(
+                            self, "_profile_adapters", {}
+                        ).get(sub_profile)
+                        if (
+                            sub_profile == notifier_profile
+                            or not _profile_adapters
+                        ):
                             adapter = self._authorization_adapter(plat, None)
                     if adapter is None:
                         logger.debug(

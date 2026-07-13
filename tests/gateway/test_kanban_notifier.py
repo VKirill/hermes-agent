@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from typing import Any, cast
 
 from gateway.config import Platform
 from gateway.kanban_watchers import _human_notify_line
@@ -378,3 +379,92 @@ def test_notifier_single_adapter_delivers_headless_profile_via_default(tmp_path,
     )
     # … and the cursor advanced (event consumed, not rewound).
     assert _unseen_terminal_events_for(tid, "chat-pm") == []
+
+
+def test_notifier_single_adapter_delivers_serving_profile_via_shared_adapter(
+    tmp_path, monkeypatch,
+):
+    """A subscription stamped with the gateway's own serving profile must use
+    the shared adapter in single-adapter mode, even when that profile has a
+    registry entry which lacks this platform.
+
+    The live failure was specific to the bot-host profile: headless routed
+    profiles delivered through the existing fallback, while ``face_personal``
+    stayed at ``last_event_id=0`` because its non-empty registry entry blocked
+    that fallback.  The serving profile owns the shared bot, so this fallback
+    is safe; unrelated registered profiles must continue to fail closed.
+    """
+    import hermes_cli.config as _cfgmod
+
+    db_path = tmp_path / "single-adapter-serving-profile.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="owned by bot host", assignee="worker")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-host",
+            notifier_profile="face_personal",
+        )
+        kb.complete_task(conn, tid, summary="done")
+
+        unrelated_tid = kb.create_task(
+            conn, title="owned by another registered profile", assignee="worker",
+        )
+        kb.add_notify_sub(
+            conn, task_id=unrelated_tid, platform="telegram",
+            chat_id="chat-beta", notifier_profile="beta",
+        )
+        kb.complete_task(conn, unrelated_tid, summary="done")
+    finally:
+        conn.close()
+
+    # The notifier enumerates explicit board slugs; pin those opens to this
+    # isolated DB so a worker process with HERMES_KANBAN_BOARD=dev cannot leak
+    # the test into (or read from) the live board registry.
+    real_connect = kb.connect
+    monkeypatch.setattr(
+        kb,
+        "list_boards",
+        lambda include_archived=False: [
+            {"slug": "default", "db_path": str(db_path)}
+        ],
+    )
+    monkeypatch.setattr(kb, "connect", lambda board=None: real_connect())
+
+    monkeypatch.setattr(
+        _cfgmod, "load_config",
+        lambda *a, **k: {
+            "kanban": {"dispatch_in_gateway": True},
+            "gateway": {"topic_profile_routing": {"single_adapter": True}},
+        },
+    )
+
+    shared_adapter = RecordingAdapter()
+    other_adapter = RecordingAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = cast(
+        dict[Platform, Any], {Platform.TELEGRAM: shared_adapter}
+    )
+    runner._profile_adapters = cast(
+        dict[str, dict[Platform, Any]],
+        {
+            "face_personal": {Platform.DISCORD: other_adapter},
+            "beta": {Platform.DISCORD: other_adapter},
+        },
+    )
+    runner._kanban_notifier_profile = "face_personal"
+    runner._kanban_sub_fail_counts = {}
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert [d["chat_id"] for d in shared_adapter.sent] == ["chat-host"]
+    assert other_adapter.sent == []
+    assert _unseen_terminal_events_for(tid, "chat-host") == []
+    assert [
+        ev.kind for ev in _unseen_terminal_events_for(
+            unrelated_tid, "chat-beta"
+        )
+    ] == ["completed"]
