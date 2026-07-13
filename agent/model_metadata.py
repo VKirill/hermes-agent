@@ -807,6 +807,24 @@ def _extract_pricing(payload: Dict[str, Any]) -> Dict[str, Any]:
             pricing["completion"] = str(float(novita_output) / 10_000 / 1_000_000)
         return pricing
 
+    # DeepInfra ships pricing under ``metadata.pricing`` with $/MTok values:
+    # ``input_tokens``, ``output_tokens``, ``cache_read_tokens``. Convert to
+    # per-token strings so the generic cost machinery (usage_pricing.py)
+    # consumes them through the same path as OpenRouter / OpenAI.
+    metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else None
+    deepinfra_pricing = metadata.get("pricing") if metadata else None
+    if isinstance(deepinfra_pricing, dict) and any(
+        k in deepinfra_pricing for k in ("input_tokens", "output_tokens", "cache_read_tokens")
+    ):
+        result: Dict[str, Any] = {}
+        if deepinfra_pricing.get("input_tokens") is not None:
+            result["prompt"] = str(float(deepinfra_pricing["input_tokens"]) / 1_000_000)
+        if deepinfra_pricing.get("output_tokens") is not None:
+            result["completion"] = str(float(deepinfra_pricing["output_tokens"]) / 1_000_000)
+        if deepinfra_pricing.get("cache_read_tokens") is not None:
+            result["cache_read"] = str(float(deepinfra_pricing["cache_read_tokens"]) / 1_000_000)
+        return result
+
     alias_map = {
         "prompt": ("prompt", "input", "input_cost_per_token", "prompt_token_cost"),
         "completion": ("completion", "output", "output_cost_per_token", "completion_token_cost"),
