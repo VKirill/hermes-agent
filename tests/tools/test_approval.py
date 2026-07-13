@@ -2273,6 +2273,282 @@ class TestKanbanProfileTerminalWriteGuard:
         assert result["approved"] is True
         assert mod._check_kanban_profile_terminal_write_guard(cmd) is None
 
+    def _shared_direct_gate_paths(self, tmp_path, monkeypatch):
+        from tools import approval as mod
+
+        root = Path("/opt/hermes-test-home")
+        profile_home = root / "profiles" / "direct_specialist"
+        workspace = tmp_path / "kanban" / "workspaces" / "t_worker"
+        workspace.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+        tenant_root = Path("/Users/agent/HermesWork")
+        gate = root / "scripts" / "direct_copy_quality_gate.py"
+        artifact = tenant_root / "tenants" / "client" / "direct" / "quality-input.json"
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {
+                "file_tools": {"allowed_write_roots": [str(tenant_root)]},
+            },
+        )
+        return mod, root, profile_home, workspace, gate, artifact
+
+    def test_shared_direct_gate_read_only_pipeline_is_allowed(self, tmp_path, monkeypatch):
+        """The canonical shared gate may read tenant input and tee into this workspace."""
+        mod, _root, _profile_home, workspace, gate, artifact = (
+            self._shared_direct_gate_paths(tmp_path, monkeypatch)
+        )
+        output = workspace / "direct-copy-quality-gate-output.json"
+        python = mod._trusted_shared_direct_gate_python()
+        tee = mod._trusted_shared_direct_gate_tee()
+        assert python is not None
+        assert tee is not None
+        cmd = f"{python} -I {gate} {artifact} | {tee} {output}"
+
+        result = mod.check_all_command_guards(cmd, "local")
+
+        assert result["approved"] is True
+        assert mod._check_kanban_profile_terminal_write_guard(cmd) is None
+
+    def test_shared_direct_gate_missing_artifact_cannot_enable_later_dynamic_write(
+        self, tmp_path, monkeypatch
+    ):
+        """A failed gate launch must not exempt its path from a later dynamic write."""
+        mod, _root, _profile_home, _workspace, gate, _artifact = (
+            self._shared_direct_gate_paths(tmp_path, monkeypatch)
+        )
+        obfuscated_gate = str(gate).replace("quality_gate", "quality_''gate")
+        commands = [
+            f'python3 {gate} ; printf x | tee "$_"',
+            f'T=t\'\'ee; python3 {gate} ; printf x | "$T" "$_"',
+            f'python3 {obfuscated_gate} ; printf x | t\'\'ee "$_"',
+        ]
+
+        for cmd in commands:
+            result = mod.check_all_command_guards(cmd, "local")
+            assert result["approved"] is False, cmd
+            assert result.get("hardline") is True, cmd
+            assert "kanban profile write guard" in result["message"], cmd
+
+    def test_shared_direct_gate_exception_requires_exact_static_pipeline(
+        self, tmp_path, monkeypatch
+    ):
+        """Wrappers, dynamic output, later segments, and non-workspace tee all fail closed."""
+        mod, _root, _profile_home, workspace, gate, artifact = (
+            self._shared_direct_gate_paths(tmp_path, monkeypatch)
+        )
+        output = workspace / "out.json"
+        monkeypatch.setenv("HOME", str(workspace))
+        commands = [
+            f"python3 {gate} {artifact}",
+            f"py''thon3 {gate} {artifact} | tee {output}",
+            f"p\\ython3 {gate} {artifact} | tee {output}",
+            f"python3 {gate} {artifact} | t''ee {output}",
+            f"python3 {gate} ~/input.json | tee {output}",
+            f"python3 {gate} {artifact} | tee ~/out.json",
+            f"true && python3 {gate} {artifact} | tee {output}",
+            f"python3 {gate} {artifact} | /usr/bin/tee {output}",
+            f'python3 {gate} {artifact} | tee "$OUT"',
+            f"python3 {gate} {artifact} | tee /tmp/out.json",
+            f"python3 {gate} {artifact} | tee {output}; true",
+        ]
+
+        for cmd in commands:
+            result = mod.check_all_command_guards(cmd, "local")
+            assert result["approved"] is False, cmd
+            assert result.get("hardline") is True, cmd
+            assert str(gate) in result["message"], cmd
+
+    def test_shared_direct_gate_path_as_write_destination_is_blocked(
+        self, tmp_path, monkeypatch
+    ):
+        """The executable exception is occurrence-specific, never destination-wide."""
+        mod, _root, _profile_home, workspace, gate, artifact = (
+            self._shared_direct_gate_paths(tmp_path, monkeypatch)
+        )
+        commands = [
+            f"printf x | tee {gate}",
+            f"cp /tmp/source {gate}",
+            f"mv /tmp/source {gate}",
+            f"install /tmp/source {gate}",
+            f"python3 {gate} {artifact} > {gate}",
+            (
+                f"python3 {gate} {artifact} | tee {workspace / 'ok.json'}; "
+                f"printf x | tee {gate}"
+            ),
+        ]
+
+        for cmd in commands:
+            result = mod.check_all_command_guards(cmd, "local")
+            assert result["approved"] is False, cmd
+            assert result.get("hardline") is True, cmd
+            assert str(gate) in result["message"], cmd
+
+    def test_shared_direct_gate_report_mode_is_blocked(self, tmp_path, monkeypatch):
+        """--report makes the shared invocation write-capable, so no exception applies."""
+        mod, _root, _profile_home, workspace, gate, artifact = (
+            self._shared_direct_gate_paths(tmp_path, monkeypatch)
+        )
+
+        for report_option in ("--report", "--rep", "--rep\\\nort"):
+            cmd = (
+                f"python3 {gate} {artifact} "
+                f"{report_option} {workspace / 'report.json'} "
+                f"| tee {workspace / 'out.json'}"
+            )
+            result = mod.check_all_command_guards(cmd, "local")
+
+            assert result["approved"] is False, report_option
+            assert result.get("hardline") is True, report_option
+            assert str(gate) in result["message"], report_option
+
+    def test_other_shared_script_remains_blocked(self, tmp_path, monkeypatch):
+        """The exception must not cover the rest of the shared scripts directory."""
+        mod, root, _profile_home, workspace, _gate, artifact = (
+            self._shared_direct_gate_paths(tmp_path, monkeypatch)
+        )
+        other_script = root / "scripts" / "other_gate.py"
+        cmd = f"python3 {other_script} {artifact} | tee {workspace / 'out.json'}"
+
+        result = mod.check_all_command_guards(cmd, "local")
+
+        assert result["approved"] is False
+        assert result.get("hardline") is True
+        assert str(other_script) in result["message"]
+
+    def test_shared_direct_gate_filesystem_alias_is_blocked(
+        self, tmp_path, monkeypatch
+    ):
+        """A symlink/case alias cannot hide a privileged gate reference."""
+        from tools import approval as mod
+
+        root = tmp_path / "shared-home"
+        profile_home = root / "profiles" / "direct_specialist"
+        profile_home.mkdir(parents=True)
+        gate = root / "scripts" / "direct_copy_quality_gate.py"
+        gate.parent.mkdir(parents=True)
+        gate.write_text("print('gate')\n", encoding="utf-8")
+        gate_alias = tmp_path / "gate-alias.py"
+        gate_alias.symlink_to(gate)
+        workspace = tmp_path / "kanban" / "workspaces" / "t_worker"
+        workspace.mkdir(parents=True)
+        artifact = workspace / "input.json"
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_worker")
+        monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
+        cmd = (
+            f"/USR/bin/python3 -I {gate_alias} {artifact} --report {gate} "
+            f"| /USR/bin/tee {workspace / 'out.json'}"
+        )
+
+        result = mod.check_all_command_guards(cmd, "local")
+
+        assert result["approved"] is False
+        assert result.get("hardline") is True
+        assert str(gate) in result["message"]
+
+    def test_dynamic_shared_direct_gate_invocation_is_blocked(
+        self, tmp_path, monkeypatch
+    ):
+        """A shell-expanded script operand cannot receive the executable exception."""
+        mod, _root, _profile_home, workspace, gate, artifact = (
+            self._shared_direct_gate_paths(tmp_path, monkeypatch)
+        )
+        cmd = (
+            f"GATE={gate}; python3 \"$GATE\" {artifact} "
+            f"| tee {workspace / 'out.json'}"
+        )
+
+        result = mod.check_all_command_guards(cmd, "local")
+
+        assert result["approved"] is False
+        assert result.get("hardline") is True
+        assert str(gate) in result["message"]
+
+    def test_shared_direct_gate_requires_trusted_absolute_python(
+        self, tmp_path, monkeypatch
+    ):
+        """Worker-controlled runtimes and execution-affecting prefixes fail closed."""
+        mod, _root, _profile_home, workspace, gate, artifact = (
+            self._shared_direct_gate_paths(tmp_path, monkeypatch)
+        )
+        python = mod._trusted_shared_direct_gate_python()
+        tee = mod._trusted_shared_direct_gate_tee()
+        assert python is not None
+        assert tee is not None
+        output = workspace / "out.json"
+        existing_output = workspace / "existing.json"
+        existing_output.write_text("already present", encoding="utf-8")
+        commands = [
+            f"{python} {gate} {artifact} | {tee} {output}",
+            f"{python} -I {gate} {artifact} | tee {output}",
+            f"{python} -I {gate} {artifact} | {workspace / 'tee'} {output}",
+            f"{python} -I {gate} {artifact}>{gate} | {tee} {output}",
+            f"{python} -I {gate} {artifact} | {tee} {output}>{gate}",
+            f"{python} -I {gate} {artifact} | {tee} {existing_output}",
+            f"python3 {gate} {artifact} | tee {workspace / 'out.json'}",
+            f"python {gate} {artifact} | tee {workspace / 'out.json'}",
+            f"/tmp/python3 {gate} {artifact} | tee {workspace / 'out.json'}",
+            f"PYTHON3 {gate} {artifact} | tee {workspace / 'out.json'}",
+            f"PYTHONPATH=/tmp python3 {gate} {artifact} | tee {workspace / 'out.json'}",
+            f"export PATH=/tmp:$PATH; python3 {gate} {artifact} | tee {workspace / 'out.json'}",
+            f"env python3 {gate} {artifact} | tee {workspace / 'out.json'}",
+            (
+                f"python3() {{ printf x | tee \"$1\"; }}; "
+                f"python3 {gate} {artifact} | tee {workspace / 'out.json'}"
+            ),
+        ]
+
+        for cmd in commands:
+            result = mod.check_all_command_guards(cmd, "local")
+            assert result["approved"] is False, cmd
+            assert result.get("hardline") is True, cmd
+            assert "kanban profile write guard" in result["message"], cmd
+
+    def test_shared_direct_gate_bare_python_is_blocked_with_inherited_path(
+        self, tmp_path, monkeypatch
+    ):
+        """A prior PATH change cannot redirect the privileged gate invocation."""
+        import shutil
+
+        mod, _root, _profile_home, workspace, gate, artifact = (
+            self._shared_direct_gate_paths(tmp_path, monkeypatch)
+        )
+        fake_python = workspace / "python3"
+        fake_python.write_text("#!/bin/sh\nprintf x | tee \"$1\"\n", encoding="utf-8")
+        fake_python.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{workspace}{os.pathsep}{os.environ.get('PATH', '')}")
+        assert shutil.which("python3") == str(fake_python)
+
+        cmd = f"python3 {gate} {artifact} | tee {workspace / 'out.json'}"
+        result = mod.check_all_command_guards(cmd, "local")
+
+        assert result["approved"] is False
+        assert result.get("hardline") is True
+        assert str(gate) in result["message"]
+
+        python = mod._trusted_shared_direct_gate_python()
+        tee = mod._trusted_shared_direct_gate_tee()
+        assert python is not None
+        assert tee is not None
+        monkeypatch.setenv("PYTHONPATH", str(workspace))
+        trusted_cmd = (
+            f"{python} -I {gate} {artifact} | {tee} {workspace / 'trusted-out.json'}"
+        )
+        assert mod.check_all_command_guards(trusted_cmd, "local")["approved"] is True
+
+    def test_shared_scripts_directory_is_not_added_to_write_roots(
+        self, tmp_path, monkeypatch
+    ):
+        mod, root, _profile_home, _workspace, gate, _artifact = (
+            self._shared_direct_gate_paths(tmp_path, monkeypatch)
+        )
+
+        roots = mod._kanban_profile_write_roots()
+
+        assert (root / "scripts").resolve() not in roots
+        assert not mod._path_under_any(gate.resolve(), roots)
 
 
 # =========================================================================

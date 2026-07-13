@@ -584,6 +584,144 @@ def _is_shared_tooling_exec_path(path: Path) -> bool:
     return False
 
 
+_SHARED_DIRECT_GATE_NAME = "direct_copy_quality_gate.py"
+_SHARED_DIRECT_GATE_UNPROVEN_SYNTAX_RE = re.compile(
+    r"\b(?:python3?|tee|cp|mv|install)\b|[;&|>$`*?\[\]{}]", re.IGNORECASE
+)
+
+
+def _command_contains_static_shell_word(command: str, expected: str) -> bool:
+    """Return whether shell quote/escape normalization yields *expected*."""
+    try:
+        return expected in shlex.split(command, posix=True)
+    except ValueError:
+        return False
+
+
+_SHARED_ABSOLUTE_PATH_CANDIDATE_RE = re.compile(r"/[^\s'\"`;&|<>)]+")
+
+
+def _command_references_shared_direct_gate(command: str, canonical: Path) -> bool:
+    """Detect textual or filesystem-equivalent references to the shared gate."""
+    canonical_text = str(canonical)
+    if canonical_text in command or _command_contains_static_shell_word(
+        command, canonical_text
+    ):
+        return True
+    try:
+        if not canonical.exists():
+            return False
+    except OSError:
+        return False
+    for match in _SHARED_ABSOLUTE_PATH_CANDIDATE_RE.finditer(command):
+        candidate = match.group(0)
+        if not candidate:
+            continue
+        try:
+            if Path(candidate).samefile(canonical):
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def _trusted_shared_direct_gate_executable(path: str) -> str | None:
+    """Return one root-owned, non-writable macOS system executable."""
+    if sys.platform != "darwin":
+        return None
+    executable = Path(path)
+    try:
+        metadata = executable.stat()
+        if not executable.is_file():
+            return None
+        if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            return None
+    except OSError:
+        return None
+    return str(executable)
+
+
+def _trusted_shared_direct_gate_python() -> str | None:
+    """Return the protected system interpreter used by the gate contract.
+
+    A bare ``python``/``python3`` cannot be proven safe because the terminal is
+    persistent: an earlier approved command may have changed ``PATH`` without
+    changing this process's environment. The fixed, root-owned macOS system path
+    keeps executable selection out of worker-controlled shell state, while SIP
+    strips dynamic-loader injection variables; the caller also requires ``-I``.
+    Other platforms fail closed until they have an equivalent trusted launcher.
+    """
+    return _trusted_shared_direct_gate_executable("/usr/bin/python3")
+
+
+def _trusted_shared_direct_gate_tee() -> str | None:
+    """Return the protected system ``tee`` path, never a PATH-resolved basename."""
+    return _trusted_shared_direct_gate_executable("/usr/bin/tee")
+
+
+def _shared_direct_gate_exec_spans(
+    command: str,
+    profile_home: Path,
+) -> set[tuple[int, int]]:
+    """Return executable spans only for the proven read-only pipeline.
+
+    The exception deliberately uses a tiny anchored grammar instead of general
+    shell tokenization. It accepts exactly ``/usr/bin/python3 -I <gate>
+    <absolute-artifact> | /usr/bin/tee <new-workspace-output>`` with unquoted,
+    shell-metacharacter-free paths. Existing outputs are rejected so a worker
+    cannot pre-create a symlink or hardlink alias before the privileged launch.
+    """
+    text = command or ""
+    try:
+        canonical = (
+            profile_home.parent.parent / "scripts" / _SHARED_DIRECT_GATE_NAME
+        ).resolve()
+        workspace = Path(os.environ["HERMES_KANBAN_WORKSPACE"]).expanduser().resolve()
+    except (KeyError, OSError, RuntimeError):
+        return set()
+
+    trusted_python = _trusted_shared_direct_gate_python()
+    trusted_tee = _trusted_shared_direct_gate_tee()
+    if trusted_python is None or trusted_tee is None:
+        return set()
+
+    # Paths in this one privileged form intentionally cannot use quoting,
+    # escaping, expansion, comments, redirection, process substitution, or any
+    # other shell syntax. The production artifact/workspace paths need none of
+    # those features, and rejecting them keeps the exception auditable.
+    safe_path = r"[^ \t\r\n;&|<>$`*?\[\]{}()'\"\\!#]+"
+    pattern = re.compile(
+        rf"\A(?P<python>{re.escape(trusted_python)})[ \t]+"
+        rf"-I[ \t]+"
+        rf"(?P<script>{re.escape(str(canonical))})[ \t]+"
+        rf"(?P<artifact>{safe_path})[ \t]*\|[ \t]*"
+        rf"(?P<tee>{re.escape(trusted_tee)})[ \t]+"
+        rf"(?P<output>{safe_path})[ \t]*\Z"
+    )
+    match = pattern.fullmatch(text)
+    if match is None:
+        return set()
+
+    try:
+        artifact_path = Path(match.group("artifact"))
+        output_path = Path(match.group("output"))
+        if not artifact_path.is_absolute() or not output_path.is_absolute():
+            return set()
+        output_path = output_path.resolve()
+        if output_path.exists():
+            return set()
+    except (OSError, RuntimeError):
+        return set()
+    if not output_path.is_relative_to(workspace):
+        return set()
+
+    return {
+        match.span("python"),
+        match.span("script"),
+        match.span("tee"),
+    }
+
+
 def _path_under_any(path: Path, roots: list[Path]) -> bool:
     for root in roots:
         try:
@@ -676,21 +814,52 @@ def _check_kanban_profile_terminal_write_guard(
     if profile_home.parent.name != "profiles":
         return None
 
-    if not _KANBAN_PROFILE_WRITE_INTENT_RE.search(command or ""):
+    command_text = command or ""
+    try:
+        canonical_gate = (
+            profile_home.parent.parent / "scripts" / _SHARED_DIRECT_GATE_NAME
+        ).resolve()
+    except (OSError, RuntimeError):
+        canonical_gate = None
+
+    gate_reference = bool(
+        canonical_gate is not None
+        and _command_references_shared_direct_gate(command_text, canonical_gate)
+    )
+    gate_sensitive_syntax = bool(
+        gate_reference
+        and _SHARED_DIRECT_GATE_UNPROVEN_SYNTAX_RE.search(command_text)
+    )
+    shared_direct_gate_exec_spans = _shared_direct_gate_exec_spans(
+        command_text, profile_home
+    )
+    write_intent = bool(
+        _KANBAN_PROFILE_WRITE_INTENT_RE.search(command_text) or gate_sensitive_syntax
+    )
+    if not write_intent:
         return None
 
     roots = _kanban_profile_write_roots(command_cwd=command_cwd)
     forbidden: list[str] = []
-    for raw_path in _POSIX_ABSOLUTE_PATH_RE.findall(command or ""):
-        try:
-            resolved = Path(raw_path).expanduser().resolve()
-        except Exception:
-            continue
-        # Executable tooling path (gen-image.sh etc.) is not a write target.
-        if _is_shared_tooling_exec_path(resolved):
-            continue
-        if not _path_under_any(resolved, roots):
-            forbidden.append(str(resolved))
+    # A reference to this privileged gate is allowed only when the entire
+    # command matches the strict pipeline grammar. This closes case-insensitive
+    # filesystem aliases that the generic absolute-path scanner cannot see.
+    if gate_sensitive_syntax and not shared_direct_gate_exec_spans:
+        forbidden.append(str(canonical_gate))
+    else:
+        for path_match in _POSIX_ABSOLUTE_PATH_RE.finditer(command_text):
+            if path_match.span() in shared_direct_gate_exec_spans:
+                continue
+            raw_path = path_match.group(0)
+            try:
+                resolved = Path(raw_path).expanduser().resolve()
+            except Exception:
+                continue
+            # Executable tooling path (gen-image.sh etc.) is not a write target.
+            if _is_shared_tooling_exec_path(resolved):
+                continue
+            if not _path_under_any(resolved, roots):
+                forbidden.append(str(resolved))
 
     if not forbidden:
         return None
