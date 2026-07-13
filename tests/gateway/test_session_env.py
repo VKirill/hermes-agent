@@ -72,6 +72,29 @@ def test_set_session_env_sets_contextvars(monkeypatch):
     runner._clear_session_env(tokens)
 
 
+def test_set_session_env_keeps_routed_and_notifier_profiles_distinct(monkeypatch):
+    """A routed agent profile must not replace the serving gateway profile."""
+    runner = object.__new__(GatewayRunner)
+    runner._kanban_notifier_profile = "serving_profile"
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="client-chat",
+        chat_type="dm",
+        thread_id="client-thread",
+        profile="routed_profile",
+    )
+    context = SessionContext(source=source, connected_platforms=[], home_channels={})
+
+    monkeypatch.delenv("HERMES_SESSION_PROFILE", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_NOTIFIER_PROFILE", raising=False)
+    tokens = runner._set_session_env(context)
+    try:
+        assert get_session_env("HERMES_SESSION_PROFILE") == "routed_profile"
+        assert get_session_env("HERMES_SESSION_NOTIFIER_PROFILE") == "serving_profile"
+    finally:
+        runner._clear_session_env(tokens)
+
+
 def test_session_source_uses_contextvars(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_SOURCE", raising=False)
 

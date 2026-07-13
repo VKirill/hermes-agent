@@ -2450,6 +2450,7 @@ def _sub_index(subs):
                 "chat_id": getattr(s, "chat_id", None),
                 "thread_id": getattr(s, "thread_id", None),
                 "user_id": getattr(s, "user_id", None),
+                "notifier_profile": getattr(s, "notifier_profile", None),
             })
     return out
 
@@ -2480,6 +2481,37 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     assert s["chat_id"] == "chat-42"
     assert s["thread_id"] == "thread-7"
     assert s["user_id"] == "user-9"
+
+
+def test_create_subscribes_serving_profile_when_routed_profile_differs(
+    monkeypatch, worker_env
+):
+    """Notifier ownership follows the gateway adapter, not runtime routing.
+
+    A topic can be physically served by one profile's Telegram adapter while
+    its agent turn is routed into another profile.  The subscription must be
+    claimed by the serving gateway, otherwise its cursor remains at zero and
+    completed artifacts never reach the topic.
+    """
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "client-chat")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "client-thread")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "routed_profile")
+    monkeypatch.setenv("HERMES_SESSION_NOTIFIER_PROFILE", "serving_profile")
+
+    out = kt._handle_create({
+        "title": "routed profile mismatch",
+        "assignee": "peer",
+    })
+    data = json.loads(out)
+    assert data["ok"] is True
+    assert data["subscribed"] is True
+
+    subs = _sub_index(_list_subs_for_task(data["task_id"]))
+    assert len(subs) == 1
+    assert subs[0]["notifier_profile"] == "serving_profile"
 
 
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):

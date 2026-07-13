@@ -1157,7 +1157,8 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         notifier_profile = (
-            get_session_env("HERMES_SESSION_PROFILE", "")
+            get_session_env("HERMES_SESSION_NOTIFIER_PROFILE", "")
+            or get_session_env("HERMES_SESSION_PROFILE", "")
             or os.environ.get("HERMES_PROFILE")
         )
 

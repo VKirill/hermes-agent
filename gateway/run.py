@@ -15128,6 +15128,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
             profile=getattr(context.source, "profile", "") or "",
+            notifier_profile=(
+                getattr(self, "_kanban_notifier_profile", None)
+                or self._active_profile_name()
+            ),
             async_delivery=_async_delivery,
         )
 
