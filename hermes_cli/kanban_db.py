@@ -7798,6 +7798,45 @@ def _error_fingerprint(error_text: str) -> str:
     return fp.lower().strip()
 
 
+# Empirically ~96% of "clean exit without a terminal tool call" tasks complete
+# on a later run, so protocol violations receive a bounded retry budget rather
+# than blocking immediately on the first occurrence.
+_PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
+_PROTOCOL_VIOLATION_SCAN_LIMIT = 50
+
+
+def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
+    """Count trailing clean-exit protocol violations, skipping quota runs."""
+    streak = 0
+    rows = conn.execute(
+        "SELECT outcome, error, metadata FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?",
+        (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
+    ).fetchall()
+    for row in rows:
+        outcome = row["outcome"] or ""
+        if outcome == "rate_limited":
+            continue
+        if outcome == "crashed":
+            is_violation = False
+            raw_meta = row["metadata"]
+            if raw_meta:
+                try:
+                    is_violation = bool(
+                        json.loads(raw_meta).get("protocol_violation")
+                    )
+                except (ValueError, TypeError):
+                    is_violation = False
+            if not is_violation:
+                is_violation = "protocol violation" in (row["error"] or "")
+            if is_violation:
+                streak += 1
+                continue
+        break
+    return streak
+
+
 def detect_crashed_workers(
     conn: sqlite3.Connection,
     *,
@@ -7817,9 +7856,7 @@ def detect_crashed_workers(
     When the reap registry shows the worker exited cleanly (rc=0) but
     the task was still ``running`` in the DB, treat it as a protocol
     violation (worker answered conversationally without calling
-    ``kanban_complete`` / ``kanban_block``) and trip the circuit breaker
-    on the first occurrence — retrying a worker whose CLI keeps
-    returning 0 without a terminal transition just loops forever.
+    ``kanban_complete`` / ``kanban_block``) and apply a bounded retry budget.
 
     Provider quota/rate/auth failures are external blockers, not crashes.
     The crash detector classifies both structured EX_TEMPFAIL exits and
@@ -7833,8 +7870,9 @@ def detect_crashed_workers(
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
-    # clean-exit-but-still-running case so we can trip the breaker
-    # immediately instead of incrementing by 1.
+    # clean-exit-but-still-running case, which is accounted against its
+    # own bounded violation streak instead of the unified failure
+    # counter (see the post-txn loop below).
     crash_details: list[tuple[str, int, str, bool, str]] = []
     # (task_id, pid, claimer, protocol_violation, error_text)
     external_block_details: list[tuple[str, str, dict[str, Any]]] = []
@@ -7869,18 +7907,29 @@ def detect_crashed_workers(
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Retrying won't
-                # help.
+                # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
+                # work itself succeeded and only the paperwork was skipped, so
+                # a retry usually completes; the corrective sentence below is
+                # surfaced to the retry worker via the prior-attempt error in
+                # ``build_worker_context`` (guidance approach from #61817).
                 protocol_violation = True
                 error_text = (
                     "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation"
+                    "kanban_complete or kanban_block — protocol violation. "
+                    "If the prior run already did the work, verify it and "
+                    "report the result via kanban_complete; a run that ends "
+                    "without a terminal kanban call counts as failed no "
+                    "matter what it did."
                 )
                 event_kind = "protocol_violation"
                 event_payload = {
                     "pid": pid,
                     "claimer": row["claim_lock"],
                     "exit_code": code,
+                    # Durable marker for _protocol_violation_streak: _end_run
+                    # copies this payload into the run metadata, which is how
+                    # the violation-only retry budget is derived later.
+                    "protocol_violation": True,
                 }
             elif kind == "rate_limited":
                 # Worker bailed because the provider rate-limited / exhausted
@@ -7956,6 +8005,11 @@ def detect_crashed_workers(
                     event_payload,
                     run_id=run_id,
                 )
+                if protocol_violation:
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                        (error_text[:500], row["id"]),
+                    )
                 crashed.append(row["id"])
                 crash_details.append(
                     (row["id"], pid, row["claim_lock"],
@@ -7979,16 +8033,22 @@ def detect_crashed_workers(
                     )
             except Exception:
                 pass
-    # Outside the main txn: increment the unified failure counter for
-    # each crashed task. If the breaker trips, the task transitions
-    # ready → blocked with a ``gave_up`` event on top of the ``crashed``
-    # event we already emitted.
+    # Outside the main txn: account each crashed task and maybe trip the
+    # breaker (the task transitions ready → blocked with a ``gave_up`` event
+    # on top of the event we already emitted).
     #
-    # Protocol-violation crashes force an immediate trip (failure_limit=1)
-    # because clean-exit-without-transition is deterministic: the next
-    # respawn will do exactly the same thing. Better to surface to a
-    # human with a clear reason than to loop ``DEFAULT_FAILURE_LIMIT``
-    # times first.
+    # Protocol-violation crashes (clean exit, no terminal tool call) get a
+    # BOUNDED retry, not an immediate trip: empirically ~96% of these tasks
+    # complete on a later run (a goal-mode finalize nudge, or the model simply
+    # emitting kanban_complete/kanban_block next time), so blocking on the first
+    # occurrence just churned them through the respawn cycle. The retry budget
+    # is a violation-only streak (``_protocol_violation_streak``): earlier
+    # timeouts / nonzero exits neither consume nor extend it, and a
+    # below-budget violation does not tick the unified
+    # ``consecutive_failures`` counter, so the two budgets stay independent.
+    # A per-task ``max_retries`` overrides the violation bound with the same
+    # top precedence it has for every other failure kind. Systemic same-error
+    # crashes still trip immediately.
     auto_blocked: list[str] = []
     if crash_details:
         # Fingerprint errors to detect systemic failures.
@@ -7997,16 +8057,59 @@ def detect_crashed_workers(
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
         for tid, pid, claimer, protocol_violation, error_text in crash_details:
+            if protocol_violation:
+                streak = _protocol_violation_streak(conn, tid)
+                trow = conn.execute(
+                    "SELECT max_retries FROM tasks WHERE id = ?", (tid,),
+                ).fetchone()
+                if trow is None:
+                    continue  # task deleted mid-loop
+                task_override = (
+                    trow["max_retries"] if "max_retries" in trow.keys() else None
+                )
+                violation_limit = (
+                    int(task_override)
+                    if task_override is not None
+                    else _PROTOCOL_VIOLATION_FAILURE_LIMIT
+                )
+                if streak < violation_limit:
+                    # Below budget: the task is already back at ``ready``
+                    # (respawn allowed) with ``last_failure_error`` stamped.
+                    # Deliberately no ``_record_task_failure`` call — a
+                    # below-budget violation must not consume the unified
+                    # failure budget, just as other failure kinds don't
+                    # consume this one.
+                    continue
+                # Streak reached the bound: trip the breaker. ``force_trip``
+                # skips the threshold resolution inside
+                # ``_record_task_failure`` because the decision — including
+                # the per-task ``max_retries`` override — was already made
+                # against the violation streak above.
+                tripped = _record_task_failure(
+                    conn, tid,
+                    error=error_text,
+                    outcome="crashed",
+                    failure_limit=violation_limit,
+                    force_trip=True,
+                    release_claim=False,
+                    end_run=False,
+                    event_payload_extra={
+                        "pid": pid,
+                        "claimer": claimer,
+                        "protocol_violations": streak,
+                        "protocol_violation_limit": violation_limit,
+                    },
+                )
+                if tripped:
+                    auto_blocked.append(tid)
+                continue
             fp = _error_fingerprint(error_text)
-            is_systemic = (
-                not protocol_violation
-                and _fp_counts.get(fp, 0) >= 3
-            )
+            is_systemic = _fp_counts.get(fp, 0) >= 3
             tripped = _record_task_failure(
                 conn, tid,
                 error=error_text,
                 outcome="crashed",
-                failure_limit=1 if (protocol_violation or is_systemic) else None,
+                failure_limit=1 if is_systemic else None,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
@@ -8032,6 +8135,7 @@ def _record_task_failure(
     *,
     outcome: str,
     failure_limit: int = None,
+    force_trip: bool = False,
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
@@ -8069,6 +8173,15 @@ def _record_task_failure(
       2. caller-supplied ``failure_limit`` (gateway passes the config
          value from ``kanban.failure_limit``; tests pass fixed values)
       3. ``DEFAULT_FAILURE_LIMIT``
+
+    ``force_trip=True`` trips the breaker unconditionally, skipping the
+    counter-vs-threshold comparison (the resolution order above is then
+    only reported in the ``gave_up`` payload, not re-evaluated). Callers
+    use it when they have already applied their own bounded-retry policy
+    — e.g. the clean-exit protocol-violation streak in
+    ``detect_crashed_workers``, which resolves the per-task
+    ``max_retries`` override against the violation streak itself. The
+    failure is still counted into ``consecutive_failures``.
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
@@ -8095,7 +8208,7 @@ def _record_task_failure(
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
 
-        if failures >= effective_limit:
+        if force_trip or failures >= effective_limit:
             # Trip the breaker.
             if release_claim:
                 # Spawn path: still running, also clear claim state.
