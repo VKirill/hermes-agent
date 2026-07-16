@@ -34,9 +34,6 @@ from pathlib import Path
 argv = sys.argv[1:]
 root = Path(next(item for item in argv if item.startswith('--gemini_dir=')).split('=', 1)[1])
 settings = json.loads((root / 'antigravity-cli' / 'settings.json').read_text(encoding='utf-8'))
-counter = Path({str(tmp_path / 'calls.txt')!r})
-count = int(counter.read_text()) + 1 if counter.exists() else 1
-counter.write_text(str(count))
 target = Path({str(requested_target)!r})
 write_rules = (settings.get('permissions') or {{}}).get('allow') or []
 if not write_rules:
@@ -60,6 +57,8 @@ print(json.dumps({{
     'prompt_path': str(prompt_path),
     'prompt_mode': stat.S_IMODE(prompt_path.stat().st_mode) if False else 384,
     'write_rules': write_rules,
+    'settings': settings,
+    'project': json.loads((root / 'config' / 'projects' / 'default-cli-project.json').read_text(encoding='utf-8')),
 }}))
 """,
         encoding="utf-8",
@@ -67,13 +66,19 @@ print(json.dumps({{
     return script
 
 
-def _client(monkeypatch, tmp_path: Path, workspace: Path, script: Path) -> AgyCLIClient:
+def _client(
+    monkeypatch,
+    tmp_path: Path,
+    workspace: Path,
+    script: Path,
+    **config_overrides,
+) -> AgyCLIClient:
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(workspace))
     return AgyCLIClient(
         command=sys.executable,
         args=[str(script)],
-        agy_config=_config(),
+        agy_config={**_config(), **config_overrides},
     )
 
 
@@ -91,27 +96,18 @@ def test_scoped_worker_write_negotiates_only_exact_target(monkeypatch, tmp_path)
 
     payload = json.loads(response.choices[0].message.content)
     assert target.read_text(encoding="utf-8") == "SCOPED_OK\n"
-    assert (tmp_path / "calls.txt").read_text() == "1"
     assert Path(payload["cwd"]) == workspace.resolve()
     assert payload["write_rules"] == [f"write_file({target.resolve()})"]
     assert "write_file(*)" not in payload["write_rules"]
     assert not Path(payload["prompt_path"]).exists()
     runtime_root = Path(payload["gemini_dir"])
     assert runtime_root.parent == client._agy_config_root
-    settings = json.loads(
-        (runtime_root / "antigravity-cli" / "settings.json").read_text(encoding="utf-8")
-    )
+    assert not runtime_root.exists()
+    settings = payload["settings"]
     assert settings["allowNonWorkspaceAccess"] is False
     assert settings["toolPermission"] == "request-review"
     assert settings["permissions"]["allow"] == [f"write_file({target.resolve()})"]
-    project = json.loads(
-        (
-            runtime_root
-            / "config"
-            / "projects"
-            / "default-cli-project.json"
-        ).read_text(encoding="utf-8")
-    )
+    project = payload["project"]
     assert project["permissionGrants"]["permissionGrants"]["allow"] == [
         "read_file(*)",
         f"write_file({target.resolve()})",
@@ -141,7 +137,6 @@ def test_scoped_worker_write_rejects_outside_target(monkeypatch, tmp_path):
         )
 
     assert not outside.exists()
-    assert not (tmp_path / "calls.txt").exists()
 
 
 def test_scoped_worker_write_rejects_symlink_escape(monkeypatch, tmp_path):
@@ -165,7 +160,6 @@ def test_scoped_worker_write_rejects_symlink_escape(monkeypatch, tmp_path):
         )
 
     assert not outside.exists()
-    assert not (tmp_path / "calls.txt").exists()
 
 
 def test_scoped_worker_write_does_not_reuse_stale_user_path(monkeypatch, tmp_path):
@@ -186,7 +180,6 @@ def test_scoped_worker_write_does_not_reuse_stale_user_path(monkeypatch, tmp_pat
         )
 
     assert not target.exists()
-    assert (tmp_path / "calls.txt").read_text() == "1"
 
 
 def test_scoped_worker_write_rejects_existing_hardlink(monkeypatch, tmp_path):
@@ -206,4 +199,177 @@ def test_scoped_worker_write_rejects_existing_hardlink(monkeypatch, tmp_path):
         )
 
     assert outside.read_text(encoding="utf-8") == "ORIGINAL\n"
-    assert not (tmp_path / "calls.txt").exists()
+
+
+def test_scoped_worker_write_accepts_unambiguous_relative_target(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "probe.py"
+    script = _write_negotiating_fake(tmp_path, target)
+    client = _client(monkeypatch, tmp_path, workspace, script)
+
+    response = client.chat.completions.create(
+        model="Gemini 3.5 Flash (High)",
+        messages=[{"role": "user", "content": "Create probe.py"}],
+    )
+
+    assert target.read_text(encoding="utf-8") == "SCOPED_OK\n"
+    payload = json.loads(response.choices[0].message.content)
+    assert payload["write_rules"] == [f"write_file({target.resolve()})"]
+
+
+def test_scoped_worker_write_does_not_grant_paths_mentioned_in_prose(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    locked = workspace / "locked.py"
+    requested = workspace / "requested.py"
+    script = _write_negotiating_fake(tmp_path, requested)
+    client = _client(monkeypatch, tmp_path, workspace, script)
+
+    with pytest.raises(PermissionError, match="did not pre-authorize"):
+        client.chat.completions.create(
+            model="Gemini 3.5 Flash (High)",
+            messages=[
+                {
+                    "role": "user",
+                    "content": f"Do not modify {locked}; create {requested} only",
+                }
+            ],
+        )
+
+    assert not locked.exists()
+    assert not requested.exists()
+
+
+def test_scoped_worker_write_uses_structured_target_not_prose_references(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    source = workspace / "source.py"
+    target = workspace / "target.py"
+    script = _write_negotiating_fake(tmp_path, target)
+    client = _client(monkeypatch, tmp_path, workspace, script)
+
+    response = client.chat.completions.create(
+        model="Gemini 3.5 Flash (High)",
+        messages=[
+            {
+                "role": "user",
+                "content": f"Use {source} as reference and update {target}",
+                "agy_write_targets": [str(target)],
+            }
+        ],
+    )
+
+    payload = json.loads(response.choices[0].message.content)
+    assert payload["write_rules"] == [f"write_file({target.resolve()})"]
+    assert not source.exists()
+
+
+@pytest.mark.parametrize("suffix", ["*", ")", ","])
+def test_scoped_worker_write_rejects_permission_metacharacters(
+    monkeypatch, tmp_path, suffix
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / f"unsafe{suffix}.py"
+    script = _write_negotiating_fake(tmp_path, target)
+    client = _client(monkeypatch, tmp_path, workspace, script)
+
+    with pytest.raises(PermissionError, match="metacharacters"):
+        client.chat.completions.create(
+            model="Gemini 3.5 Flash (High)",
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Create one exact target",
+                    "agy_write_targets": [str(target)],
+                }
+            ],
+        )
+
+
+
+def test_scoped_worker_write_bypasses_cache_and_cleans_unique_runtime_roots(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "probe.py"
+    script = _write_negotiating_fake(tmp_path, target)
+    client = _client(
+        monkeypatch,
+        tmp_path,
+        workspace,
+        script,
+        dedupe_ttl_seconds=60,
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": "Create the authorized probe",
+            "agy_write_targets": [str(target)],
+        }
+    ]
+
+    first = client.chat.completions.create(
+        model="Gemini 3.5 Flash (High)", messages=messages
+    )
+    first_root = Path(json.loads(first.choices[0].message.content)["gemini_dir"])
+    target.unlink()
+    second = client.chat.completions.create(
+        model="Gemini 3.5 Flash (High)", messages=messages
+    )
+    second_root = Path(json.loads(second.choices[0].message.content)["gemini_dir"])
+
+    assert target.read_text(encoding="utf-8") == "SCOPED_OK\n"
+    assert first.agy_cached is False
+    assert second.agy_cached is False
+    assert first_root != second_root
+    assert not first_root.exists()
+    assert not second_root.exists()
+
+
+def test_scoped_worker_write_os_boundary_blocks_symlink_swap_race(
+    monkeypatch, tmp_path
+):
+    if sys.platform != "darwin":
+        pytest.skip("macOS sandbox-exec regression")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "probe.py"
+    outside = tmp_path / "outside.py"
+    outside.write_text("ORIGINAL\n", encoding="utf-8")
+    script = tmp_path / "fake_racing_agy.py"
+    script.write_text(
+        f"""
+from pathlib import Path
+import sys
+
+target = Path({str(target)!r})
+outside = Path({str(outside)!r})
+target.unlink(missing_ok=True)
+target.symlink_to(outside)
+target.write_text('ESCAPED\\n', encoding='utf-8')
+print('UNSAFE')
+""",
+        encoding="utf-8",
+    )
+    client = _client(monkeypatch, tmp_path, workspace, script)
+
+    with pytest.raises(RuntimeError, match="Operation not permitted|exit_1"):
+        client.chat.completions.create(
+            model="Gemini 3.5 Flash (High)",
+            messages=[
+                {
+                    "role": "user",
+                    "content": "Create the authorized probe",
+                    "agy_write_targets": [str(target)],
+                }
+            ],
+        )
+
+    assert outside.read_text(encoding="utf-8") == "ORIGINAL\n"

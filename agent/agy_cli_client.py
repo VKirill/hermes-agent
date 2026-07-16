@@ -22,6 +22,7 @@ import shutil
 import sqlite3
 import stat
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -298,6 +299,9 @@ def _exclusive_file_lock(path: Path):
             os.close(fd)
 
 
+_AGY_PERMISSION_META = frozenset("*(),\r\n")
+
+
 def _install_hermetic_agy_settings(
     config_root: Path, *, write_targets: Iterable[Path] = ()
 ) -> Path:
@@ -318,7 +322,14 @@ def _install_hermetic_agy_settings(
         _assert_contained(root, directory)
         _ensure_secure_directory(directory)
     settings = dict(_HERMETIC_AGY_SETTINGS)
-    exact_write_rules = [f"write_file({target})" for target in write_targets]
+    exact_write_rules: list[str] = []
+    for target in write_targets:
+        target_text = str(target)
+        if any(character in target_text for character in _AGY_PERMISSION_META):
+            raise PermissionError(
+                "agy write target contains permission-rule metacharacters"
+            )
+        exact_write_rules.append(f"write_file({target_text})")
     if exact_write_rules:
         settings["permissions"] = {
             "allow": exact_write_rules,
@@ -387,10 +398,14 @@ def _validate_scoped_write_targets(
         if len(approved) >= 8:
             raise PermissionError("agy requested more than 8 scoped write targets")
         value = str(raw or "").strip()
-        lexical = Path(value).expanduser()
-        if not value or not lexical.is_absolute() or value.startswith("~"):
-            raise PermissionError(f"agy requested a non-absolute write target: {value!r}")
-        target = lexical.resolve(strict=False)
+        if not value or value.startswith("~"):
+            raise PermissionError(f"agy requested an invalid write target: {value!r}")
+        lexical = Path(value)
+        target = (
+            lexical.resolve(strict=False)
+            if lexical.is_absolute()
+            else (workspace / lexical).resolve(strict=False)
+        )
         try:
             contained = os.path.commonpath((str(workspace), str(target))) == str(workspace)
         except ValueError:
@@ -427,27 +442,38 @@ def _validate_scoped_write_targets(
     return approved
 
 
-_WRITE_INTENT_RE = re.compile(
-    r"\b(?:create|write|edit|modify|update|overwrite|созда\w*|запи\w*|измен\w*|обнов\w*)\b",
-    re.IGNORECASE,
-)
-_ABSOLUTE_PATH_RE = re.compile(r"(?<![\w])/(?:[^\s'\"`<>|]+)")
+_STRICT_WRITE_VERBS = frozenset({"create", "write", "создай", "запиши"})
 
 
 def _declared_write_targets(messages: Iterable[dict[str, Any]]) -> list[str]:
-    """Extract exact targets only from the active (last) user instruction."""
-    last_user_content = ""
+    """Read an explicit grant or a minimal unambiguous one-target command.
+
+    Arbitrary prose is never an authorization source.  Callers that need a
+    richer instruction must attach ``agy_write_targets`` to the final explicit
+    user message.  The two-token fallback keeps headless probes such as
+    ``Create probe.py`` usable without granting paths merely mentioned in text.
+    """
+    last_user: dict[str, Any] | None = None
     for message in messages:
-        if str(message.get("role") or "user").lower() == "user":
-            last_user_content = _content_to_text(message.get("content"))
-    if not _WRITE_INTENT_RE.search(last_user_content):
+        if str(message.get("role") or "").lower() == "user":
+            last_user = message
+    if last_user is None:
         return []
-    targets: list[str] = []
-    for match in _ABSOLUTE_PATH_RE.findall(last_user_content):
-        candidate = match.rstrip(".,;:!?)]}")
-        if candidate and candidate not in targets:
-            targets.append(candidate)
-    return targets
+    structured = last_user.get("agy_write_targets")
+    if structured is not None:
+        if not isinstance(structured, list) or not all(
+            isinstance(item, str) and item.strip() for item in structured
+        ):
+            raise PermissionError("agy_write_targets must be a list of paths")
+        return [item.strip() for item in structured]
+
+    tokens = _content_to_text(last_user.get("content")).strip().split()
+    if len(tokens) != 2 or tokens[0].lower() not in _STRICT_WRITE_VERBS:
+        return []
+    candidate = tokens[1].strip("`'\"")
+    if not candidate or any(character in candidate for character in "<>|;"):
+        return []
+    return [candidate]
 
 
 def _terminate_process(proc: subprocess.Popen[bytes], *, force: bool = False) -> None:
@@ -461,6 +487,30 @@ def _terminate_process(proc: subprocess.Popen[bytes], *, force: bool = False) ->
             proc.terminate()
     except (OSError, ProcessLookupError):
         pass
+
+
+def _darwin_scoped_write_sandbox(
+    argv: list[str], *, runtime_root: Path, write_targets: Iterable[Path]
+) -> list[str]:
+    """Enforce exact native-tool writes at the macOS filesystem sink."""
+    if sys.platform != "darwin":
+        return argv
+    sandbox_exec = Path("/usr/bin/sandbox-exec")
+    if not sandbox_exec.is_file():
+        raise RuntimeError("macOS scoped Agy writes require sandbox-exec")
+    grants = [f"(subpath {json.dumps(str(runtime_root))})"]
+    grants.extend(
+        f"(literal {json.dumps(str(target))})" for target in write_targets
+    )
+    profile = " ".join(
+        [
+            "(version 1)",
+            "(allow default)",
+            "(deny file-write*)",
+            f"(allow file-write* {' '.join(grants)})",
+        ]
+    )
+    return [str(sandbox_exec), "-p", profile, *argv]
 
 
 class _AgyProcessStartAborted(RuntimeError):
@@ -1447,12 +1497,26 @@ class AgyCLIClient:
             request_messages, tools=tools, tool_choice=tool_choice
         )
         request_id = self._request_id(model=explicit_model, prompt=prompt)
+        task_workspace = _scoped_kanban_workspace()
+        declared = _declared_write_targets(request_messages)
+        approved_declared = (
+            _validate_scoped_write_targets(task_workspace, declared)
+            if task_workspace is not None and declared
+            else []
+        )
+        has_write_side_effect = bool(approved_declared)
+        if has_write_side_effect:
+            request_id = hashlib.sha256(
+                f"{request_id}:{secrets.token_hex(16)}".encode("ascii")
+            ).hexdigest()[:24]
         logger.debug(
             "[FIX:agy-backend] request start id=%s model=%s",
             request_id,
             explicit_model,
         )
-        cached_content = self._read_cached_success(request_id)
+        cached_content = (
+            None if has_write_side_effect else self._read_cached_success(request_id)
+        )
         if cached_content is not None:
             self._append_log(
                 request_id,
@@ -1490,13 +1554,7 @@ class AgyCLIClient:
         request_workspace = self._workspaces_dir / request_id
         _assert_contained(self._workspaces_dir, request_workspace)
         request_workspace = _ensure_secure_directory(request_workspace)
-        task_workspace = _scoped_kanban_workspace()
         process_workspace = task_workspace or request_workspace
-        runtime_config_root = (
-            _ensure_secure_directory(self._agy_config_root / request_id)
-            if task_workspace is not None
-            else self._agy_config_root
-        )
         if _cancellation_event is not None and _cancellation_event.is_set():
             message = f"agy request {request_id} was cancelled"
             self._store_failure(request_id, message, 0)
@@ -1532,6 +1590,14 @@ class AgyCLIClient:
             started = time.monotonic()
             prompt_path: Path | None = None
             active_process: subprocess.Popen[bytes] | None = None
+            runtime_config_root = (
+                _ensure_secure_directory(
+                    self._agy_config_root
+                    / f"{request_id}-{attempt_number}-{secrets.token_hex(8)}"
+                )
+                if task_workspace is not None
+                else self._agy_config_root
+            )
 
             def start_process(
                 spawn: Callable[[], subprocess.Popen[bytes]],
@@ -1554,12 +1620,6 @@ class AgyCLIClient:
                     return active_process
 
             try:
-                declared = _declared_write_targets(request_messages)
-                approved_declared = (
-                    _validate_scoped_write_targets(task_workspace, declared)
-                    if task_workspace is not None and declared
-                    else []
-                )
                 _install_hermetic_agy_settings(
                     runtime_config_root, write_targets=approved_declared
                 )
@@ -1592,6 +1652,12 @@ class AgyCLIClient:
                     ]
                     if self._sandbox:
                         argv.append("--sandbox")
+                    if task_workspace is not None:
+                        argv = _darwin_scoped_write_sandbox(
+                            argv,
+                            runtime_root=runtime_config_root,
+                            write_targets=approved_declared,
+                        )
                     return _run_bounded_process(
                         argv,
                         cwd=process_workspace,
@@ -1679,6 +1745,17 @@ class AgyCLIClient:
                         logger.warning(
                             "[FIX:agy-backend] failed to remove private prompt file %s: %s",
                             prompt_path,
+                            exc,
+                        )
+                if task_workspace is not None:
+                    try:
+                        shutil.rmtree(runtime_config_root)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        logger.warning(
+                            "[FIX:agy-runtime-cleanup] failed to remove runtime root %s: %s",
+                            runtime_config_root,
                             exc,
                         )
 
