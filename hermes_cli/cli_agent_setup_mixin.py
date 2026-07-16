@@ -52,6 +52,7 @@ class CLIAgentSetupMixin:
             from hermes_cli.auth import AuthError
             if isinstance(_primary_exc, AuthError) and not provider_requires_fail_closed(
                 self.requested_provider,
+                base_url=self._explicit_base_url,
                 error=_primary_exc,
             ):
                 _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []

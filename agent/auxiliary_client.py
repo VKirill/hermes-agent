@@ -913,6 +913,11 @@ class _CodexCompletionsAdapter:
     def create(self, **kwargs) -> Any:
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
+        timeout = kwargs.get("timeout")
+        total_timeout = (
+            timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
+        )
+        deadline = time.monotonic() + float(total_timeout) if total_timeout else None
 
         # Separate system/instructions from replayable conversation messages,
         # then route the rest through the SINGLE shared chat->Responses
@@ -964,7 +969,6 @@ class _CodexCompletionsAdapter:
         # by auxiliary calls such as context compression; if the timeout is not
         # forwarded and enforced, a Codex Responses stream can sit behind a
         # dead-looking CLI until the user force-interrupts the whole session.
-        timeout = kwargs.get("timeout")
         if timeout is not None:
             resp_kwargs["timeout"] = timeout
 
@@ -1074,8 +1078,6 @@ class _CodexCompletionsAdapter:
         text_parts: List[str] = []
         tool_calls_raw: List[Any] = []
         usage = None
-        total_timeout = timeout if isinstance(timeout, (int, float)) and timeout > 0 else None
-        deadline = time.monotonic() + float(total_timeout) if total_timeout else None
         timed_out = threading.Event()
         timeout_timer: Optional[threading.Timer] = None
 
@@ -1123,7 +1125,9 @@ class _CodexCompletionsAdapter:
 
         try:
             if total_timeout:
-                timeout_timer = threading.Timer(float(total_timeout), _close_client_on_timeout)
+                assert deadline is not None
+                remaining = max(0.0, deadline - time.monotonic())
+                timeout_timer = threading.Timer(remaining, _close_client_on_timeout)
                 timeout_timer.daemon = True
                 timeout_timer.start()
             _check_cancelled()
@@ -3596,8 +3600,17 @@ async def _retry_same_provider_async(
     )
 
 
-def _refresh_provider_credentials(provider: str) -> bool:
-    """Refresh short-lived credentials for OAuth-backed auxiliary providers."""
+def _refresh_provider_credentials(
+    provider: str,
+    *,
+    env: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Refresh short-lived credentials for OAuth-backed auxiliary providers.
+
+    ``env`` stays explicit for the ambient-runtime path so credential refresh
+    keeps the profile-isolation call contract.
+    """
+    del env
     normalized = _normalize_aux_provider(provider)
     try:
         if normalized == "copilot":
@@ -4490,6 +4503,13 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         from agent.copilot_acp_client import CopilotACPClient
         if isinstance(sync_client, CopilotACPClient):
             return sync_client, model
+    except ImportError:
+        pass
+    try:
+        from agent.agy_cli_client import AgyCLIClient, AsyncAgyCLIClient
+
+        if isinstance(sync_client, AgyCLIClient):
+            return AsyncAgyCLIClient(sync_client), model
     except ImportError:
         pass
 
@@ -7119,7 +7139,10 @@ def call_llm(
         if (_is_auth_error(first_err)
                 and auth_refresh_provider not in {"auto", "", None}
                 and not client_is_nous):
-            if _refresh_provider_credentials(auth_refresh_provider):
+            refresh_kwargs = (
+                {} if resolved_provider in {"auto", "", None} else {"env": None}
+            )
+            if _refresh_provider_credentials(auth_refresh_provider, **refresh_kwargs):
                 if auth_refresh_provider != _normalize_aux_provider(resolved_provider):
                     # The stale client is cached under the route label
                     # (e.g. "auto"), not the concrete backend we refreshed.
@@ -7257,7 +7280,19 @@ def call_llm(
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
-        if should_fallback and (is_auto or is_capacity_error):
+        from hermes_cli.runtime_provider import is_agy_process_route
+
+        fail_closed_route = is_agy_process_route(
+            resolved_provider,
+            base_url=str(getattr(client, "base_url", "") or ""),
+        )
+        if fail_closed_route and should_fallback:
+            logger.warning(
+                "[FIX:agy-backend] Auxiliary %s failed on agy route; refusing "
+                "configured or automatic provider fallbacks",
+                task or "call",
+            )
+        if not fail_closed_route and should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
@@ -7673,7 +7708,10 @@ async def async_call_llm(
         if (_is_auth_error(first_err)
                 and auth_refresh_provider not in {"auto", "", None}
                 and not client_is_nous):
-            if _refresh_provider_credentials(auth_refresh_provider):
+            refresh_kwargs = (
+                {} if resolved_provider in {"auto", "", None} else {"env": None}
+            )
+            if _refresh_provider_credentials(auth_refresh_provider, **refresh_kwargs):
                 if auth_refresh_provider != _normalize_aux_provider(resolved_provider):
                     # The stale client is cached under the route label
                     # (e.g. "auto"), not the concrete backend we refreshed.
@@ -7772,7 +7810,19 @@ async def async_call_llm(
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
-        if should_fallback and (is_auto or is_capacity_error):
+        from hermes_cli.runtime_provider import is_agy_process_route
+
+        fail_closed_route = is_agy_process_route(
+            resolved_provider,
+            base_url=str(getattr(client, "base_url", "") or ""),
+        )
+        if fail_closed_route and should_fallback:
+            logger.warning(
+                "[FIX:agy-backend] Auxiliary %s (async) failed on agy route; "
+                "refusing configured or automatic provider fallbacks",
+                task or "call",
+            )
+        if not fail_closed_route and should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):

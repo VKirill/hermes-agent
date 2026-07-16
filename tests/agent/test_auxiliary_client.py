@@ -2158,6 +2158,33 @@ class TestCallLlmPaymentFallback:
                 )
         mock_fb.assert_not_called()
 
+    @pytest.mark.parametrize(
+        ("provider", "base_url"),
+        [("agy", "agy://local"), ("custom", "agy://local")],
+    )
+    def test_agy_process_route_never_falls_back_on_capacity_failure(
+        self, provider, base_url
+    ):
+        primary_client = MagicMock()
+        primary_client.base_url = base_url
+        capacity_error = self._make_429_rate_limit_error()
+        primary_client.chat.completions.create.side_effect = capacity_error
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "Gemini 3.5 Flash (Low)"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=(provider, "Gemini 3.5 Flash (Low)", None, base_url, None),
+        ), patch("agent.auxiliary_client._try_payment_fallback") as mock_fallback:
+            with pytest.raises(Exception, match="Rate limit exceeded"):
+                call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "hello"}],
+                )
+
+        mock_fallback.assert_not_called()
+
 
 class TestStaleFallbackCandidateSkip:
     """A fallback candidate with a stale credential must not abort the task.
@@ -4651,10 +4678,14 @@ class TestCodexAuxiliaryAdapterTimeout:
         assert response.choices[0].message.content == "summary"
 
     def test_enforces_total_timeout_while_stream_keeps_emitting_events(self):
+        emitted = 0
+
         class _SlowAliveCreateStream:
             def __iter__(self):
+                nonlocal emitted
                 for _ in range(5):
                     time.sleep(0.03)
+                    emitted += 1
                     yield SimpleNamespace(type="response.in_progress")
 
             def close(self): pass
@@ -4666,14 +4697,13 @@ class TestCodexAuxiliaryAdapterTimeout:
         fake_client = SimpleNamespace(responses=FakeResponses(), close=lambda: None)
         adapter = _CodexCompletionsAdapter(fake_client, "gpt-5.5")
 
-        started = time.monotonic()
         with pytest.raises(TimeoutError):
             adapter.create(
                 messages=[{"role": "user", "content": "summarize this"}],
                 timeout=0.05,
             )
 
-        assert time.monotonic() - started < 0.14
+        assert emitted < 5
 
 
 class TestCodexAuxiliaryToolMessageConversion:

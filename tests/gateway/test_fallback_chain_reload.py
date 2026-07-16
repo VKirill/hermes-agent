@@ -117,6 +117,27 @@ def test_apply_fallback_chain_updates_primary_agent():
     assert agent._fallback_index == 0
 
 
+def test_apply_fallback_chain_keeps_cached_agy_agent_fail_closed():
+    from gateway.run import GatewayRunner
+
+    agent = SimpleNamespace(
+        provider="agy",
+        base_url="agy://local",
+        _fallback_chain=[],
+        _fallback_model=None,
+        _fallback_index=0,
+        _fallback_activated=False,
+        _rate_limited_until=0,
+    )
+    GatewayRunner._apply_fallback_chain_to_agent(
+        agent,
+        [{"provider": "gemini", "model": "gemini-3-flash"}],
+    )
+
+    assert agent._fallback_chain == []
+    assert agent._fallback_model is None
+
+
 def test_apply_fallback_chain_skips_while_cooldown_holds_fallback():
     """Do not clobber a live fallback activation during its cooldown window."""
     from gateway.run import GatewayRunner

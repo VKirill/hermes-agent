@@ -1408,6 +1408,17 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    from hermes_cli.runtime_provider import is_agy_process_route
+
+    if is_agy_process_route(
+        getattr(agent, "provider", None),
+        base_url=getattr(agent, "base_url", None),
+    ):
+        logger.warning(
+            "[FIX:agy-backend] Refusing fallback activation from fail-closed agy route"
+        )
+        return False
+
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -1576,6 +1587,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent.provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
+        if is_agy_process_route(agent.provider, base_url=agent.base_url):
+            agent._fallback_chain = []
+            agent._fallback_model = None
+            agent._api_max_retries = 1
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True

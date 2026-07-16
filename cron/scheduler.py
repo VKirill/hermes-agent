@@ -3054,7 +3054,11 @@ def run_job(
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
             runtime = resolve_runtime_provider(**runtime_kwargs)
         except AuthError as auth_exc:
-            if provider_requires_fail_closed(job.get("provider"), error=auth_exc):
+            if provider_requires_fail_closed(
+                job.get("provider"),
+                base_url=job.get("base_url"),
+                error=auth_exc,
+            ):
                 logger.error("Job '%s': primary provider failed closed: %s", job_id, auth_exc)
                 raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
             # Primary provider auth failed — try fallback chain before giving up.

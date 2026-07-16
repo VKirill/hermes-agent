@@ -1167,6 +1167,13 @@ def restore_primary_runtime(agent) -> bool:
         agent.provider = rt["provider"]
         agent.base_url = rt["base_url"]           # setter updates _base_url_lower
         agent.api_mode = rt["api_mode"]
+        from hermes_cli.runtime_provider import is_agy_process_route
+
+        agent._api_max_retries = (
+            1
+            if is_agy_process_route(agent.provider, base_url=agent.base_url)
+            else max(1, int(getattr(agent, "_configured_api_max_retries", 1) or 1))
+        )
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
@@ -1709,7 +1716,12 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
             agent._client_log_context(),
         )
         return client
-    if agent.provider == "agy" or str(client_kwargs.get("base_url", "")).startswith("agy://"):
+    from hermes_cli.runtime_provider import is_agy_process_route
+
+    if is_agy_process_route(
+        agent.provider,
+        base_url=str(client_kwargs.get("base_url", "")),
+    ):
         from agent.agy_cli_client import AgyCLIClient
 
         client = AgyCLIClient(**client_kwargs)
@@ -2160,6 +2172,22 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         ]
     agent._fallback_chain = fallback_chain
     agent._fallback_model = fallback_chain[0] if fallback_chain else None
+    from hermes_cli.runtime_provider import is_agy_process_route
+
+    if is_agy_process_route(agent.provider, base_url=agent.base_url):
+        if agent._fallback_chain:
+            logger.warning(
+                "[FIX:agy-backend] Ignoring %d fallback provider(s) after model "
+                "switch; the active agy route is fail-closed",
+                len(agent._fallback_chain),
+            )
+        agent._fallback_chain = []
+        agent._fallback_model = None
+        agent._api_max_retries = 1
+    else:
+        agent._api_max_retries = max(
+            1, int(getattr(agent, "_configured_api_max_retries", 1) or 1)
+        )
 
     logger.info(
         "Model switched in-place: %s (%s) -> %s (%s)",

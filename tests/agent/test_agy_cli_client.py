@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.agy_cli_client import AgyCLIClient
+from agent.agy_cli_client import AgyCLIClient, _format_messages_as_prompt
 
 
 def _write_fake_agy(tmp_path: Path, body: str) -> Path:
@@ -18,7 +18,6 @@ def _write_fake_agy(tmp_path: Path, body: str) -> Path:
 
 def _config(tmp_path: Path, **overrides):
     config = {
-        "state_dir": str(tmp_path / "state"),
         "timeout_seconds": 5,
         "queue_timeout_seconds": 5,
         "max_parallel": 1,
@@ -40,9 +39,18 @@ def test_agy_client_uses_explicit_model_sanitized_env_isolated_cwd_and_logs(
         """
 import json
 import os
+import stat
 import sys
+argv = sys.argv[1:]
+prompt_ref = argv[argv.index("-p") + 1]
+assert prompt_ref.startswith("@")
+prompt_path = prompt_ref[1:]
+prompt = open(prompt_path, encoding="utf-8").read()
 print(json.dumps({
-    "argv": sys.argv[1:],
+    "argv": argv,
+    "prompt": prompt,
+    "prompt_path": prompt_path,
+    "prompt_mode": stat.S_IMODE(os.stat(prompt_path).st_mode),
     "cwd": os.getcwd(),
     "has_google_key": "GOOGLE_API_KEY" in os.environ,
     "has_gemini_key": "GEMINI_API_KEY" in os.environ,
@@ -66,18 +74,66 @@ print(json.dumps({
     payload = json.loads(response.choices[0].message.content)
     argv = payload["argv"]
     assert "-p" in argv
+    assert "Return READY" not in " ".join(argv)
+    assert "Return READY" in payload["prompt"]
     assert argv[argv.index("--model") + 1] == "Gemini 3.5 Flash (Low)"
     assert argv[argv.index("--print-timeout") + 1] == "5s"
     assert "--sandbox" in argv
     assert argv[argv.index("--mode") + 1] == "plan"
     assert payload["has_google_key"] is False
     assert payload["has_gemini_key"] is False
-    assert Path(payload["cwd"]).parent == tmp_path / "state" / "workspaces"
+    assert Path(payload["cwd"]).parent == client._workspaces_dir
+    prompt_path = Path(payload["prompt_path"])
+    assert prompt_path.parent == Path(payload["cwd"])
+    assert payload["prompt_mode"] == 0o600
+    assert not prompt_path.exists()
     events = client.read_log(response.agy_request_id)
     assert [event["event"] for event in events] == ["start", "success"]
     log_path = Path(response.agy_log_path)
     assert log_path.exists()
     assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+
+
+def test_agy_client_uses_private_prompt_file_for_large_transcript(tmp_path):
+    script = _write_fake_agy(
+        tmp_path,
+        """
+import json
+import os
+import stat
+import sys
+argv = sys.argv[1:]
+prompt_ref = argv[argv.index("-p") + 1]
+assert prompt_ref.startswith("@")
+prompt_path = prompt_ref[1:]
+with open(prompt_path, encoding="utf-8") as handle:
+    prompt = handle.read()
+print(json.dumps({
+    "argv": argv,
+    "prompt_length": len(prompt),
+    "prompt_path": prompt_path,
+    "prompt_mode": stat.S_IMODE(os.stat(prompt_path).st_mode),
+}))
+""",
+    )
+    client = AgyCLIClient(
+        command=sys.executable,
+        args=[str(script)],
+        agy_config=_config(tmp_path),
+    )
+    marker = "LONG_TRANSCRIPT_SECRET"
+    content = marker + ("x" * (2 * 1024 * 1024))
+
+    response = client.chat.completions.create(
+        model="Gemini 3.5 Flash (Low)",
+        messages=[{"role": "user", "content": content}],
+    )
+
+    payload = json.loads(response.choices[0].message.content)
+    assert payload["prompt_length"] > 2 * 1024 * 1024
+    assert marker not in " ".join(payload["argv"])
+    assert payload["prompt_mode"] == 0o600
+    assert not Path(payload["prompt_path"]).exists()
 
 
 def test_agy_client_retries_nonzero_exit_within_budget(tmp_path):
@@ -116,6 +172,7 @@ print("RECOVERED")
         "start",
         "success",
     ]
+    assert not list(client._workspaces_dir.rglob("prompt-*.txt"))
 
 
 def test_agy_client_deduplicates_successful_requests_within_ttl(tmp_path):
@@ -148,6 +205,160 @@ print(f"CALL-{{count}}")
     assert second.agy_cached is True
     assert counter.read_text() == "1"
     assert client.read_log(second.agy_request_id)[-1]["event"] == "cache_hit"
+
+
+def test_agy_client_maps_tool_call_output_to_openai_contract(tmp_path):
+    script = _write_fake_agy(
+        tmp_path,
+        """
+import json
+payload = {
+    "id": "agy-call-1",
+    "type": "function",
+    "function": {
+        "name": "probe_tool",
+        "arguments": json.dumps({"value": "ping"}),
+    },
+}
+print("<tool_call>" + json.dumps(payload) + "</tool_call>")
+""",
+    )
+    client = AgyCLIClient(
+        command=sys.executable,
+        args=[str(script)],
+        agy_config=_config(tmp_path),
+    )
+
+    response = client.chat.completions.create(
+        model="Gemini 3.5 Flash (Low)",
+        messages=[{"role": "user", "content": "Call the probe tool"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "probe_tool",
+                    "description": "Return a probe result.",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+        tool_choice="auto",
+    )
+
+    choice = response.choices[0]
+    assert choice.finish_reason == "tool_calls"
+    assert choice.message.content == ""
+    assert len(choice.message.tool_calls) == 1
+    tool_call = choice.message.tool_calls[0]
+    assert tool_call.id == "agy-call-1"
+    assert tool_call.type == "function"
+    assert tool_call.function.name == "probe_tool"
+    assert json.loads(tool_call.function.arguments) == {"value": "ping"}
+
+
+def test_agy_stream_uses_openai_delta_chunks(tmp_path):
+    script = _write_fake_agy(tmp_path, 'print("STREAM-READY")')
+    client = AgyCLIClient(
+        command=sys.executable,
+        args=[str(script)],
+        agy_config=_config(tmp_path),
+    )
+
+    chunks = list(
+        client.chat.completions.create(
+            model="Gemini 3.5 Flash (Low)",
+            messages=[{"role": "user", "content": "stream"}],
+            stream=True,
+        )
+    )
+
+    assert chunks
+    assert chunks[0].choices[0].delta.content == "STREAM-READY"
+    assert chunks[0].choices[0].finish_reason == "stop"
+    assert chunks[-1].choices == []
+    assert chunks[-1].usage.total_tokens == 0
+
+
+def test_agy_prompt_preserves_tool_call_history_metadata():
+    prompt = _format_messages_as_prompt(
+        [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-history-1",
+                        "type": "function",
+                        "function": {
+                            "name": "probe_tool",
+                            "arguments": '{"value":"ping"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-history-1",
+                "name": "probe_tool",
+                "content": "TOOL-OK",
+            },
+        ],
+        tools=None,
+    )
+
+    assert "call-history-1" in prompt
+    assert "probe_tool" in prompt
+    assert "value" in prompt
+    assert "ping" in prompt
+    assert "TOOL-OK" in prompt
+
+
+def test_agy_close_stops_active_child_and_releases_lease(tmp_path):
+    started = tmp_path / "started"
+    script = _write_fake_agy(
+        tmp_path,
+        f"""
+from pathlib import Path
+import time
+Path({str(started)!r}).write_text("started")
+time.sleep(0.8)
+print("LATE")
+""",
+    )
+    client = AgyCLIClient(
+        command=sys.executable,
+        args=[str(script)],
+        agy_config=_config(tmp_path, dedupe_ttl_seconds=0),
+    )
+    errors: list[Exception] = []
+
+    def run() -> None:
+        try:
+            client.chat.completions.create(
+                model="Gemini 3.5 Flash (Low)",
+                messages=[{"role": "user", "content": "wait"}],
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    deadline = time.monotonic() + 2
+    while not started.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert started.exists()
+
+    client.close()
+    thread.join(timeout=0.2)
+    stopped_by_close = not thread.is_alive()
+    thread.join(timeout=2)
+
+    assert stopped_by_close is True
+    assert errors
+    with client._connect_state() as conn:
+        statuses = [row[0] for row in conn.execute("SELECT status FROM requests")]
+    assert "running" not in statuses
+    assert not list(client._workspaces_dir.rglob("prompt-*.txt"))
 
 
 def test_agy_clients_share_a_cross_process_concurrency_limit(tmp_path):
@@ -197,7 +408,7 @@ def test_agy_client_bounds_timeout_retries_and_fails_closed(monkeypatch, tmp_pat
         calls += 1
         raise __import__("subprocess").TimeoutExpired(args[0], kwargs["timeout"])
 
-    monkeypatch.setattr("agent.agy_cli_client.subprocess.run", timeout)
+    monkeypatch.setattr("agent.agy_cli_client._run_bounded_process", timeout)
     client = AgyCLIClient(
         command="agy",
         agy_config=_config(tmp_path, timeout_seconds=1, retry_budget=1),
@@ -210,6 +421,273 @@ def test_agy_client_bounds_timeout_retries_and_fails_closed(monkeypatch, tmp_pat
         )
 
     assert calls == 2
+
+
+def test_agy_client_rejects_symlinked_state_and_workspace(monkeypatch, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    profile_home = tmp_path / "profile"
+    (profile_home / "cache").mkdir(parents=True)
+    state_link = profile_home / "cache" / "agy"
+    state_link.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    with pytest.raises(PermissionError, match="symlink"):
+        AgyCLIClient(agy_config=_config(tmp_path))
+
+    state_link.unlink()
+    script = _write_fake_agy(tmp_path, 'print("SHOULD-NOT-RUN")')
+    client = AgyCLIClient(
+        command=sys.executable,
+        args=[str(script)],
+        agy_config=_config(tmp_path),
+    )
+    messages = [{"role": "user", "content": "workspace symlink"}]
+    prompt = _format_messages_as_prompt(messages, tools=None)
+    request_id = client._request_id(model="Gemini 3.5 Flash (Low)", prompt=prompt)
+    workspace = client._workspaces_dir / request_id
+    workspace.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(PermissionError, match="symlink"):
+        client.chat.completions.create(
+            model="Gemini 3.5 Flash (Low)", messages=messages
+        )
+
+
+def test_agy_client_rejects_symlinked_database_and_log(monkeypatch, tmp_path):
+    outside_db = tmp_path / "outside.sqlite3"
+    outside_db.write_bytes(b"outside-db")
+    profile_home = tmp_path / "profile"
+    state = profile_home / "cache" / "agy"
+    state.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    (state / "state.sqlite3").symlink_to(outside_db)
+
+    with pytest.raises(OSError):
+        AgyCLIClient(agy_config=_config(tmp_path))
+    assert outside_db.read_bytes() == b"outside-db"
+
+    (state / "state.sqlite3").unlink()
+    sidecar = state / "state.sqlite3-journal"
+    sidecar.symlink_to(outside_db)
+    with pytest.raises(OSError):
+        AgyCLIClient(agy_config=_config(tmp_path))
+    assert outside_db.read_bytes() == b"outside-db"
+
+    sidecar.unlink()
+    client = AgyCLIClient(agy_config=_config(tmp_path))
+    outside_log = tmp_path / "outside.log"
+    outside_log.write_text("outside-log", encoding="utf-8")
+    request_id = "b" * 24
+    client._log_path(request_id).symlink_to(outside_log)
+
+    with pytest.raises(OSError):
+        client._append_log(request_id, {"event": "must-not-escape"})
+    assert outside_log.read_text(encoding="utf-8") == "outside-log"
+
+
+def test_agy_client_fails_closed_when_private_permissions_cannot_be_applied(
+    monkeypatch, tmp_path
+):
+    original_chmod = __import__("os").chmod
+    profile_home = tmp_path / "profile"
+    state_dir = profile_home / "cache" / "agy"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+    def fail_state_chmod(path, mode, **kwargs):
+        if Path(path) == state_dir:
+            raise OSError("permission denied")
+        return original_chmod(path, mode, **kwargs)
+
+    monkeypatch.setattr("agent.agy_cli_client.os.chmod", fail_state_chmod)
+    with pytest.raises(PermissionError, match="could not secure"):
+        AgyCLIClient(agy_config=_config(tmp_path))
+
+
+def test_agy_client_physically_bounds_output_logs_and_database(tmp_path):
+    script = _write_fake_agy(
+        tmp_path,
+        'import sys\nsys.stdout.write("X" * 200_000)\n',
+    )
+    client = AgyCLIClient(
+        command=sys.executable,
+        args=[str(script)],
+        agy_config=_config(
+            tmp_path,
+            max_output_bytes=4096,
+            max_log_bytes=4096,
+            max_db_bytes=65536,
+            max_state_rows=8,
+            dedupe_ttl_seconds=0,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="bounded stdout_limit capture"):
+        client.chat.completions.create(
+            model="Gemini 3.5 Flash (Low)",
+            messages=[{"role": "user", "content": "large output"}],
+        )
+
+    log_files = list(client._logs_dir.glob("*.jsonl"))
+    assert log_files
+    assert all(path.stat().st_size <= 4096 for path in log_files)
+    assert client._db_path.stat().st_size <= 65536
+    with client._connect_state() as conn:
+        status, response = conn.execute(
+            "SELECT status, response FROM requests"
+        ).fetchone()
+    assert status == "failed"
+    assert response is None
+
+    request_id = "a" * 24
+    for index in range(20):
+        client._append_log(
+            request_id,
+            {"event": "probe", "index": index, "payload": "Y" * 1000},
+        )
+    assert client._log_path(request_id).stat().st_size <= 4096
+
+
+def test_agy_client_serializes_concurrent_log_rotation(tmp_path):
+    client = AgyCLIClient(
+        agy_config=_config(tmp_path, max_log_bytes=4096)
+    )
+    request_id = "c" * 24
+    gate = threading.Event()
+    errors: list[Exception] = []
+
+    def write_events(worker: int) -> None:
+        gate.wait()
+        try:
+            for index in range(20):
+                client._append_log(
+                    request_id,
+                    {
+                        "event": "concurrent",
+                        "worker": worker,
+                        "index": index,
+                        "payload": "Z" * 300,
+                    },
+                )
+        except Exception as exc:  # pragma: no cover - assertion reports details
+            errors.append(exc)
+
+    threads = [threading.Thread(target=write_events, args=(index,)) for index in range(8)]
+    for thread in threads:
+        thread.start()
+    gate.set()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert errors == []
+    assert all(not thread.is_alive() for thread in threads)
+    assert client._log_path(request_id).stat().st_size <= 4096
+    assert client.read_log(request_id)
+
+
+def test_agy_client_cleans_old_and_excess_state_rows(tmp_path):
+    client = AgyCLIClient(
+        agy_config=_config(
+            tmp_path,
+            max_state_rows=8,
+            state_ttl_seconds=60,
+        )
+    )
+    now = time.time()
+    with client._connect_state() as conn:
+        for index in range(12):
+            conn.execute(
+                "INSERT INTO requests(request_id, status, started_at, finished_at) "
+                "VALUES (?, 'success', ?, ?)",
+                (f"{index:024x}", now - index, now - index),
+            )
+        conn.execute(
+            "INSERT INTO requests(request_id, status, started_at, finished_at) "
+            "VALUES (?, 'failed', ?, ?)",
+            ("f" * 24, now - 120, now - 120),
+        )
+        client._cleanup_state_rows(conn)
+        rows = conn.execute(
+            "SELECT request_id FROM requests ORDER BY finished_at DESC"
+        ).fetchall()
+
+    assert len(rows) <= 8
+    assert ("f" * 24,) not in rows
+
+
+def test_agy_client_garbage_collects_stale_and_excess_workspaces(tmp_path):
+    config = _config(
+        tmp_path,
+        max_state_rows=8,
+        state_ttl_seconds=60,
+    )
+    client = AgyCLIClient(agy_config=config)
+    workspaces = client._workspaces_dir
+    now = time.time()
+    stale = workspaces / ("f" * 24)
+    stale.mkdir()
+    stale.touch()
+    __import__("os").utime(stale, (now - 120, now - 120))
+
+    newest = workspaces / ("e" * 24)
+    for index in range(12):
+        workspace = workspaces / f"{index:024x}"
+        workspace.mkdir()
+        __import__("os").utime(workspace, (now - index, now - index))
+    newest.mkdir()
+    __import__("os").utime(newest, (now + 1, now + 1))
+
+    AgyCLIClient(agy_config=config)
+
+    retained = list(workspaces.iterdir())
+    assert stale not in retained
+    assert newest in retained
+    assert len(retained) <= 8
+
+
+def test_agy_default_state_is_scoped_to_hermes_profile(monkeypatch, tmp_path):
+    legacy_default = "~/.cache/hermes/agy"
+    shared_override = tmp_path / "shared-state"
+    first_home = tmp_path / "profile-a"
+    second_home = tmp_path / "profile-b"
+    monkeypatch.setenv("HERMES_HOME", str(first_home))
+    first = AgyCLIClient(agy_config={"state_dir": str(shared_override)})
+    monkeypatch.setenv("HERMES_HOME", str(second_home))
+    second = AgyCLIClient(agy_config={"state_dir": legacy_default})
+
+    assert first._state_dir == first_home / "cache" / "agy"
+    assert second._state_dir == second_home / "cache" / "agy"
+    assert first._state_dir != second._state_dir
+    assert not shared_override.exists()
+
+
+def test_agy_request_id_covers_execution_context(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    first = AgyCLIClient(command="agy")
+    second = AgyCLIClient(command="agy-wrapper", args=["wrapper-config"])
+
+    first_id = first._request_id(model="model", prompt="same")
+    second_id = second._request_id(model="model", prompt="same")
+
+    assert first_id != second_id
+
+
+@pytest.mark.parametrize(
+    "agy_config,args,error",
+    [
+        ({"sandbox": False}, None, "sandbox=true"),
+        ({"mode": "accept-edits"}, None, "mode='plan'"),
+        ({}, ["--dangerously-skip-permissions"], "managed by Hermes"),
+        ({}, ["--prompt-interactive"], "managed by Hermes"),
+    ],
+)
+def test_agy_client_rejects_tool_policy_bypasses(tmp_path, agy_config, args, error):
+    with pytest.raises(ValueError, match=error):
+        AgyCLIClient(
+            command="agy",
+            args=args,
+            agy_config=_config(tmp_path, **agy_config),
+        )
 
 
 def test_agy_client_redacts_stderr_before_log_and_error(monkeypatch, tmp_path):

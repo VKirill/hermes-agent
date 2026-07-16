@@ -46,9 +46,37 @@ from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_int
 
 
+def is_agy_process_route(
+    provider: str | None = None,
+    *,
+    base_url: str | None = None,
+) -> bool:
+    """Return whether runtime routing selects the local ``agy`` process.
+
+    The base URL is authoritative because named/bare custom providers may
+    deliberately use ``agy://`` while retaining the generic ``custom`` label.
+    Matching the provider alone leaves those routes eligible for HTTP retries
+    and remote fallbacks even though client construction selects AgyCLIClient.
+    """
+    normalized_url = str(base_url or "").strip().lower()
+    if normalized_url.startswith("agy://"):
+        return True
+    candidate = str(provider or "").strip().lower()
+    if not candidate:
+        return False
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(candidate)
+    except Exception:
+        return candidate == "agy"
+    return bool(profile and profile.name == "agy")
+
+
 def provider_requires_fail_closed(
     provider: str | None = None,
     *,
+    base_url: str | None = None,
     error: Exception | None = None,
 ) -> bool:
     """Return whether a provider failure must not activate fallbacks.
@@ -58,6 +86,8 @@ def provider_requires_fail_closed(
     the configured request was ``auto``). Provider profiles own this policy so
     every CLI/gateway/cron entrypoint enforces the same contract.
     """
+    if is_agy_process_route(provider, base_url=base_url):
+        return True
     candidate = str(getattr(error, "provider", "") or provider or "").strip().lower()
     if not candidate:
         return False

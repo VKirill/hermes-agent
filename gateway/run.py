@@ -5284,6 +5284,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         if agent is None:
             return
+        from hermes_cli.runtime_provider import is_agy_process_route
+
+        if is_agy_process_route(
+            getattr(agent, "provider", None),
+            base_url=getattr(agent, "base_url", None),
+        ):
+            agent._fallback_chain = []
+            agent._fallback_model = None
+            agent._fallback_index = 0
+            logger.debug(
+                "[FIX:agy-backend] cached agy agent remains fail-closed during "
+                "fallback config refresh"
+            )
+            return
         new_chain = list(chain or [])
         rate_limited_until = getattr(agent, "_rate_limited_until", 0) or 0
         if (

@@ -1041,10 +1041,17 @@ DEFAULT_CONFIG = {
         "max_parallel": 1,
         "retry_budget": 1,
         "dedupe_ttl_seconds": 300,
-        "state_dir": "~/.cache/hermes/agy",
+        # Deprecated compatibility key. State is always stored under the
+        # active profile's ``$HERMES_HOME/cache/agy``; external paths are
+        # ignored to prevent cross-profile response-cache disclosure.
+        "state_dir": "",
         "sandbox": True,
         "mode": "plan",
         "max_log_bytes": 262144,
+        "max_output_bytes": 1048576,
+        "max_db_bytes": 16777216,
+        "max_state_rows": 1000,
+        "state_ttl_seconds": 86400,
     },
     "fallback_providers": [],
     "credential_pool_strategies": {},

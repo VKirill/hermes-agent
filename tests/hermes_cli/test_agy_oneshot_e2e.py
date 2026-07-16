@@ -43,9 +43,9 @@ def _write_failing_agy(tmp_path: Path) -> Path:
 def test_agy_oneshot_process_failure_exits_nonzero_without_gemini_fallback(tmp_path):
     """Exercise the real CLI path: process failures are not successful output."""
     fake_agy = _write_failing_agy(tmp_path)
-    state_dir = tmp_path / "agy-state"
     hermes_home = tmp_path / "hermes-home"
     hermes_home.mkdir()
+    state_dir = hermes_home / "cache" / "agy"
     sentinel = ThreadingHTTPServer(("127.0.0.1", 0), _FallbackSentinelHandler)
     thread = Thread(target=sentinel.serve_forever, daemon=True)
     _FallbackSentinelHandler.hits = []

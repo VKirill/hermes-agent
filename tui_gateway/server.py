@@ -4508,7 +4508,11 @@ def _resolve_runtime_with_fallback(
     try:
         return resolve_runtime_provider(**kwargs)
     except AuthError as primary_exc:
-        if provider_requires_fail_closed(kwargs.get("requested"), error=primary_exc):
+        if provider_requires_fail_closed(
+            kwargs.get("requested"),
+            base_url=kwargs.get("explicit_base_url"),
+            error=primary_exc,
+        ):
             raise
         fb_chain = _load_fallback_model() or []
         for entry in fb_chain:
