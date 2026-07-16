@@ -1,3 +1,5 @@
+import pytest
+
 from hermes_cli import auth
 from hermes_cli.auth import AuthError
 from hermes_cli.runtime_provider import (
@@ -46,3 +48,18 @@ def test_agy_runtime_resolves_local_cli_without_api_key(monkeypatch, tmp_path):
     assert resolved["args"] == []
     assert resolved["source"] == "process"
     assert "googleapis.com" not in resolved["base_url"]
+
+
+def test_agy_missing_cli_raises_fail_closed_auth_error(monkeypatch):
+    monkeypatch.setattr(auth.shutil, "which", lambda command: None)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"agy": {"command": "/missing/agy"}},
+    )
+
+    with pytest.raises(AuthError) as exc_info:
+        resolve_runtime_provider(requested="agy")
+
+    assert exc_info.value.provider == "agy"
+    assert exc_info.value.code == "missing_agy_cli"
+    assert provider_requires_fail_closed(error=exc_info.value) is True

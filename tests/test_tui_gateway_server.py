@@ -8893,6 +8893,30 @@ class TestResolveRuntimeWithFallback:
         )
         assert result == fallback_runtime
 
+    def test_agy_auth_error_is_fail_closed(self, monkeypatch):
+        from hermes_cli.auth import AuthError
+
+        calls = []
+
+        def fake_resolve(**kwargs):
+            calls.append(kwargs)
+            raise AuthError("agy is unavailable", provider="agy")
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            fake_resolve,
+        )
+        monkeypatch.setattr(
+            server,
+            "_load_fallback_model",
+            lambda: [{"provider": "deepseek", "model": "deepseek-v4-pro"}],
+        )
+
+        with pytest.raises(AuthError, match="agy is unavailable"):
+            server._resolve_runtime_with_fallback({"requested": "agy"})
+
+        assert len(calls) == 1
+
     def test_auth_error_all_fallbacks_fail_raises(self, monkeypatch):
         """When all fallbacks also fail, re-raise the original AuthError."""
         from hermes_cli.auth import AuthError

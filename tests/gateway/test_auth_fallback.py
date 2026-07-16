@@ -71,6 +71,33 @@ class TestResolveRuntimeAgentKwargsAuthFallback:
             with pytest.raises(RuntimeError):
                 _resolve_runtime_agent_kwargs()
 
+    def test_agy_auth_error_does_not_try_configured_fallback(self, tmp_path, monkeypatch):
+        """Keyless agy failures must remain on the explicitly selected route."""
+        from hermes_cli.auth import AuthError
+
+        (tmp_path / "config.yaml").write_text(
+            "model:\n  provider: agy\n"
+            "fallback_model:\n  provider: openrouter\n"
+            "  model: meta-llama/llama-4-maverick\n"
+        )
+        monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+        calls = []
+
+        def _mock_resolve(**kwargs):
+            calls.append(kwargs)
+            raise AuthError("agy is unavailable", provider="agy")
+
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            side_effect=_mock_resolve,
+        ):
+            from gateway.run import _resolve_runtime_agent_kwargs
+
+            with pytest.raises(RuntimeError, match="agy is unavailable"):
+                _resolve_runtime_agent_kwargs()
+
+        assert len(calls) == 1
+
     def test_legacy_fallback_is_appended_after_fallback_providers(self, tmp_path, monkeypatch):
         """When both keys exist, the legacy entry still participates in resolution."""
         config_path = tmp_path / "config.yaml"
