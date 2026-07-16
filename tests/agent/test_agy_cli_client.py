@@ -59,11 +59,19 @@ print(json.dumps({
     "cwd": os.getcwd(),
     "has_google_key": "GOOGLE_API_KEY" in os.environ,
     "has_gemini_key": "GEMINI_API_KEY" in os.environ,
+    "has_aws_access_key": "AWS_ACCESS_KEY_ID" in os.environ,
+    "has_aws_secret_key": "AWS_SECRET_ACCESS_KEY" in os.environ,
+    "has_aws_session_token": "AWS_SESSION_TOKEN" in os.environ,
+    "has_claude_oauth_token": "CLAUDE_CODE_OAUTH_TOKEN" in os.environ,
 }))
 """,
     )
     monkeypatch.setenv("GOOGLE_API_KEY", "must-not-reach-child")
     monkeypatch.setenv("GEMINI_API_KEY", "must-not-reach-child")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "must-not-reach-child")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-reach-child")
+    monkeypatch.setenv("AWS_SESSION_TOKEN", "must-not-reach-child")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "must-not-reach-child")
     client = AgyCLIClient(
         command=sys.executable,
         args=[str(script)],
@@ -87,6 +95,10 @@ print(json.dumps({
     assert argv[argv.index("--mode") + 1] == "plan"
     assert payload["has_google_key"] is False
     assert payload["has_gemini_key"] is False
+    assert payload["has_aws_access_key"] is False
+    assert payload["has_aws_secret_key"] is False
+    assert payload["has_aws_session_token"] is False
+    assert payload["has_claude_oauth_token"] is False
     assert Path(payload["cwd"]).parent == client._workspaces_dir
     prompt_path = Path(payload["prompt_path"])
     assert prompt_path.parent == Path(payload["cwd"])
@@ -453,8 +465,13 @@ prompt_ref = sys.argv[sys.argv.index("-p") + 1]
 prompt = Path(prompt_ref[1:]).read_text()
 name = "one" if "parallel-one" in prompt else "two"
 Path({str(started_dir)!r}, name).write_text("started")
-time.sleep(0.8)
-Path({str(side_effect_dir)!r}, name).write_text("should-not-exist")
+if name == "one":
+    deadline = time.monotonic() + 2
+    while not Path({str(started_dir)!r}, "two").exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+else:
+    time.sleep(0.8)
+    Path({str(side_effect_dir)!r}, name).write_text("should-not-exist")
 print(name)
 """,
     )
@@ -464,13 +481,15 @@ print(name)
         agy_config=_config(tmp_path, max_parallel=2, dedupe_ttl_seconds=0),
     )
     errors: list[Exception] = []
+    results: list[str] = []
 
     def run(name: str) -> None:
         try:
-            client.chat.completions.create(
+            response = client.chat.completions.create(
                 model="Gemini 3.5 Flash (Low)",
                 messages=[{"role": "user", "content": f"parallel-{name}"}],
             )
+            results.append(response.choices[0].message.content)
         except Exception as exc:
             errors.append(exc)
 
@@ -481,13 +500,17 @@ print(name)
     while len(list(started_dir.iterdir())) < 2 and time.monotonic() < deadline:
         time.sleep(0.01)
     assert len(list(started_dir.iterdir())) == 2
+    threads[0].join(timeout=2)
+    assert threads[0].is_alive() is False
+    assert threads[1].is_alive() is True
 
     client.close()
     for thread in threads:
         thread.join(timeout=2)
 
     assert all(not thread.is_alive() for thread in threads)
-    assert len(errors) == 2
+    assert results == ["one"]
+    assert len(errors) == 1
     assert list(side_effect_dir.iterdir()) == []
 
 

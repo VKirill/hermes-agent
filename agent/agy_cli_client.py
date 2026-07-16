@@ -46,7 +46,11 @@ try:
 except ImportError:  # pragma: no cover - non-Windows
     msvcrt = None
 
-_DIRECT_GOOGLE_ENV_VARS = {
+_AGY_FORBIDDEN_CREDENTIAL_ENV_VARS = {
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
     "GOOGLE_API_KEY",
     "GEMINI_API_KEY",
     "GOOGLE_APPLICATION_CREDENTIALS",
@@ -1174,7 +1178,11 @@ class AgyCLIClient:
 
     def _safe_child_env(self) -> dict[str, str]:
         env = hermes_subprocess_env(inherit_credentials=False)
-        for key in _DIRECT_GOOGLE_ENV_VARS:
+        # The shared terminal helper intentionally preserves operator-shell
+        # credentials such as AWS and Claude Code OAuth. Agy consumes an
+        # untrusted transcript and may invoke internal tools even in sandboxed
+        # plan mode, so its child gets a stricter, adapter-local boundary.
+        for key in _AGY_FORBIDDEN_CREDENTIAL_ENV_VARS:
             env.pop(key, None)
         env["NO_COLOR"] = "1"
         env["TERM"] = env.get("TERM") or "dumb"
