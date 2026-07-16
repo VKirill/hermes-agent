@@ -11,8 +11,9 @@ PROFILE = ProviderProfile(
     name="agy",
     display_name="Antigravity CLI (managed local process)",
     description=(
-        "Runs the local agy CLI with its existing managed authentication; "
-        "does not use GOOGLE_API_KEY or GEMINI_API_KEY."
+        "Uses the local agy CLI OAuth transport to remote Google Cloud Code Assist; "
+        "Hermes does not use GOOGLE_API_KEY or GEMINI_API_KEY. Disabled in gateway "
+        "sessions because agy headless mode can auto-approve native tools."
     ),
     aliases=("antigravity", "antigravity-cli"),
     env_vars=(),

@@ -1489,6 +1489,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key or session_id,
             )
 
+        # Route fields are caller-controlled and can overwrite a safe default
+        # after provider resolution (including a bare custom agy:// URL).
+        # Revalidate the fully merged runtime immediately before agent creation.
+        from gateway.provider_policy import enforce_gateway_provider_policy
+
+        enforce_gateway_provider_policy(runtime_kwargs)
+
         user_config = _load_gateway_config()
         enabled_toolsets = sorted(_get_platform_tools(user_config, "api_server"))
 
