@@ -166,6 +166,23 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         pass
 
 
+def _failed_run_requires_nonzero_exit(
+    result: dict,
+    *,
+    requested_provider: Optional[str] = None,
+) -> bool:
+    """Return whether a failed fail-closed route must fail the CLI process."""
+    if not (result.get("failed") or result.get("partial")):
+        return False
+
+    from hermes_cli.runtime_provider import provider_requires_fail_closed
+
+    return provider_requires_fail_closed(
+        result.get("provider") or requested_provider,
+        base_url=result.get("base_url"),
+    )
+
+
 def run_oneshot(
     prompt: str,
     model: Optional[str] = None,
@@ -273,7 +290,17 @@ def run_oneshot(
             real_stdout.write("\n")
         real_stdout.flush()
 
-    if (result.get("failed") or result.get("partial")) and not (response or "").strip():
+    run_failed = bool(result.get("failed") or result.get("partial"))
+    if run_failed and (
+        _failed_run_requires_nonzero_exit(result, requested_provider=provider)
+        or not (response or "").strip()
+    ):
+        logging.debug(
+            "[FIX:agy-oneshot-exit] Returning nonzero for failed fail-closed route "
+            "provider=%s base_url=%s",
+            result.get("provider") or provider,
+            result.get("base_url"),
+        )
         return 2
 
     if not (response or "").strip():
@@ -423,6 +450,8 @@ def _run_agent(
     agent.tool_gen_callback = None
 
     result = agent.run_conversation(prompt)
+    result.setdefault("provider", runtime.get("provider"))
+    result.setdefault("base_url", runtime.get("base_url"))
     return (result.get("final_response") or "", result)
 
 
