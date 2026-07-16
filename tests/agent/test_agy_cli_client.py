@@ -62,6 +62,11 @@ print(json.dumps({
     "has_aws_access_key": "AWS_ACCESS_KEY_ID" in os.environ,
     "has_aws_secret_key": "AWS_SECRET_ACCESS_KEY" in os.environ,
     "has_aws_session_token": "AWS_SESSION_TOKEN" in os.environ,
+    "has_aws_profile": "AWS_PROFILE" in os.environ,
+    "has_aws_web_identity": "AWS_WEB_IDENTITY_TOKEN_FILE" in os.environ,
+    "has_aws_container_credentials": "AWS_CONTAINER_CREDENTIALS_FULL_URI" in os.environ,
+    "aws_metadata_disabled": os.environ.get("AWS_EC2_METADATA_DISABLED"),
+    "has_ssh_agent": "SSH_AUTH_SOCK" in os.environ,
     "has_claude_oauth_token": "CLAUDE_CODE_OAUTH_TOKEN" in os.environ,
 }))
 """,
@@ -71,6 +76,13 @@ print(json.dumps({
     monkeypatch.setenv("AWS_ACCESS_KEY_ID", "must-not-reach-child")
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-reach-child")
     monkeypatch.setenv("AWS_SESSION_TOKEN", "must-not-reach-child")
+    monkeypatch.setenv("AWS_PROFILE", "must-not-reach-child")
+    monkeypatch.setenv("AWS_WEB_IDENTITY_TOKEN_FILE", "/must/not/reach/child")
+    monkeypatch.setenv(
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "http://127.0.0.1/must-not-reach-child",
+    )
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/must/not/reach/child.sock")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "must-not-reach-child")
     client = AgyCLIClient(
         command=sys.executable,
@@ -98,6 +110,11 @@ print(json.dumps({
     assert payload["has_aws_access_key"] is False
     assert payload["has_aws_secret_key"] is False
     assert payload["has_aws_session_token"] is False
+    assert payload["has_aws_profile"] is False
+    assert payload["has_aws_web_identity"] is False
+    assert payload["has_aws_container_credentials"] is False
+    assert payload["aws_metadata_disabled"] == "true"
+    assert payload["has_ssh_agent"] is False
     assert payload["has_claude_oauth_token"] is False
     assert Path(payload["cwd"]).parent == client._workspaces_dir
     prompt_path = Path(payload["prompt_path"])

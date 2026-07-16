@@ -776,6 +776,9 @@ def test_status_falls_through_to_generic_dispatcher_for_catalog_only_provider():
         "access_token": "sk-future-secret-token-xyz",
         "expires_at": "2026-12-01T00:00:00Z",
         "has_refresh_token": True,
+        "available": True,
+        "auth_verified": False,
+        "status_basis": "process_available",
     }
     with patch("hermes_cli.auth.get_auth_status", return_value=fake_status):
         out = ws._resolve_provider_status("some-future-oauth", None)
@@ -787,6 +790,9 @@ def test_status_falls_through_to_generic_dispatcher_for_catalog_only_provider():
     assert out["token_preview"] and "sk-future-secret-token-xyz" not in out["token_preview"]
     assert out["expires_at"] == "2026-12-01T00:00:00Z"
     assert out["has_refresh_token"] is True
+    assert out["available"] is True
+    assert out["auth_verified"] is False
+    assert out["status_basis"] == "process_available"
 
 
 def test_status_hardcoded_branch_wins_over_generic_fallback():

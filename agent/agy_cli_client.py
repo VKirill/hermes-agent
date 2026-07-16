@@ -56,8 +56,11 @@ _AGY_FORBIDDEN_CREDENTIAL_ENV_VARS = {
     "GOOGLE_APPLICATION_CREDENTIALS",
     "GOOGLE_CLOUD_PROJECT",
     "GOOGLE_CLOUD_QUOTA_PROJECT",
+    "SSH_AGENT_PID",
+    "SSH_AUTH_SOCK",
     "VERTEX_AI_API_KEY",
 }
+_AGY_FORBIDDEN_CREDENTIAL_ENV_PREFIXES = ("AWS_",)
 
 logger = logging.getLogger(__name__)
 
@@ -1263,8 +1266,22 @@ class AgyCLIClient:
         # credentials such as AWS and Claude Code OAuth. Agy consumes an
         # untrusted transcript and may invoke internal tools even in sandboxed
         # plan mode, so its child gets a stricter, adapter-local boundary.
-        for key in _AGY_FORBIDDEN_CREDENTIAL_ENV_VARS:
+        forbidden_keys = sorted(
+            key
+            for key in env
+            if key in _AGY_FORBIDDEN_CREDENTIAL_ENV_VARS
+            or key.startswith(_AGY_FORBIDDEN_CREDENTIAL_ENV_PREFIXES)
+        )
+        for key in forbidden_keys:
             env.pop(key, None)
+        # Blocking inherited AWS variables is not enough on hosts where the SDK
+        # can discover an instance role directly through EC2 metadata.
+        env["AWS_EC2_METADATA_DISABLED"] = "true"
+        if forbidden_keys:
+            logger.debug(
+                "[FIX:agy-env-boundary] stripped credential environment keys=%s",
+                forbidden_keys,
+            )
         env["NO_COLOR"] = "1"
         env["TERM"] = env.get("TERM") or "dumb"
         return env

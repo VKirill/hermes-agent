@@ -8813,7 +8813,7 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
         # OAuth/account provider plugin and its card shows the right state.
         raw = hauth.get_auth_status(provider_id)
         if isinstance(raw, dict) and "logged_in" in raw:
-            return {
+            status = {
                 "logged_in": bool(raw.get("logged_in")),
                 "source": raw.get("source") or raw.get("provider") or provider_id,
                 "source_label": (
@@ -8830,6 +8830,19 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
                 "expires_at": raw.get("expires_at") or raw.get("access_expires_at"),
                 "has_refresh_token": bool(raw.get("has_refresh_token")),
             }
+            for key in ("available", "auth_verified", "status_basis"):
+                if key in raw:
+                    status[key] = raw[key]
+            _log.debug(
+                "[FIX:external-process-status] provider=%s structured_fields=%s",
+                provider_id,
+                sorted(
+                    key
+                    for key in ("available", "auth_verified", "status_basis")
+                    if key in raw
+                ),
+            )
+            return status
     except Exception as e:
         return {"logged_in": False, "error": str(e)}
     return {"logged_in": False}
