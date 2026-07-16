@@ -1,3 +1,4 @@
+import asyncio
 import json
 import stat
 import sys
@@ -7,7 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from agent.agy_cli_client import AgyCLIClient, _format_messages_as_prompt
+from agent.agy_cli_client import (
+    AgyCLIClient,
+    AsyncAgyCLIClient,
+    _format_messages_as_prompt,
+)
 
 
 def _write_fake_agy(tmp_path: Path, body: str) -> Path:
@@ -134,6 +139,33 @@ print(json.dumps({
     assert marker not in " ".join(payload["argv"])
     assert payload["prompt_mode"] == 0o600
     assert not Path(payload["prompt_path"]).exists()
+
+
+def test_agy_client_runtime_cleanup_recovers_from_prompt_unlink_failure(
+    monkeypatch, tmp_path
+):
+    script = _write_fake_agy(tmp_path, 'print("DONE")')
+    client = AgyCLIClient(
+        command=sys.executable,
+        args=[str(script)],
+        agy_config=_config(tmp_path, dedupe_ttl_seconds=0),
+    )
+    original_unlink = Path.unlink
+
+    def fail_prompt_unlink(path: Path, *args, **kwargs):
+        if path.name.startswith("prompt-"):
+            raise OSError("simulated prompt cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_prompt_unlink)
+
+    response = client.chat.completions.create(
+        model="Gemini 3.5 Flash (Low)",
+        messages=[{"role": "user", "content": "cleanup"}],
+    )
+
+    assert response.choices[0].message.content == "DONE"
+    assert list(client._workspaces_dir.iterdir()) == []
 
 
 def test_agy_client_retries_nonzero_exit_within_budget(tmp_path):
@@ -359,6 +391,104 @@ print("LATE")
         statuses = [row[0] for row in conn.execute("SELECT status FROM requests")]
     assert "running" not in statuses
     assert not list(client._workspaces_dir.rglob("prompt-*.txt"))
+
+
+def test_async_agy_cancellation_stops_child_before_side_effect(tmp_path):
+    started = tmp_path / "async-started"
+    side_effect = tmp_path / "async-side-effect"
+    script = _write_fake_agy(
+        tmp_path,
+        f"""
+from pathlib import Path
+import time
+Path({str(started)!r}).write_text("started")
+time.sleep(0.8)
+Path({str(side_effect)!r}).write_text("should-not-exist")
+print("LATE")
+""",
+    )
+    sync_client = AgyCLIClient(
+        command=sys.executable,
+        args=[str(script)],
+        agy_config=_config(tmp_path, dedupe_ttl_seconds=0),
+    )
+    client = AsyncAgyCLIClient(sync_client)
+
+    async def cancel_request() -> None:
+        task = asyncio.create_task(
+            client.chat.completions.create(
+                model="Gemini 3.5 Flash (Low)",
+                messages=[{"role": "user", "content": "cancel-me"}],
+            )
+        )
+        deadline = asyncio.get_running_loop().time() + 2
+        while not started.exists() and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        assert started.exists()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_request())
+    time.sleep(0.9)
+
+    assert not side_effect.exists()
+    with sync_client._connect_state() as conn:
+        statuses = [row[0] for row in conn.execute("SELECT status FROM requests")]
+    assert "running" not in statuses
+
+
+def test_agy_close_stops_every_parallel_child(tmp_path):
+    started_dir = tmp_path / "parallel-started"
+    side_effect_dir = tmp_path / "parallel-side-effects"
+    started_dir.mkdir()
+    side_effect_dir.mkdir()
+    script = _write_fake_agy(
+        tmp_path,
+        f"""
+from pathlib import Path
+import sys
+import time
+prompt_ref = sys.argv[sys.argv.index("-p") + 1]
+prompt = Path(prompt_ref[1:]).read_text()
+name = "one" if "parallel-one" in prompt else "two"
+Path({str(started_dir)!r}, name).write_text("started")
+time.sleep(0.8)
+Path({str(side_effect_dir)!r}, name).write_text("should-not-exist")
+print(name)
+""",
+    )
+    client = AgyCLIClient(
+        command=sys.executable,
+        args=[str(script)],
+        agy_config=_config(tmp_path, max_parallel=2, dedupe_ttl_seconds=0),
+    )
+    errors: list[Exception] = []
+
+    def run(name: str) -> None:
+        try:
+            client.chat.completions.create(
+                model="Gemini 3.5 Flash (Low)",
+                messages=[{"role": "user", "content": f"parallel-{name}"}],
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(name,)) for name in ("one", "two")]
+    for thread in threads:
+        thread.start()
+    deadline = time.monotonic() + 2
+    while len(list(started_dir.iterdir())) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert len(list(started_dir.iterdir())) == 2
+
+    client.close()
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(errors) == 2
+    assert list(side_effect_dir.iterdir()) == []
 
 
 def test_agy_clients_share_a_cross_process_concurrency_limit(tmp_path):
@@ -636,13 +766,41 @@ def test_agy_client_garbage_collects_stale_and_excess_workspaces(tmp_path):
         __import__("os").utime(workspace, (now - index, now - index))
     newest.mkdir()
     __import__("os").utime(newest, (now + 1, now + 1))
+    with client._connect_state() as conn:
+        conn.execute(
+            "INSERT INTO requests(request_id, status, started_at, finished_at) "
+            "VALUES (?, 'running', ?, NULL)",
+            (newest.name, now),
+        )
 
     AgyCLIClient(agy_config=config)
 
     retained = list(workspaces.iterdir())
     assert stale not in retained
     assert newest in retained
-    assert len(retained) <= 8
+    assert retained == [newest]
+
+
+def test_agy_client_bounds_workspaces_during_live_client_requests(tmp_path):
+    script = _write_fake_agy(tmp_path, 'print("DONE")')
+    client = AgyCLIClient(
+        command=sys.executable,
+        args=[str(script)],
+        agy_config=_config(
+            tmp_path,
+            max_state_rows=8,
+            dedupe_ttl_seconds=0,
+        ),
+    )
+
+    for index in range(20):
+        response = client.chat.completions.create(
+            model="Gemini 3.5 Flash (Low)",
+            messages=[{"role": "user", "content": f"unique-{index}"}],
+        )
+        assert response.choices[0].message.content == "DONE"
+
+    assert len(list(client._workspaces_dir.iterdir())) <= 8
 
 
 def test_agy_default_state_is_scoped_to_hermes_profile(monkeypatch, tmp_path):

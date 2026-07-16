@@ -608,7 +608,27 @@ class _AsyncAgyCompletionsNamespace:
         self._client = client
 
     async def create(self, **kwargs: Any) -> Any:
-        return await asyncio.to_thread(self._client._create_chat_completion, **kwargs)
+        cancellation_event = threading.Event()
+        worker = asyncio.create_task(
+            asyncio.to_thread(
+                self._client._create_chat_completion,
+                _cancellation_event=cancellation_event,
+                **kwargs,
+            )
+        )
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            logger.debug("[FIX:agy-cancel] cancelling async agy request")
+            cancellation_event.set()
+            await asyncio.to_thread(
+                self._client._cancel_active_process, cancellation_event
+            )
+            # The thread must observe the terminated child and release its
+            # SQLite lease/workspace before cancellation reaches the caller.
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await asyncio.shield(worker)
+            raise
 
 
 class _AsyncAgyChatNamespace:
@@ -711,7 +731,9 @@ class AgyCLIClient:
         self.chat = _AgyChatNamespace(self)
         self.is_closed = False
         self._active_process_lock = threading.Lock()
-        self._active_process: subprocess.Popen[bytes] | None = None
+        self._active_processes: dict[
+            subprocess.Popen[bytes], threading.Event | None
+        ] = {}
 
     def _ensure_state_dirs(self) -> None:
         for path in (self._state_dir, self._workspaces_dir, self._logs_dir):
@@ -719,12 +741,27 @@ class AgyCLIClient:
             _ensure_secure_directory(path)
 
     def close(self) -> None:
-        self.is_closed = True
         with self._active_process_lock:
-            proc = self._active_process
-        if proc is None or proc.poll() is not None:
+            self.is_closed = True
+            processes = list(self._active_processes)
+        if not processes:
             return
-        logger.debug("[FIX:agy-backend] terminating active child pid=%s", proc.pid)
+        logger.debug(
+            "[FIX:agy-backend] terminating %d active child process(es)",
+            len(processes),
+        )
+        for proc in processes:
+            self._stop_process(proc, reason="client close")
+
+    def _stop_process(
+        self, proc: subprocess.Popen[bytes], *, reason: str
+    ) -> None:
+        """Terminate, then kill and reap one managed child if necessary."""
+        if proc.poll() is not None:
+            return
+        logger.debug(
+            "[FIX:agy-cancel] terminating child pid=%s reason=%s", proc.pid, reason
+        )
         _terminate_process(proc)
         try:
             proc.wait(timeout=0.5)
@@ -734,23 +771,40 @@ class AgyCLIClient:
                 proc.wait(timeout=0.5)
             except subprocess.TimeoutExpired:
                 logger.warning(
-                    "[FIX:agy-backend] active child pid=%s did not exit after kill",
+                    "[FIX:agy-cancel] active child pid=%s did not exit after kill",
                     proc.pid,
                 )
 
-    def _set_active_process(self, proc: subprocess.Popen[bytes]) -> None:
-        with self._active_process_lock:
-            self._active_process = proc
-            closed = self.is_closed
-        if closed:
-            _terminate_process(proc)
-
-    def _clear_active_process(
-        self, proc: subprocess.Popen[bytes] | None = None
+    def _set_active_process(
+        self,
+        proc: subprocess.Popen[bytes],
+        cancellation_event: threading.Event | None = None,
     ) -> None:
         with self._active_process_lock:
-            if proc is None or self._active_process is proc:
-                self._active_process = None
+            self._active_processes[proc] = cancellation_event
+            should_stop = self.is_closed or bool(
+                cancellation_event is not None and cancellation_event.is_set()
+            )
+        if should_stop:
+            self._stop_process(proc, reason="request already cancelled")
+
+    def _clear_active_process(self, proc: subprocess.Popen[bytes] | None) -> None:
+        if proc is None:
+            return
+        with self._active_process_lock:
+            self._active_processes.pop(proc, None)
+
+    def _cancel_active_process(self, cancellation_event: threading.Event) -> None:
+        """Stop only the child owned by one cancelled async request."""
+        cancellation_event.set()
+        with self._active_process_lock:
+            processes = [
+                proc
+                for proc, owner in self._active_processes.items()
+                if owner is cancellation_event
+            ]
+        for proc in processes:
+            self._stop_process(proc, reason="async request cancelled")
 
     def _connect_state(self) -> sqlite3.Connection:
         self._ensure_state_dirs()
@@ -799,17 +853,11 @@ class AgyCLIClient:
                 """
             )
             self._cleanup_state_rows(conn)
-            running_request_ids = {
-                str(row[0])
-                for row in conn.execute(
-                    "SELECT request_id FROM requests WHERE status = 'running'"
-                ).fetchall()
-            }
         fd = _open_secure_file(self._db_path, os.O_RDWR)
         os.close(fd)
         self._enforce_db_size()
         self._cleanup_logs()
-        self._cleanup_workspaces(running_request_ids)
+        self._cleanup_workspaces()
 
     def _cleanup_state_rows(self, conn: sqlite3.Connection) -> None:
         now = time.time()
@@ -885,27 +933,50 @@ class AgyCLIClient:
             for _, path in retained[self._max_state_rows :]:
                 path.unlink()
 
-    def _cleanup_workspaces(self, running_request_ids: set[str]) -> None:
-        """Bound private request workspaces without touching active requests."""
-        cutoff = time.time() - self._state_ttl_seconds
-        retained: list[tuple[float, Path]] = []
-        for path in self._workspaces_dir.iterdir():
-            info = os.lstat(path)
-            if stat.S_ISLNK(info.st_mode):
-                raise PermissionError(f"agy workspace path contains a symlink: {path}")
-            if not stat.S_ISDIR(info.st_mode):
-                continue
-            if hasattr(os, "getuid") and info.st_uid != os.getuid():
-                raise PermissionError(f"agy workspace is not owned by this user: {path}")
-            if path.name in running_request_ids:
-                continue
-            if info.st_mtime < cutoff:
-                shutil.rmtree(path)
-            else:
-                retained.append((info.st_mtime, path))
-        retained.sort(reverse=True)
-        for _, path in retained[self._max_state_rows :]:
-            shutil.rmtree(path)
+    def _cleanup_workspaces(self) -> None:
+        """Remove completed request workspaces without touching active requests."""
+        # Hold the same write lock used by slot acquisition while taking the
+        # running-request snapshot and deleting. A new request therefore
+        # cannot acquire a lease and create a workspace between those steps.
+        with self._connect_state() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            running_request_ids = {
+                str(row[0])
+                for row in conn.execute(
+                    "SELECT request_id FROM requests WHERE status = 'running'"
+                ).fetchall()
+            }
+            for path in self._workspaces_dir.iterdir():
+                try:
+                    info = os.lstat(path)
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(info.st_mode):
+                    raise PermissionError(
+                        f"agy workspace path contains a symlink: {path}"
+                    )
+                if not stat.S_ISDIR(info.st_mode):
+                    continue
+                if hasattr(os, "getuid") and info.st_uid != os.getuid():
+                    raise PermissionError(
+                        f"agy workspace is not owned by this user: {path}"
+                    )
+                if path.name in running_request_ids:
+                    continue
+                try:
+                    shutil.rmtree(path)
+                except FileNotFoundError:
+                    continue
+            conn.commit()
+
+    def _cleanup_runtime_workspaces(self) -> None:
+        """Best-effort runtime cleanup that cannot mask request results."""
+        try:
+            self._cleanup_workspaces()
+        except (OSError, sqlite3.Error) as exc:
+            logger.warning(
+                "[FIX:agy-workspace-cleanup] runtime cleanup failed: %s", exc
+            )
 
     def _request_id(self, *, model: str, prompt: str) -> str:
         material = json.dumps(
@@ -937,7 +1008,11 @@ class AgyCLIClient:
             ).fetchone()
         return str(row[0]) if row and row[0] is not None else None
 
-    def _acquire_slot(self, request_id: str) -> tuple[str, str | None]:
+    def _acquire_slot(
+        self,
+        request_id: str,
+        cancellation_event: threading.Event | None = None,
+    ) -> tuple[str, str | None]:
         deadline = time.monotonic() + self._queue_timeout_seconds
         stale_after = (
             self._timeout_seconds * (self._retry_budget + 1)
@@ -945,6 +1020,8 @@ class AgyCLIClient:
             + 30
         )
         while True:
+            if cancellation_event is not None and cancellation_event.is_set():
+                raise RuntimeError(f"agy request {request_id} was cancelled")
             now = time.time()
             with self._connect_state() as conn:
                 conn.execute("BEGIN IMMEDIATE")
@@ -1014,6 +1091,7 @@ class AgyCLIClient:
             self._cleanup_state_rows(conn)
         self._enforce_db_size()
         self._cleanup_logs()
+        self._cleanup_runtime_workspaces()
 
     def _store_failure(self, request_id: str, error: str, attempts: int) -> None:
         with self._connect_state() as conn:
@@ -1030,6 +1108,7 @@ class AgyCLIClient:
             self._cleanup_state_rows(conn)
         self._enforce_db_size()
         self._cleanup_logs()
+        self._cleanup_runtime_workspaces()
 
     def _log_path(self, request_id: str) -> Path:
         if not re.fullmatch(r"[a-f0-9]{24}", request_id):
@@ -1146,6 +1225,7 @@ class AgyCLIClient:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: Any = None,
         stream: bool = False,
+        _cancellation_event: threading.Event | None = None,
         **_: Any,
     ) -> Any:
         if self.is_closed:
@@ -1176,7 +1256,9 @@ class AgyCLIClient:
             )
             return iter(_completion_to_stream_chunks(response)) if stream else response
 
-        slot_status, slot_content = self._acquire_slot(request_id)
+        slot_status, slot_content = self._acquire_slot(
+            request_id, _cancellation_event
+        )
         if slot_status == "cached" and slot_content is not None:
             self._append_log(
                 request_id,
@@ -1198,6 +1280,10 @@ class AgyCLIClient:
         workspace = self._workspaces_dir / request_id
         _assert_contained(self._workspaces_dir, workspace)
         workspace = _ensure_secure_directory(workspace)
+        if _cancellation_event is not None and _cancellation_event.is_set():
+            message = f"agy request {request_id} was cancelled"
+            self._store_failure(request_id, message, 0)
+            raise RuntimeError(message)
         effective_timeout = self._timeout_seconds
         if (
             isinstance(timeout, (int, float))
@@ -1208,6 +1294,10 @@ class AgyCLIClient:
         stdout = ""
         attempt_number = 0
         for attempt in range(self._retry_budget + 1):
+            if _cancellation_event is not None and _cancellation_event.is_set():
+                message = f"agy request {request_id} was cancelled"
+                self._store_failure(request_id, message, attempt_number)
+                raise RuntimeError(message)
             attempt_number = attempt + 1
             self._append_log(
                 request_id,
@@ -1224,6 +1314,13 @@ class AgyCLIClient:
             )
             started = time.monotonic()
             prompt_path: Path | None = None
+            active_process: subprocess.Popen[bytes] | None = None
+
+            def register_process(proc: subprocess.Popen[bytes]) -> None:
+                nonlocal active_process
+                active_process = proc
+                self._set_active_process(proc, _cancellation_event)
+
             try:
                 prompt_path = _write_private_prompt_file(workspace, prompt)
                 argv = [
@@ -1247,7 +1344,7 @@ class AgyCLIClient:
                     timeout=effective_timeout,
                     stdout_limit=self._max_output_bytes,
                     stderr_limit=self._max_log_bytes,
-                    process_started=self._set_active_process,
+                    process_started=register_process,
                 )
             except subprocess.TimeoutExpired as exc:
                 elapsed = time.monotonic() - started
@@ -1282,7 +1379,7 @@ class AgyCLIClient:
                 self._store_failure(request_id, message, attempt_number)
                 raise RuntimeError(message) from exc
             finally:
-                self._clear_active_process()
+                self._clear_active_process(active_process)
                 if prompt_path is not None:
                     try:
                         prompt_path.unlink(missing_ok=True)
@@ -1292,6 +1389,11 @@ class AgyCLIClient:
                             prompt_path,
                             exc,
                         )
+
+            if _cancellation_event is not None and _cancellation_event.is_set():
+                message = f"agy request {request_id} was cancelled"
+                self._store_failure(request_id, message, attempt_number)
+                raise RuntimeError(message)
 
             if self.is_closed:
                 message = f"agy request {request_id} cancelled because client closed"
