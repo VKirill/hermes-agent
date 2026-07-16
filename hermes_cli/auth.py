@@ -6326,15 +6326,22 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
         base_url = pconfig.inference_base_url
 
     resolved_command = shutil.which(command) if command else None
+    process_available = bool(resolved_command or base_url.startswith("acp+tcp://"))
     return {
-        "configured": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        "configured": process_available,
+        "available": process_available,
         "provider": provider_id,
         "name": pconfig.name,
         "command": command,
         "args": args,
         "resolved_command": resolved_command,
         "base_url": base_url,
-        "logged_in": bool(resolved_command or base_url.startswith("acp+tcp://")),
+        # Compatibility field for existing pickers. This is structural process
+        # availability, not proof that the subprocess's private auth session is
+        # ready; callers that need that distinction must inspect the fields below.
+        "logged_in": process_available,
+        "auth_verified": False,
+        "status_basis": "process_available",
     }
 
 

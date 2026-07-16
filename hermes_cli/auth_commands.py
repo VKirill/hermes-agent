@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import sys
@@ -33,6 +34,9 @@ import hermes_cli.auth as auth_mod
 from hermes_cli.auth import PROVIDER_REGISTRY
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.secret_prompt import masked_secret_prompt
+
+
+logger = logging.getLogger(__name__)
 
 
 # Providers that support OAuth login in addition to API keys.
@@ -86,7 +90,8 @@ def _normalize_provider(provider: str) -> str:
     custom_key = _resolve_custom_provider_input(normalized)
     if custom_key:
         return custom_key
-    return normalized
+    pconfig = PROVIDER_REGISTRY.get(normalized)
+    return pconfig.id if pconfig else normalized
 
 
 def _provider_base_url(provider: str) -> str:
@@ -167,6 +172,20 @@ def auth_add_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", ""))
     if provider not in PROVIDER_REGISTRY and provider != "openrouter" and not provider.startswith(CUSTOM_POOL_PREFIX):
         raise SystemExit(f"Unknown provider: {provider}")
+
+    pconfig = PROVIDER_REGISTRY.get(provider)
+    if pconfig and pconfig.auth_type == "external_process":
+        status = auth_mod.get_external_process_provider_status(provider)
+        command = str(status.get("command") or provider).strip() or provider
+        logger.debug(
+            "[FIX] rejected credential mutation for external-process provider=%s command=%s",
+            provider,
+            command,
+        )
+        raise SystemExit(
+            f"{pconfig.name} manages authentication outside Hermes; run `{command}` "
+            "to install or authenticate it. No Hermes credential was stored."
+        )
 
     requested_type = str(getattr(args, "auth_type", "") or "").strip().lower()
     if requested_type in {AUTH_TYPE_API_KEY, "api-key"}:

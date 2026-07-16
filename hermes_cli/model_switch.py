@@ -1975,6 +1975,37 @@ def list_authenticated_providers(
         if not _cp_has_creds and _cp_config and getattr(_cp_config, "auth_type", "") == "aws_sdk":
             _cp_has_creds = _has_aws_sdk_creds_for_listing(_cp.slug)
 
+        # External-process providers are keyless: availability comes from the
+        # canonical auth-status dispatcher (usually a configured executable),
+        # not env vars or credential-pool entries. Without this branch they
+        # degrade to empty unauthenticated canonical skeletons in both TUI and
+        # Desktop model payloads even while the process is usable.
+        if (
+            not _cp_has_creds
+            and _cp_config
+            and getattr(_cp_config, "auth_type", "") == "external_process"
+        ):
+            try:
+                from hermes_cli.auth import get_auth_status as _get_auth_status  # type: ignore[import-not-found]
+
+                _process_status = _get_auth_status(_cp.slug) or {}
+                _cp_has_creds = bool(
+                    _process_status.get("configured")
+                    or _process_status.get("logged_in")
+                )
+                logger.debug(
+                    "[FIX] external-process inventory provider=%s available=%s basis=%s",
+                    _cp.slug,
+                    _cp_has_creds,
+                    _process_status.get("status_basis", "legacy"),
+                )
+            except Exception:
+                logger.debug(
+                    "[FIX] external-process inventory status failed provider=%s",
+                    _cp.slug,
+                    exc_info=True,
+                )
+
         if not _cp_has_creds:
             continue
 

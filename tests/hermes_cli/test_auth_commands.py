@@ -94,6 +94,25 @@ def test_auth_add_api_key_persists_manual_entry(tmp_path, monkeypatch):
     assert entry["access_token"] == "sk-or-manual"
 
 
+def test_auth_add_agy_fails_fast_without_credential_mutation(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "providers": {}})
+    before = (tmp_path / "hermes" / "auth.json").read_text()
+
+    from hermes_cli.auth_commands import auth_add_command
+
+    class _Args:
+        provider = "agy"
+        auth_type = None
+        api_key = None
+        label = None
+
+    with pytest.raises(SystemExit, match=r"run `agy`"):
+        auth_add_command(_Args())
+
+    assert (tmp_path / "hermes" / "auth.json").read_text() == before
+
+
 def test_auth_add_anthropic_oauth_persists_pool_entry(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)

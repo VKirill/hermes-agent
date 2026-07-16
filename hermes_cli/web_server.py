@@ -8909,11 +8909,17 @@ def _build_oauth_catalog() -> list[Dict[str, Any]]:
             if d.tab != "accounts" or d.slug in seen:
                 continue
             seen.add(d.slug)
+            cli_command = "agy" if d.slug == "agy" else f"hermes auth add {d.slug}"
+            _log.debug(
+                "[FIX] external account card provider=%s command=%s",
+                d.slug,
+                cli_command,
+            )
             rows.append({
                 "id": d.slug,
                 "name": d.label,
                 "flow": "external",
-                "cli_command": f"hermes auth add {d.slug}",
+                "cli_command": cli_command,
                 "docs_url": d.signup_url or "",
                 "status_fn": None,
             })

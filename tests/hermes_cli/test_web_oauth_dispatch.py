@@ -809,3 +809,13 @@ def test_status_unknown_provider_degrades_to_logged_out():
     with patch("hermes_cli.auth.get_auth_status", return_value={"logged_in": False}):
         out = ws._resolve_provider_status("totally-unknown", None)
     assert out["logged_in"] is False
+
+
+def test_agy_account_card_launches_external_cli_not_api_key_flow():
+    from hermes_cli import web_server as ws
+
+    agy = next(row for row in ws._build_oauth_catalog() if row["id"] == "agy")
+
+    assert agy["flow"] == "external"
+    assert agy["cli_command"] == "agy"
+    assert "hermes auth add" not in agy["cli_command"]

@@ -1301,6 +1301,30 @@ _PROVIDER_ALIASES = {
     "ollama_cloud": "ollama-cloud",
 }
 
+# Provider plugins own their aliases. Mirror those declarations into the
+# model-switch parser instead of requiring every new profile to also edit this
+# legacy table. Static entries above remain authoritative for compatibility;
+# plugin aliases only fill missing keys.
+try:
+    import logging as _logging
+    from providers import list_providers as _list_alias_profiles  # type: ignore[attr-defined]
+
+    _profile_aliases_added = 0
+    for _profile in _list_alias_profiles():
+        for _alias in _profile.aliases or ():
+            _normalized_alias = str(_alias or "").strip().lower()
+            if _normalized_alias and _normalized_alias not in _PROVIDER_ALIASES:
+                _PROVIDER_ALIASES[_normalized_alias] = _profile.name
+                _profile_aliases_added += 1
+    _logging.getLogger(__name__).debug(
+        "[FIX] synchronized provider profile aliases count=%d",
+        _profile_aliases_added,
+    )
+except Exception:
+    # Keep the static alias map usable in minimal/partial installations where
+    # provider plugin discovery is unavailable.
+    pass
+
 
 # In-repo fallback for the model Hermes silently lands on when the user never
 # picked one (GUI onboarding confirm card, empty ``model.default``,
