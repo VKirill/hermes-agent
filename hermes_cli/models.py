@@ -1066,6 +1066,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("nvidia",         "NVIDIA NIM",               "NVIDIA NIM (Nemotron models via build.nvidia.com or local NIM)"),
     ProviderEntry("copilot",        "GitHub Copilot",           "GitHub Copilot (Uses GITHUB_TOKEN or gh auth token)"),
     ProviderEntry("copilot-acp",    "GitHub Copilot ACP",       "GitHub Copilot ACP (Spawns copilot --acp --stdio)"),
+    ProviderEntry("agy",            "Antigravity CLI",          "Antigravity CLI (Uses the authenticated local agy process)"),
     ProviderEntry("huggingface",    "Hugging Face",             "Hugging Face Inference Providers"),
     ProviderEntry("gemini",         "Google AI Studio",         "Google AI Studio (Native Gemini API)"),
     ProviderEntry("vertex",         "Google Vertex AI",         "Google Vertex AI (Gemini via GCP; OAuth2 service account or ADC, GCP billing/quotas)"),
@@ -2593,9 +2594,10 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                                 merged_lower.add(m.lower())
                         return merged
                     return live
-            # Use profile's fallback_models if defined
-            if _p.fallback_models:
-                return list(_p.fallback_models)
+        # Non-HTTP profiles (for example external-process providers) can still
+        # publish a curated list even though they have no /models endpoint.
+        if _p and _p.fallback_models:
+            return list(_p.fallback_models)
     except Exception:
         pass
 

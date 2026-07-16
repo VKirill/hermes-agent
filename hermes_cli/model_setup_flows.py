@@ -21,10 +21,13 @@ call time, when main.py is fully loaded) so this module never imports
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import subprocess
 
 from hermes_cli.config import clear_model_endpoint_credentials
+
+logger = logging.getLogger(__name__)
 
 
 # AWS cross-region inference profile prefixes. Any geo-prefixed profile only
@@ -1924,6 +1927,80 @@ def _model_flow_copilot_acp(config, current_model=""):
     deactivate_provider()
 
     print(f"Default model set to: {selected} (via {pconfig.name})")
+
+
+def _model_flow_agy(config, current_model=""):
+    """Antigravity CLI flow using its managed local authentication."""
+    from hermes_cli.auth import (
+        PROVIDER_REGISTRY,
+        _prompt_model_selection,
+        _save_model_choice,
+        deactivate_provider,
+        get_external_process_provider_status,
+        resolve_external_process_provider_credentials,
+    )
+    from hermes_cli.config import load_config, save_config
+    from hermes_cli.models import provider_model_ids
+
+    del config
+
+    provider_id = "agy"
+    pconfig = PROVIDER_REGISTRY[provider_id]
+    status = get_external_process_provider_status(provider_id)
+    resolved_command = status.get("resolved_command") or status.get("command") or "agy"
+    effective_base = status.get("base_url") or pconfig.inference_base_url
+    logger.debug(
+        "[FIX:agy-provider-picker] flow start command=%s base_url=%s",
+        resolved_command,
+        effective_base,
+    )
+
+    print("  Antigravity CLI delegates Hermes turns to the local `agy` process.")
+    print("  Authentication remains managed by agy; no Google API key is used.")
+    print(f"  Command: {resolved_command}")
+    print(f"  Backend marker: {effective_base}")
+    print()
+
+    try:
+        creds = resolve_external_process_provider_credentials(provider_id)
+    except Exception as exc:
+        logger.debug(
+            "[FIX:agy-provider-picker] external process resolution failed",
+            exc_info=True,
+        )
+        print(f"  ⚠ {exc}")
+        print("  Install and authenticate agy, or set agy.command in config.yaml.")
+        return
+
+    effective_base = creds.get("base_url") or effective_base
+    selected = _prompt_model_selection(
+        provider_model_ids(provider_id),
+        current_model=current_model,
+    )
+    if not selected:
+        print("No change.")
+        return
+
+    _save_model_choice(selected)
+    cfg = load_config()
+    model = cfg.get("model")
+    if not isinstance(model, dict):
+        model = {"default": model} if model else {}
+        cfg["model"] = model
+    model["provider"] = provider_id
+    model["base_url"] = effective_base
+    model["api_mode"] = "chat_completions"
+    clear_model_endpoint_credentials(model, clear_api_mode=False)
+    save_config(cfg)
+    deactivate_provider()
+    logger.debug(
+        "[FIX:agy-provider-picker] saved provider=%s model=%s base_url=%s",
+        provider_id,
+        selected,
+        effective_base,
+    )
+    print(f"Default model set to: {selected} (via {pconfig.name})")
+
 
 def _model_flow_kimi(config, current_model=""):
     """Kimi / Moonshot model selection with automatic endpoint routing.

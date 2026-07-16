@@ -6305,6 +6305,7 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
+    provider_id = pconfig.id
 
     if provider_id == "agy":
         from hermes_cli.config import load_config
@@ -6538,6 +6539,7 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             provider=provider_id,
             code="invalid_provider",
         )
+    provider_id = pconfig.id
 
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
