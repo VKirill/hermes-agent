@@ -1,6 +1,7 @@
 import asyncio
 import json
 import stat
+import subprocess
 import sys
 import threading
 import time
@@ -8,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import agent.agy_cli_client as agy_client_module
 from agent.agy_cli_client import (
     AgyCLIClient,
     AsyncAgyCLIClient,
@@ -517,6 +519,106 @@ print("LATE")
     assert not list(client._workspaces_dir.rglob("prompt-*.txt"))
 
 
+def test_agy_close_fences_queued_spawn_before_process_registration(
+    monkeypatch, tmp_path
+):
+    first_started = tmp_path / "first-started"
+    queued_side_effect = tmp_path / "queued-side-effect"
+    script = _write_fake_agy(
+        tmp_path,
+        f"""
+from pathlib import Path
+import sys
+import time
+prompt_ref = sys.argv[sys.argv.index("-p") + 1]
+prompt = Path(prompt_ref[1:]).read_text()
+if "hold-slot" in prompt:
+    Path({str(first_started)!r}).write_text("started")
+    time.sleep(5)
+else:
+    Path({str(queued_side_effect)!r}).write_text("should-not-exist")
+    print("QUEUED")
+""",
+    )
+    client = AgyCLIClient(
+        command=sys.executable,
+        args=[str(script)],
+        agy_config=_config(tmp_path, dedupe_ttl_seconds=0),
+    )
+    queued_waiting = threading.Event()
+    queued_spawned = threading.Event()
+    release_queued_popen = threading.Event()
+    acquire_calls = 0
+    popen_calls = 0
+    calls_lock = threading.Lock()
+    original_acquire_slot = client._acquire_slot
+    original_popen = subprocess.Popen
+
+    def tracked_acquire_slot(request_id, cancellation_event=None):
+        nonlocal acquire_calls
+        with calls_lock:
+            acquire_calls += 1
+            call_number = acquire_calls
+        if call_number == 2:
+            queued_waiting.set()
+        return original_acquire_slot(request_id, cancellation_event)
+
+    def fenced_popen(*args, **kwargs):
+        nonlocal popen_calls
+        with calls_lock:
+            popen_calls += 1
+            call_number = popen_calls
+        proc = original_popen(*args, **kwargs)
+        if call_number == 2:
+            queued_spawned.set()
+            release_queued_popen.wait(timeout=5)
+        return proc
+
+    monkeypatch.setattr(client, "_acquire_slot", tracked_acquire_slot)
+    monkeypatch.setattr("agent.agy_cli_client.subprocess.Popen", fenced_popen)
+    errors: list[Exception] = []
+
+    def run(prompt: str) -> None:
+        try:
+            client.chat.completions.create(
+                model="Gemini 3.5 Flash (Low)",
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    def wait_for_path(path: Path) -> bool:
+        deadline = time.monotonic() + 2
+        while not path.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return path.exists()
+
+    first = threading.Thread(target=run, args=("hold-slot",))
+    queued = threading.Thread(target=run, args=("queued",))
+    first.start()
+    assert wait_for_path(first_started)
+    queued.start()
+    assert queued_waiting.wait(timeout=2)
+
+    try:
+        client.close()
+        queued.join(timeout=1)
+        spawned_after_close = queued_spawned.is_set()
+        if spawned_after_close:
+            assert wait_for_path(queued_side_effect)
+    finally:
+        release_queued_popen.set()
+        first.join(timeout=2)
+        queued.join(timeout=2)
+
+    assert spawned_after_close is False
+    assert not queued_side_effect.exists()
+    assert not first.is_alive()
+    assert not queued.is_alive()
+    assert len(errors) == 2
+    assert list(client._workspaces_dir.iterdir()) == []
+
+
 def test_async_agy_cancellation_stops_child_before_side_effect(tmp_path):
     started = tmp_path / "async-started"
     side_effect = tmp_path / "async-side-effect"
@@ -560,6 +662,135 @@ print("LATE")
     with sync_client._connect_state() as conn:
         statuses = [row[0] for row in conn.execute("SELECT status FROM requests")]
     assert "running" not in statuses
+
+
+def test_async_agy_cancellation_is_published_inside_process_start_fence(tmp_path):
+    sync_client = AgyCLIClient(
+        command=sys.executable,
+        args=[str(_write_fake_agy(tmp_path, 'print("UNREACHABLE")'))],
+        agy_config=_config(tmp_path, dedupe_ttl_seconds=0),
+    )
+    client = AsyncAgyCLIClient(sync_client)
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+    cancellation_event: threading.Event | None = None
+
+    def blocked_completion(*, _cancellation_event=None, **kwargs):
+        nonlocal cancellation_event
+        cancellation_event = _cancellation_event
+        worker_started.set()
+        assert release_worker.wait(timeout=2)
+        raise RuntimeError("cancelled worker released")
+
+    sync_client._create_chat_completion = blocked_completion
+
+    async def cancel_while_process_fence_is_held() -> None:
+        sync_client._active_process_lock.acquire()
+        task = asyncio.create_task(
+            client.chat.completions.create(
+                model="Gemini 3.5 Flash (Low)",
+                messages=[{"role": "user", "content": "cancel-before-spawn"}],
+            )
+        )
+        try:
+            assert await asyncio.to_thread(worker_started.wait, 2)
+            task.cancel()
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            assert cancellation_event is not None
+            assert cancellation_event.is_set() is False
+        finally:
+            sync_client._active_process_lock.release()
+            release_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel_while_process_fence_is_held())
+
+
+def test_async_agy_cancellation_wins_process_start_fence_before_popen(
+    monkeypatch, tmp_path
+):
+    side_effect = tmp_path / "cancelled-before-popen"
+    script = _write_fake_agy(
+        tmp_path,
+        f"""
+from pathlib import Path
+Path({str(side_effect)!r}).write_text("should-not-exist")
+print("UNREACHABLE")
+""",
+    )
+    sync_client = AgyCLIClient(
+        command=sys.executable,
+        args=[str(script)],
+        agy_config=_config(tmp_path, dedupe_ttl_seconds=0),
+    )
+    client = AsyncAgyCLIClient(sync_client)
+    process_start_waiting = threading.Event()
+    release_process_start = threading.Event()
+    cancellation_waiting = threading.Event()
+    cancellation_finished = threading.Event()
+    popen_called = threading.Event()
+    original_run_bounded_process = agy_client_module._run_bounded_process
+    original_cancel_active_process = sync_client._cancel_active_process
+    original_popen = subprocess.Popen
+
+    def blocked_run_bounded_process(*args, **kwargs):
+        process_start_waiting.set()
+        assert release_process_start.wait(timeout=2)
+        return original_run_bounded_process(*args, **kwargs)
+
+    def tracked_cancel_active_process(cancellation_event):
+        cancellation_waiting.set()
+        try:
+            return original_cancel_active_process(cancellation_event)
+        finally:
+            cancellation_finished.set()
+
+    def tracked_popen(*args, **kwargs):
+        popen_called.set()
+        return original_popen(*args, **kwargs)
+
+    monkeypatch.setattr(
+        agy_client_module, "_run_bounded_process", blocked_run_bounded_process
+    )
+    monkeypatch.setattr(
+        sync_client, "_cancel_active_process", tracked_cancel_active_process
+    )
+    monkeypatch.setattr(agy_client_module.subprocess, "Popen", tracked_popen)
+
+    async def cancel_before_process_start_fence() -> None:
+        lock_held = True
+        sync_client._active_process_lock.acquire()
+        task = asyncio.create_task(
+            client.chat.completions.create(
+                model="Gemini 3.5 Flash (Low)",
+                messages=[{"role": "user", "content": "cancel-before-popen"}],
+            )
+        )
+        try:
+            assert await asyncio.to_thread(process_start_waiting.wait, 2)
+            task.cancel()
+            assert await asyncio.to_thread(cancellation_waiting.wait, 2)
+            sync_client._active_process_lock.release()
+            lock_held = False
+            assert await asyncio.to_thread(cancellation_finished.wait, 2)
+            release_process_start.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            if lock_held:
+                sync_client._active_process_lock.release()
+            release_process_start.set()
+
+    asyncio.run(cancel_before_process_start_fence())
+
+    assert popen_called.is_set() is False
+    assert side_effect.exists() is False
+    with sync_client._connect_state() as conn:
+        statuses = [row[0] for row in conn.execute("SELECT status FROM requests")]
+    assert "running" not in statuses
+    assert list(sync_client._workspaces_dir.iterdir()) == []
 
 
 def test_agy_close_stops_every_parallel_child(tmp_path):

@@ -360,6 +360,10 @@ def _terminate_process(proc: subprocess.Popen[bytes], *, force: bool = False) ->
         pass
 
 
+class _AgyProcessStartAborted(RuntimeError):
+    """Raised when cancellation wins the atomic process-start fence."""
+
+
 def _run_bounded_process(
     argv: list[str],
     *,
@@ -368,7 +372,10 @@ def _run_bounded_process(
     timeout: int,
     stdout_limit: int,
     stderr_limit: int,
-    process_started: Callable[[subprocess.Popen[bytes]], None] | None = None,
+    process_start: Callable[
+        [Callable[[], subprocess.Popen[bytes]]], subprocess.Popen[bytes]
+    ]
+    | None = None,
 ) -> SimpleNamespace:
     """Run ``agy`` with bounded streaming pipe capture."""
     creationflags = 0
@@ -376,19 +383,20 @@ def _run_bounded_process(
         creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(
             subprocess, "CREATE_NO_WINDOW", 0
         )
-    proc = subprocess.Popen(
-        argv,
-        cwd=str(cwd),
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        shell=False,
-        start_new_session=os.name == "posix",
-        creationflags=creationflags,
-    )
-    if process_started is not None:
-        process_started(proc)
+    def spawn() -> subprocess.Popen[bytes]:
+        return subprocess.Popen(
+            argv,
+            cwd=str(cwd),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            start_new_session=os.name == "posix",
+            creationflags=creationflags,
+        )
+
+    proc = process_start(spawn) if process_start is not None else spawn()
     stdout_chunks: list[bytes] = []
     stderr_chunks: list[bytes] = []
     stdout_size = 0
@@ -701,7 +709,6 @@ class _AsyncAgyCompletionsNamespace:
             return await asyncio.shield(worker)
         except asyncio.CancelledError:
             logger.debug("[FIX:agy-cancel] cancelling async agy request")
-            cancellation_event.set()
             await asyncio.to_thread(
                 self._client._cancel_active_process, cancellation_event
             )
@@ -863,19 +870,6 @@ class AgyCLIClient:
                     proc.pid,
                 )
 
-    def _set_active_process(
-        self,
-        proc: subprocess.Popen[bytes],
-        cancellation_event: threading.Event | None = None,
-    ) -> None:
-        with self._active_process_lock:
-            self._active_processes[proc] = cancellation_event
-            should_stop = self.is_closed or bool(
-                cancellation_event is not None and cancellation_event.is_set()
-            )
-        if should_stop:
-            self._stop_process(proc, reason="request already cancelled")
-
     def _clear_active_process(self, proc: subprocess.Popen[bytes] | None) -> None:
         if proc is None:
             return
@@ -884,8 +878,12 @@ class AgyCLIClient:
 
     def _cancel_active_process(self, cancellation_event: threading.Event) -> None:
         """Stop only the child owned by one cancelled async request."""
-        cancellation_event.set()
         with self._active_process_lock:
+            # Publish cancellation under the same fence that protects the
+            # final cancellation check, Popen, and process registration.
+            # Whichever side acquires the fence first therefore completes its
+            # state transition before the other can observe a stale snapshot.
+            cancellation_event.set()
             processes = [
                 proc
                 for proc, owner in self._active_processes.items()
@@ -1422,10 +1420,25 @@ class AgyCLIClient:
             prompt_path: Path | None = None
             active_process: subprocess.Popen[bytes] | None = None
 
-            def register_process(proc: subprocess.Popen[bytes]) -> None:
+            def start_process(
+                spawn: Callable[[], subprocess.Popen[bytes]],
+            ) -> subprocess.Popen[bytes]:
                 nonlocal active_process
-                active_process = proc
-                self._set_active_process(proc, _cancellation_event)
+                with self._active_process_lock:
+                    if self.is_closed:
+                        raise _AgyProcessStartAborted(
+                            f"agy request {request_id} cancelled because client closed"
+                        )
+                    if (
+                        _cancellation_event is not None
+                        and _cancellation_event.is_set()
+                    ):
+                        raise _AgyProcessStartAborted(
+                            f"agy request {request_id} was cancelled"
+                        )
+                    active_process = spawn()
+                    self._active_processes[active_process] = _cancellation_event
+                    return active_process
 
             try:
                 _install_hermetic_agy_settings(self._agy_config_root)
@@ -1454,8 +1467,20 @@ class AgyCLIClient:
                     timeout=effective_timeout,
                     stdout_limit=self._max_output_bytes,
                     stderr_limit=self._max_log_bytes,
-                    process_started=register_process,
+                    process_start=start_process,
                 )
+            except _AgyProcessStartAborted as exc:
+                message = str(exc)
+                self._append_log(
+                    request_id,
+                    {
+                        "event": "failure",
+                        "kind": "cancelled",
+                        "attempt": attempt_number,
+                    },
+                )
+                self._store_failure(request_id, message, attempt_number)
+                raise RuntimeError(message) from exc
             except subprocess.TimeoutExpired as exc:
                 elapsed = time.monotonic() - started
                 self._append_log(
