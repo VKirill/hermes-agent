@@ -66,6 +66,7 @@ def test_agy_external_process_inventory_populates_shared_tui_desktop_payload(
     picker = list_picker_providers(current_provider="agy")
     payload = build_models_payload(
         ConfigContext("agy", "Gemini 3.5 Flash (Low)", "agy://local", {}, []),
+        explicit_only=True,
         include_unconfigured=True,
         picker_hints=True,
         canonical_order=True,
@@ -95,13 +96,14 @@ def test_agy_is_populated_in_tui_and_desktop_model_options(monkeypatch):
         lambda: {"agy": {"command": "agy"}},
     )
 
-    desktop = web_server.get_model_options(include_unconfigured=True)
+    desktop = web_server.get_model_options(explicit_only=True)
     tui = server._methods["model.options"](
         42, {"session_id": "", "include_unconfigured": True}
     )["result"]
 
     for payload in (desktop, tui):
         agy = next(row for row in payload["providers"] if row["slug"] == "agy")
+        assert agy["configured"] is True
         assert agy["authenticated"] is True
         assert "Gemini 3.5 Flash (Low)" in agy["models"]
 

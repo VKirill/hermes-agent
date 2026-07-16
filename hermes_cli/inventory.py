@@ -33,6 +33,7 @@ Substrate facts (verified May 2026):
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -399,6 +400,19 @@ def _filter_explicit_provider_rows(rows: list[dict], ctx: ConfigContext) -> list
             # DEFAULT_CONFIG preset does not make every desktop picker show MoA.
             if _raw_config_has_enabled_moa_preset():
                 kept.append(row)
+            continue
+        if row.get("configured") is True:
+            # Keyless external-process providers carry their canonical status
+            # from list_authenticated_providers(). They have no API key or
+            # auth-store entry for is_provider_explicitly_configured() to find,
+            # but a usable configured process belongs in Desktop's configured-
+            # only inventory just like an explicitly configured HTTP provider.
+            logging.getLogger(__name__).debug(
+                "[FIX:agy-provider-picker] keeping configured process provider=%s models=%d",
+                slug,
+                len(row.get("models") or []),
+            )
+            kept.append(row)
             continue
         if is_provider_explicitly_configured(slug):
             kept.append(row)

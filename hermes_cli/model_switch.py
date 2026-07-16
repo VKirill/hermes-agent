@@ -1950,6 +1950,7 @@ def list_authenticated_providers(
         # Check credentials via PROVIDER_REGISTRY (auth.py)
         _cp_config = _auth_registry.get(_cp.slug)
         _cp_has_creds = False
+        _cp_external_status: dict | None = None
         if _cp_config and _cp_config.api_key_env_vars:
             _cp_has_creds = any(os.environ.get(ev) for ev in _cp_config.api_key_env_vars)
         # Also check auth store and credential pool
@@ -1989,6 +1990,7 @@ def list_authenticated_providers(
                 from hermes_cli.auth import get_auth_status as _get_auth_status  # type: ignore[import-not-found]
 
                 _process_status = _get_auth_status(_cp.slug) or {}
+                _cp_external_status = _process_status
                 _cp_has_creds = bool(
                     _process_status.get("configured")
                     or _process_status.get("logged_in")
@@ -2025,7 +2027,7 @@ def list_authenticated_providers(
         _cp_total = len(_cp_model_ids)
         _cp_top = _cp_model_ids[:max_models] if max_models is not None else _cp_model_ids
 
-        results.append({
+        _cp_row = {
             "slug": _cp.slug,
             "name": _cp.label,
             "is_current": _cp.slug == current_provider,
@@ -2033,7 +2035,20 @@ def list_authenticated_providers(
             "models": _cp_top,
             "total_models": _cp_total,
             "source": "canonical",
-        })
+        }
+        if _cp_external_status is not None:
+            # Preserve the process provider's structural status on the row.
+            # Configured-only consumers cannot infer it from API keys or the
+            # auth store, and dropping it here makes the Desktop filter turn a
+            # usable keyless provider back into an unauthenticated skeleton.
+            _cp_row.update(
+                {
+                    "configured": bool(_cp_external_status.get("configured")),
+                    "auth_verified": bool(_cp_external_status.get("auth_verified")),
+                    "status_basis": _cp_external_status.get("status_basis", "legacy"),
+                }
+            )
+        results.append(_cp_row)
         seen_slugs.add(_cp.slug.lower())
         _record_builtin_endpoint(_cp.slug)
 
