@@ -1319,14 +1319,13 @@ def run_conversation(
                 # session instead of re-failing every retry.
                 if getattr(agent, "_disable_streaming", False):
                     _use_streaming = False
-                # CopilotACPClient communicates via subprocess stdio and
-                # returns a plain SimpleNamespace — not an iterable
-                # stream.  Mirror the ACP exclusion used for Responses
-                # API upgrade (lines ~1083-1085).
+                # Local external-process clients return a plain completion
+                # namespace rather than an iterable OpenAI token stream.
                 elif (
-                    agent.provider in {"copilot-acp"}
+                    agent.provider in {"copilot-acp", "agy"}
                     or str(agent.base_url or "").lower().startswith("acp://copilot")
                     or str(agent.base_url or "").lower().startswith("acp+tcp://")
+                    or str(agent.base_url or "").lower().startswith("agy://")
                 ):
                     _use_streaming = False
                 # MoA streams only when a display/TTS consumer is present to

@@ -1032,6 +1032,20 @@ def _ensure_hermes_home_managed(home: Path):
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
+    # Managed local Antigravity CLI backend. Authentication remains in agy's
+    # OS-managed session; Hermes never resolves a Gemini/Google API key here.
+    "agy": {
+        "command": "agy",
+        "timeout_seconds": 120,
+        "queue_timeout_seconds": 120,
+        "max_parallel": 1,
+        "retry_budget": 1,
+        "dedupe_ttl_seconds": 300,
+        "state_dir": "~/.cache/hermes/agy",
+        "sandbox": True,
+        "mode": "plan",
+        "max_log_bytes": 262144,
+    },
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],

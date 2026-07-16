@@ -986,7 +986,7 @@ def init_agent(
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
             if _provider_timeout is not None:
                 client_kwargs["timeout"] = _provider_timeout
-            if agent.provider == "copilot-acp":
+            if agent.provider in {"copilot-acp", "agy"}:
                 client_kwargs["command"] = agent.acp_command
                 client_kwargs["args"] = agent.acp_args
             effective_base = base_url
@@ -1211,6 +1211,13 @@ def init_agent(
     elif isinstance(fallback_model, dict) and fallback_model.get("provider") and fallback_model.get("model"):
         agent._fallback_chain = [fallback_model]
     else:
+        agent._fallback_chain = []
+    if agent.provider == "agy" and agent._fallback_chain:
+        logger.warning(
+            "[FIX:agy-backend] Ignoring %d configured fallback provider(s); "
+            "the agy route is fail-closed",
+            len(agent._fallback_chain),
+        )
         agent._fallback_chain = []
     agent._fallback_index = 0
     agent._fallback_activated = getattr(agent, "_fallback_activated", False)
@@ -1584,6 +1591,10 @@ def init_agent(
         _api_retries = max(_api_retries, 1)  # 1 = no retry (single attempt)
     except (TypeError, ValueError):
         _api_retries = 3
+    if agent.provider == "agy":
+        # AgyCLIClient owns retry policy via agy.retry_budget. Prevent the
+        # outer conversation loop from multiplying managed process attempts.
+        _api_retries = 1
     agent._api_max_retries = _api_retries
 
     # Initialize context compressor for automatic context management

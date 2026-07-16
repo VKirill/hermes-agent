@@ -4499,12 +4499,17 @@ def _resolve_runtime_with_fallback(
     ``fallback_model`` chain before giving up.
     """
     from hermes_cli.auth import AuthError
-    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_cli.runtime_provider import (
+        provider_requires_fail_closed,
+        resolve_runtime_provider,
+    )
 
     kwargs = resolve_kwargs or {}
     try:
         return resolve_runtime_provider(**kwargs)
     except AuthError as primary_exc:
+        if provider_requires_fail_closed(kwargs.get("requested"), error=primary_exc):
+            raise
         fb_chain = _load_fallback_model() or []
         for entry in fb_chain:
             if not isinstance(entry, dict):

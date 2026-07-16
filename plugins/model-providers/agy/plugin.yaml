@@ -1,0 +1,5 @@
+name: agy-provider
+kind: model-provider
+version: 1.0.0
+description: Antigravity CLI external-process backend without Gemini API keys
+author: Hermes Agent

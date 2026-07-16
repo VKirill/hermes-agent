@@ -1974,6 +1974,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
         format_runtime_provider_error,
+        provider_requires_fail_closed,
         _get_model_config,
     )
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
@@ -1981,6 +1982,9 @@ def _resolve_runtime_agent_kwargs() -> dict:
     try:
         runtime = resolve_runtime_provider()
     except AuthError as auth_exc:
+        if provider_requires_fail_closed(error=auth_exc):
+            logger.error("Primary provider failed closed: %s", auth_exc)
+            raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
         # Distinguish a transient rate-limit/quota cap (credentials are fine,
         # re-auth cannot help) from a genuine auth failure (expired/revoked
         # token). Both fall through to the fallback chain, but the log message

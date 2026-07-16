@@ -33,6 +33,7 @@ class CLIAgentSetupMixin:
         from hermes_cli.runtime_provider import (
             resolve_runtime_provider,
             format_runtime_provider_error,
+            provider_requires_fail_closed,
         )
 
         _primary_exc = None
@@ -49,7 +50,10 @@ class CLIAgentSetupMixin:
         # Primary provider auth failed — try fallback providers before giving up.
         if runtime is None and _primary_exc is not None:
             from hermes_cli.auth import AuthError
-            if isinstance(_primary_exc, AuthError):
+            if isinstance(_primary_exc, AuthError) and not provider_requires_fail_closed(
+                self.requested_provider,
+                error=_primary_exc,
+            ):
                 _fb_chain = self._fallback_model if isinstance(self._fallback_model, list) else []
                 for _fb in _fb_chain:
                     _fb_provider = (_fb.get("provider") or "").strip().lower()

@@ -3029,6 +3029,7 @@ def run_job(
         from hermes_cli.runtime_provider import (
             resolve_runtime_provider,
             format_runtime_provider_error,
+            provider_requires_fail_closed,
         )
         from hermes_cli.auth import AuthError
 
@@ -3053,6 +3054,9 @@ def run_job(
                 runtime_kwargs["explicit_base_url"] = job.get("base_url")
             runtime = resolve_runtime_provider(**runtime_kwargs)
         except AuthError as auth_exc:
+            if provider_requires_fail_closed(job.get("provider"), error=auth_exc):
+                logger.error("Job '%s': primary provider failed closed: %s", job_id, auth_exc)
+                raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
             # Primary provider auth failed — try fallback chain before giving up.
             logger.warning("Job '%s': primary auth failed (%s), trying fallback", job_id, auth_exc)
             fb_list = get_fallback_chain(_cfg)

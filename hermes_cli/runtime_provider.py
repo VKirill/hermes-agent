@@ -46,6 +46,30 @@ from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_int
 
 
+def provider_requires_fail_closed(
+    provider: str | None = None,
+    *,
+    error: Exception | None = None,
+) -> bool:
+    """Return whether a provider failure must not activate fallbacks.
+
+    ``AuthError.provider`` is authoritative when resolution failed before the
+    caller learned the canonical route (for example, a missing local CLI while
+    the configured request was ``auto``). Provider profiles own this policy so
+    every CLI/gateway/cron entrypoint enforces the same contract.
+    """
+    candidate = str(getattr(error, "provider", "") or provider or "").strip().lower()
+    if not candidate:
+        return False
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(candidate)
+    except Exception:
+        return False
+    return bool(profile and profile.fail_closed)
+
+
 def _getenv(name: str, default: str = "") -> str:
     """Profile-scoped replacement for ``os.getenv`` on credential/provider reads.
 
@@ -1851,10 +1875,11 @@ def resolve_runtime_provider(
                 "requested_provider": requested_provider,
             }
 
-    if provider == "copilot-acp":
+    pconfig = PROVIDER_REGISTRY.get(provider)
+    if pconfig and pconfig.auth_type == "external_process":
         creds = resolve_external_process_provider_credentials(provider)
         return {
-            "provider": "copilot-acp",
+            "provider": provider,
             "api_mode": "chat_completions",
             "base_url": creds.get("base_url", "").rstrip("/"),
             "api_key": creds.get("api_key", ""),

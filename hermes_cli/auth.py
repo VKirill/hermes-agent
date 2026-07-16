@@ -452,6 +452,19 @@ try:
     for _pp in _list_providers_for_registry():
         if _pp.name in PROVIDER_REGISTRY:
             continue
+        if _pp.auth_type == "external_process":
+            PROVIDER_REGISTRY[_pp.name] = ProviderConfig(
+                id=_pp.name,
+                name=_pp.display_name or _pp.name,
+                auth_type="external_process",
+                inference_base_url=_pp.base_url,
+                api_key_env_vars=(),
+                base_url_env_var="",
+            )
+            for _alias in _pp.aliases:
+                if _alias not in PROVIDER_REGISTRY:
+                    PROVIDER_REGISTRY[_alias] = PROVIDER_REGISTRY[_pp.name]
+            continue
         if _pp.auth_type != "api_key" or not _pp.env_vars:
             continue
         # Skip providers that need custom token resolution or are special-cased
@@ -6293,13 +6306,20 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
     if not pconfig or pconfig.auth_type != "external_process":
         return {"configured": False}
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    if provider_id == "agy":
+        from hermes_cli.config import load_config
+
+        process_config = (load_config() or {}).get("agy") or {}
+        command = str(process_config.get("command") or "agy").strip() or "agy"
+        args = []
+    else:
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
+        )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
     base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
@@ -6334,12 +6354,14 @@ def get_auth_status(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return get_qwen_auth_status()
     if target == "minimax-oauth":
         return get_minimax_oauth_auth_status()
-    if target == "copilot-acp":
+    pconfig = PROVIDER_REGISTRY.get(target)
+    if target == "copilot-acp" or (
+        pconfig and pconfig.auth_type == "external_process"
+    ):
         return get_external_process_provider_status(target)
     if target == "azure-foundry":
         return _get_azure_foundry_auth_status()
     # API-key providers
-    pconfig = PROVIDER_REGISTRY.get(target)
     if pconfig and pconfig.auth_type == "api_key":
         return get_api_key_provider_status(target)
     # AWS SDK providers (Bedrock) — check via boto3 credential chain
@@ -6504,7 +6526,11 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
 
 def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str, Any]:
-    """Resolve runtime details for local subprocess-backed providers."""
+    """Resolve runtime details for local subprocess-backed providers.
+
+    Non-secret process behavior is read from ``config.yaml``. API-key
+    environment variables are deliberately not consulted for ``agy``.
+    """
     pconfig = PROVIDER_REGISTRY.get(provider_id)
     if not pconfig or pconfig.auth_type != "external_process":
         raise AuthError(
@@ -6517,25 +6543,49 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
     if not base_url:
         base_url = pconfig.inference_base_url
 
-    command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
-        or "copilot"
-    )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
-    args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+    if provider_id == "agy":
+        from hermes_cli.config import load_config
+
+        process_config = (load_config() or {}).get("agy") or {}
+        command = str(process_config.get("command") or "agy").strip() or "agy"
+        args = []
+        api_key_marker = "agy-external-process"
+        missing_code = "missing_agy_cli"
+        missing_hint = (
+            f"Could not find the Antigravity CLI command '{command}'. "
+            "Install and authenticate agy, then retry."
+        )
+    else:
+        command = (
+            os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+            or os.getenv("COPILOT_CLI_PATH", "").strip()
+            or "copilot"
+        )
+        raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+        args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
+        api_key_marker = "copilot-acp"
+        missing_code = "missing_copilot_cli"
+        missing_hint = (
+            f"Could not find the Copilot CLI command '{command}'. "
+            "Install GitHub Copilot CLI or set "
+            "HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH."
+        )
     resolved_command = shutil.which(command) if command else None
     if not resolved_command and not base_url.startswith("acp+tcp://"):
         raise AuthError(
-            f"Could not find the Copilot CLI command '{command}'. "
-            "Install GitHub Copilot CLI or set HERMES_COPILOT_ACP_COMMAND/COPILOT_CLI_PATH.",
+            missing_hint,
             provider=provider_id,
-            code="missing_copilot_cli",
+            code=missing_code,
         )
 
+    logger.debug(
+        "[FIX:agy-backend] Resolved external process provider %s via %s",
+        provider_id,
+        resolved_command or command,
+    )
     return {
         "provider": provider_id,
-        "api_key": "copilot-acp",
+        "api_key": api_key_marker,
         "base_url": base_url.rstrip("/"),
         "command": resolved_command or command,
         "args": args,

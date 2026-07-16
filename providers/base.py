@@ -55,6 +55,10 @@ class ProviderProfile:
     models_url: str = ""  # explicit models endpoint; falls back to {base_url}/models
     auth_type: str = "api_key"   # api_key|oauth_device_code|oauth_external|copilot|aws_sdk
     supports_health_check: bool = True  # False → doctor skips /models probe for this provider
+    # True when silently changing providers would violate the route's security
+    # contract. Callers must surface the original failure instead of walking
+    # the configured fallback chain.
+    fail_closed: bool = False
 
     # ── Vision support ────────────────────────────────────────
     # True when the provider's API accepts image content inside
