@@ -8917,6 +8917,103 @@ class TestResolveRuntimeWithFallback:
 
         assert len(calls) == 1
 
+    @pytest.mark.parametrize(
+        ("resolve_kwargs", "error_provider"),
+        [
+            ({"requested": "antigravity"}, "agy"),
+            ({"requested": "auto"}, "agy"),
+            (
+                {
+                    "requested": "custom",
+                    "explicit_base_url": "agy://local",
+                },
+                "",
+            ),
+        ],
+    )
+    def test_legacy_runtime_provider_shim_keeps_agy_fail_closed(
+        self,
+        monkeypatch,
+        resolve_kwargs,
+        error_provider,
+    ):
+        """Older embedders without the shared policy must not route agy remote."""
+        from hermes_cli.auth import AuthError
+
+        calls = []
+
+        def fake_resolve(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise AuthError("agy is unavailable", provider=error_provider)
+            return {
+                "provider": "gemini",
+                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+            }
+
+        monkeypatch.setitem(
+            sys.modules,
+            "hermes_cli.runtime_provider",
+            types.SimpleNamespace(resolve_runtime_provider=fake_resolve),
+        )
+        monkeypatch.setattr(
+            server,
+            "_load_fallback_model",
+            lambda: [{"provider": "gemini", "model": "gemini-3-flash"}],
+        )
+
+        with pytest.raises(AuthError, match="agy is unavailable"):
+            server._resolve_runtime_with_fallback(resolve_kwargs)
+
+        assert calls == [resolve_kwargs]
+
+    @pytest.mark.parametrize(
+        "profile_result",
+        [
+            types.SimpleNamespace(name="guarded", fail_closed=True),
+            RuntimeError("provider registry unavailable"),
+        ],
+        ids=["profile-policy", "classification-error"],
+    )
+    def test_legacy_runtime_provider_shim_refuses_uncertain_fallback(
+        self,
+        monkeypatch,
+        profile_result,
+    ):
+        from hermes_cli.auth import AuthError
+        import providers
+
+        calls = []
+
+        def fake_resolve(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise AuthError("guarded provider unavailable")
+            return {"provider": "gemini"}
+
+        def fake_get_provider_profile(_candidate):
+            if isinstance(profile_result, Exception):
+                raise profile_result
+            return profile_result
+
+        monkeypatch.setattr(providers, "get_provider_profile", fake_get_provider_profile)
+        monkeypatch.setitem(
+            sys.modules,
+            "hermes_cli.runtime_provider",
+            types.SimpleNamespace(resolve_runtime_provider=fake_resolve),
+        )
+        monkeypatch.setattr(
+            server,
+            "_load_fallback_model",
+            lambda: [{"provider": "gemini", "model": "gemini-3-flash"}],
+        )
+
+        resolve_kwargs = {"requested": "guarded-alias"}
+        with pytest.raises(AuthError, match="guarded provider unavailable"):
+            server._resolve_runtime_with_fallback(resolve_kwargs)
+
+        assert calls == [resolve_kwargs]
+
     def test_auth_error_all_fallbacks_fail_raises(self, monkeypatch):
         """When all fallbacks also fail, re-raise the original AuthError."""
         from hermes_cli.auth import AuthError

@@ -4512,10 +4512,49 @@ def _resolve_runtime_with_fallback(
         def provider_requires_fail_closed(
             provider=None, *, base_url=None, error=None
         ):
-            del error
-            return str(provider or "").strip().lower() == "agy" or str(
-                base_url or ""
-            ).strip().lower().startswith("agy://")
+            if str(base_url or "").strip().lower().startswith("agy://"):
+                return True
+
+            candidates = []
+            for value in (getattr(error, "provider", ""), provider):
+                candidate = str(value or "").strip().lower()
+                if candidate and candidate not in candidates:
+                    candidates.append(candidate)
+            if any(
+                candidate in {"agy", "antigravity", "antigravity-cli"}
+                for candidate in candidates
+            ):
+                return True
+
+            try:
+                from providers import get_provider_profile
+            except Exception as exc:
+                if candidates:
+                    logger.warning(
+                        "[FIX:agy-tui-fail-closed] provider registry unavailable "
+                        "for candidates=%s; refusing fallback: %s",
+                        candidates,
+                        exc,
+                    )
+                    return True
+                return False
+
+            for candidate in candidates:
+                try:
+                    profile = get_provider_profile(candidate)
+                except Exception as exc:
+                    logger.warning(
+                        "[FIX:agy-tui-fail-closed] provider classification failed "
+                        "for candidate=%s; refusing fallback: %s",
+                        candidate,
+                        exc,
+                    )
+                    return True
+                if profile and (
+                    profile.name == "agy" or bool(getattr(profile, "fail_closed", False))
+                ):
+                    return True
+            return False
 
     kwargs = resolve_kwargs or {}
     try:
