@@ -4499,10 +4499,23 @@ def _resolve_runtime_with_fallback(
     ``fallback_model`` chain before giving up.
     """
     from hermes_cli.auth import AuthError
-    from hermes_cli.runtime_provider import (
-        provider_requires_fail_closed,
-        resolve_runtime_provider,
-    )
+    try:
+        from hermes_cli.runtime_provider import (
+            provider_requires_fail_closed,
+            resolve_runtime_provider,
+        )
+    except ImportError:
+        # A few embedders/tests provide a minimal runtime_provider shim. Keep
+        # legacy shims working without weakening agy's no-fallback boundary.
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        def provider_requires_fail_closed(
+            provider=None, *, base_url=None, error=None
+        ):
+            del error
+            return str(provider or "").strip().lower() == "agy" or str(
+                base_url or ""
+            ).strip().lower().startswith("agy://")
 
     kwargs = resolve_kwargs or {}
     try:

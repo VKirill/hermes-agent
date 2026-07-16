@@ -158,6 +158,11 @@ def _skills_dir() -> Path:
     return get_hermes_home() / "skills"
 
 
+def get_skills_dir() -> Path:
+    """Return the active profile's skills directory."""
+    return _skills_dir()
+
+
 # Anthropic-recommended limits for progressive disclosure efficiency
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
