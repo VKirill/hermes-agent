@@ -111,6 +111,101 @@ print(json.dumps({
     assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
 
 
+def test_agy_client_uses_hermetic_no_command_cli_config_without_changing_home(
+    monkeypatch, tmp_path
+):
+    script = _write_fake_agy(
+        tmp_path,
+        """
+import json
+import os
+import stat
+import sys
+argv = sys.argv[1:]
+gemini_arg = next(item for item in argv if item.startswith("--gemini_dir="))
+gemini_dir = gemini_arg.split("=", 1)[1]
+settings_path = os.path.join(gemini_dir, "antigravity-cli", "settings.json")
+project_path = os.path.join(gemini_dir, "config", "projects", "default-cli-project.json")
+print(json.dumps({
+    "argv": argv,
+    "home": os.environ.get("HOME"),
+    "gemini_dir": gemini_dir,
+    "settings": json.load(open(settings_path, encoding="utf-8")),
+    "project": json.load(open(project_path, encoding="utf-8")),
+    "settings_mode": stat.S_IMODE(os.stat(settings_path).st_mode),
+    "has_hooks": os.path.exists(os.path.join(gemini_dir, "antigravity-cli", "hooks.json")),
+    "has_mcp": os.path.exists(os.path.join(gemini_dir, "antigravity-cli", "mcp_config.json")),
+    "has_plugins": os.path.exists(os.path.join(gemini_dir, "antigravity-cli", "plugins")),
+}))
+""",
+    )
+    profile_home = tmp_path / "profile"
+    login_home = tmp_path / "login-home"
+    login_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setenv("HOME", str(login_home))
+    client = AgyCLIClient(
+        command=sys.executable,
+        args=[str(script)],
+        agy_config=_config(tmp_path),
+    )
+    # agy may persist runtime decisions after a prior launch. The adapter must
+    # restore the managed policy immediately before every new process.
+    (client._agy_config_root / "antigravity-cli" / "settings.json").write_text(
+        '{"toolPermission":"always-proceed"}', encoding="utf-8"
+    )
+    (
+        client._agy_config_root
+        / "config"
+        / "projects"
+        / "default-cli-project.json"
+    ).write_text(
+        '{"id":"default-cli-project","name":"CLI Project"}', encoding="utf-8"
+    )
+
+    response = client.chat.completions.create(
+        model="Gemini 3.5 Flash (Low)",
+        messages=[{"role": "user", "content": "Return READY"}],
+    )
+
+    payload = json.loads(response.choices[0].message.content)
+    gemini_dir = Path(payload["gemini_dir"])
+    assert gemini_dir == client._agy_config_root
+    assert gemini_dir.parent == client._state_dir
+    assert payload["home"] == str(login_home)
+    assert payload["argv"][payload["argv"].index("--project") + 1] == "default-cli-project"
+    assert payload["settings"] == {
+        "allowNonWorkspaceAccess": False,
+        "artifactReviewPolicy": "asks-for-review",
+        "toolPermission": "request-review",
+        "trustedWorkspaces": [],
+    }
+    assert payload["project"]["permissionGrants"]["permissionGrants"] == {
+        "allow": ["read_file(*)"],
+        "ask": [],
+        "deny": [],
+    }
+    assert payload["settings_mode"] == 0o600
+    assert payload["has_hooks"] is False
+    assert payload["has_mcp"] is False
+    assert payload["has_plugins"] is False
+
+
+def test_agy_client_rejects_symlinked_hermetic_settings(monkeypatch, tmp_path):
+    profile_home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    client = AgyCLIClient(agy_config=_config(tmp_path))
+    settings_path = client._agy_config_root / "antigravity-cli" / "settings.json"
+    outside = tmp_path / "outside-settings.json"
+    outside.write_text('{"toolPermission":"always-proceed"}', encoding="utf-8")
+    settings_path.unlink()
+    settings_path.symlink_to(outside)
+
+    with pytest.raises(PermissionError, match="symlink"):
+        AgyCLIClient(agy_config=_config(tmp_path))
+    assert outside.read_text(encoding="utf-8") == '{"toolPermission":"always-proceed"}'
+
+
 def test_agy_client_uses_private_prompt_file_for_large_transcript(tmp_path):
     script = _write_fake_agy(
         tmp_path,
@@ -859,6 +954,7 @@ def test_agy_request_id_covers_execution_context(monkeypatch, tmp_path):
         ({"sandbox": False}, None, "sandbox=true"),
         ({"mode": "accept-edits"}, None, "mode='plan'"),
         ({}, ["--dangerously-skip-permissions"], "managed by Hermes"),
+        ({}, ["--gemini_dir=/tmp/escape"], "managed by Hermes"),
         ({}, ["--prompt-interactive"], "managed by Hermes"),
     ],
 )

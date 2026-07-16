@@ -65,6 +65,29 @@ _TOOL_CALL_BLOCK_RE = re.compile(
     r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL
 )
 _LOG_THREAD_LOCK = threading.Lock()
+_HERMETIC_AGY_SETTINGS = {
+    "allowNonWorkspaceAccess": False,
+    "artifactReviewPolicy": "asks-for-review",
+    # ``strict`` also blocks the read_file permission that agy itself needs to
+    # expand our private ``@file`` prompt transport. request-review plus the
+    # project grant below permits only read_file inside the isolated request
+    # workspace; commands remain unapproved permissions and headless print mode
+    # auto-denies them.
+    "toolPermission": "request-review",
+    "trustedWorkspaces": [],
+}
+_HERMETIC_AGY_PROJECT = {
+    "id": "default-cli-project",
+    "name": "CLI Project",
+    "permissionGrants": {
+        "permissionGrants": {
+            "allow": ["read_file(*)"],
+            "ask": [],
+            "deny": [],
+        }
+    },
+    "projectResources": {},
+}
 
 # Keep every launch-shaping flag owned by this adapter so configured process
 # arguments cannot silently disable sandbox/plan mode or select shared state.
@@ -77,6 +100,8 @@ _RESERVED_AGY_FLAGS = frozenset(
         "--continue",
         "--conversation",
         "--dangerously-skip-permissions",
+        "--gemini-dir",
+        "--gemini_dir",
         "--log-file",
         "--mode",
         "--model",
@@ -268,6 +293,55 @@ def _exclusive_file_lock(path: Path):
                 except OSError:
                     pass
             os.close(fd)
+
+
+def _install_hermetic_agy_settings(config_root: Path) -> Path:
+    """Install the hermetic headless policy without changing HOME or auth state.
+
+    ``agy`` stores CLI customizations below its Gemini directory, while OAuth is
+    resolved independently through the OS keyring.  Pointing ``--gemini_dir`` at
+    this managed root therefore excludes the user's hooks/plugins/MCP/settings
+    without breaking the existing interactive login.
+    """
+    root = _ensure_secure_directory(config_root)
+    cli_root = root / "antigravity-cli"
+    _assert_contained(root, cli_root)
+    cli_root = _ensure_secure_directory(cli_root)
+    config_dir = root / "config"
+    projects_dir = config_dir / "projects"
+    for directory in (config_dir, projects_dir):
+        _assert_contained(root, directory)
+        _ensure_secure_directory(directory)
+    managed_files = {
+        cli_root / "settings.json": _HERMETIC_AGY_SETTINGS,
+        config_dir / "config.json": {
+            "projectID": "default-cli-project",
+            "projectName": "CLI Project",
+        },
+        projects_dir / "default-cli-project.json": _HERMETIC_AGY_PROJECT,
+    }
+    for path in managed_files:
+        _assert_contained(root, path)
+    lock_path = root / "settings.lock"
+    _assert_contained(root, lock_path)
+    with _exclusive_file_lock(lock_path):
+        for path, value in managed_files.items():
+            payload = (
+                json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+            ).encode("utf-8")
+            fd = _open_secure_file(
+                path,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            )
+            try:
+                offset = 0
+                while offset < len(payload):
+                    offset += os.write(fd, payload[offset:])
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    settings_path = cli_root / "settings.json"
+    return settings_path
 
 
 def _terminate_process(proc: subprocess.Popen[bytes], *, force: bool = False) -> None:
@@ -729,8 +803,10 @@ class AgyCLIClient:
         self._state_dir = _ensure_secure_directory(profile_state)
         self._workspaces_dir = self._state_dir / "workspaces"
         self._logs_dir = self._state_dir / "logs"
+        self._agy_config_root = self._state_dir / "antigravity-runtime"
         self._db_path = self._state_dir / "state.sqlite3"
         self._ensure_state_dirs()
+        _install_hermetic_agy_settings(self._agy_config_root)
         self._init_state_db()
         self.chat = _AgyChatNamespace(self)
         self.is_closed = False
@@ -740,7 +816,12 @@ class AgyCLIClient:
         ] = {}
 
     def _ensure_state_dirs(self) -> None:
-        for path in (self._state_dir, self._workspaces_dir, self._logs_dir):
+        for path in (
+            self._state_dir,
+            self._workspaces_dir,
+            self._logs_dir,
+            self._agy_config_root,
+        ):
             _assert_contained(self._state_dir, path)
             _ensure_secure_directory(path)
 
@@ -991,7 +1072,7 @@ class AgyCLIClient:
                 "model": model,
                 "prompt": prompt,
                 "sandbox": self._sandbox,
-                "launch_policy": "managed-sandbox-plan-v2-private-prompt-file",
+                "launch_policy": "managed-sandbox-plan-v4-hermetic-no-command",
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -1330,10 +1411,14 @@ class AgyCLIClient:
                 self._set_active_process(proc, _cancellation_event)
 
             try:
+                _install_hermetic_agy_settings(self._agy_config_root)
                 prompt_path = _write_private_prompt_file(workspace, prompt)
                 argv = [
                     self._command,
                     *self._args,
+                    f"--gemini_dir={self._agy_config_root}",
+                    "--project",
+                    "default-cli-project",
                     "-p",
                     f"@{prompt_path}",
                     "--model",
