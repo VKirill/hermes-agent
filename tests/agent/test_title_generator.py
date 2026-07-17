@@ -1,7 +1,8 @@
-"""Tests for agent.title_generator — auto-generated session titles with icons."""
+"""Tests for agent.title_generator — auto-generated session titles."""
 
-import json
+import pytest
 from unittest.mock import MagicMock, patch
+
 
 from agent.title_generator import (
     generate_title,
@@ -9,25 +10,20 @@ from agent.title_generator import (
     maybe_auto_title,
     _title_language,
 )
-
-
-def _json_response(title: str, icon: int = 1) -> MagicMock:
-    """Build a mock LLM response returning JSON with title + icon."""
-    mock = MagicMock()
-    mock.choices = [MagicMock()]
-    mock.choices[0].message.content = json.dumps({"title": title, "icon": icon})
-    return mock
+from hermes_state import SessionDB
 
 
 class TestGenerateTitle:
-    """Unit tests for generate_title() — now returns (title, icon_id) tuple."""
+    """Unit tests for generate_title()."""
 
     def test_returns_title_on_success(self):
-        mock_response = _json_response("Debugging Python Import Errors", 1)
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Debugging Python Import Errors"
+
         with patch("agent.title_generator.call_llm", return_value=mock_response):
-            title, icon_id = generate_title("help me fix this import", "Sure, let me check...")
+            title = generate_title("help me fix this import", "Sure, let me check...")
             assert title == "Debugging Python Import Errors"
-            assert icon_id is not None
 
     def test_default_prompt_matches_user_language(self):
         mock_response = MagicMock()
@@ -97,11 +93,13 @@ class TestGenerateTitle:
         assert captured_kwargs["timeout"] == 123.0
 
     def test_strips_quotes(self):
-        mock_response = _json_response('"Setting Up Docker Environment"', 4)
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = '"Setting Up Docker Environment"'
+
         with patch("agent.title_generator.call_llm", return_value=mock_response):
-            title, icon_id = generate_title("how do I set up docker", "First install...")
+            title = generate_title("how do I set up docker", "First install...")
             assert title == "Setting Up Docker Environment"
-            assert icon_id is not None
 
     def test_strips_think_blocks(self):
         """Reasoning-model output wrapped in <think>...</think> must not
@@ -135,16 +133,21 @@ class TestGenerateTitle:
             assert title is None
 
     def test_strips_title_prefix(self):
-        mock_response = _json_response("Title: Kubernetes Pod Debugging", 1)
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Title: Kubernetes Pod Debugging"
+
         with patch("agent.title_generator.call_llm", return_value=mock_response):
-            title, icon_id = generate_title("my pod keeps crashing", "Let me look...")
+            title = generate_title("my pod keeps crashing", "Let me look...")
             assert title == "Kubernetes Pod Debugging"
 
     def test_truncates_long_titles(self):
-        mock_response = _json_response("A" * 100, 1)
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "A" * 100
+
         with patch("agent.title_generator.call_llm", return_value=mock_response):
-            title, icon_id = generate_title("question", "answer")
-            assert title is not None
+            title = generate_title("question", "answer")
             assert len(title) == 80
             assert title.endswith("...")
 
@@ -152,16 +155,13 @@ class TestGenerateTitle:
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
         mock_response.choices[0].message.content = ""
-        with patch("agent.title_generator.call_llm", return_value=mock_response):
-            title, icon_id = generate_title("question", "answer")
-            assert title is None
-            assert icon_id is None
 
-    def test_returns_none_none_on_exception(self):
+        with patch("agent.title_generator.call_llm", return_value=mock_response):
+            assert generate_title("question", "answer") is None
+
+    def test_returns_none_on_exception(self):
         with patch("agent.title_generator.call_llm", side_effect=RuntimeError("no provider")):
-            title, icon_id = generate_title("question", "answer")
-            assert title is None
-            assert icon_id is None
+            assert generate_title("question", "answer") is None
 
     def test_invokes_failure_callback_on_exception(self):
         """failure_callback must fire so the user sees a warning (issue #15775)."""
@@ -172,30 +172,27 @@ class TestGenerateTitle:
 
         exc = RuntimeError("openrouter 402: credits exhausted")
         with patch("agent.title_generator.call_llm", side_effect=exc):
-            title, icon_id = generate_title("question", "answer", failure_callback=_cb)
+            result = generate_title("question", "answer", failure_callback=_cb)
 
-        assert title is None
-        assert icon_id is None
+        assert result is None
         assert len(captured) == 1
         assert captured[0][0] == "title generation"
         assert captured[0][1] is exc
 
     def test_failure_callback_errors_are_swallowed(self):
         """A broken callback must not crash title generation."""
+
         def _bad_cb(task, exc):
             raise ValueError("callback bug")
 
         with patch("agent.title_generator.call_llm", side_effect=RuntimeError("nope")):
-            title, icon_id = generate_title("q", "a", failure_callback=_bad_cb)
-            assert title is None
-            assert icon_id is None
+            # Should return None without re-raising the callback error
+            assert generate_title("q", "a", failure_callback=_bad_cb) is None
 
     def test_no_callback_matches_legacy_behavior(self):
         """Omitting failure_callback preserves the silent-None return."""
         with patch("agent.title_generator.call_llm", side_effect=RuntimeError("nope")):
-            title, icon_id = generate_title("q", "a")
-            assert title is None
-            assert icon_id is None
+            assert generate_title("q", "a") is None
 
     def test_truncates_long_messages(self):
         """Long user/assistant messages should be truncated in the LLM request."""
@@ -203,108 +200,103 @@ class TestGenerateTitle:
 
         def mock_call_llm(**kwargs):
             captured_kwargs.update(kwargs)
-            return _json_response("Short Title", 1)
+            resp = MagicMock()
+            resp.choices = [MagicMock()]
+            resp.choices[0].message.content = "Short Title"
+            return resp
 
         with patch("agent.title_generator.call_llm", side_effect=mock_call_llm):
             generate_title("x" * 1000, "y" * 1000)
 
+        # The user content in the messages should be truncated
         user_content = captured_kwargs["messages"][1]["content"]
-        assert len(user_content) < 1100
+        assert len(user_content) < 1100  # 500 + 500 + formatting
 
-    def test_invalid_json_returns_none(self):
-        """Non-JSON LLM response should return (None, None)."""
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "Just a plain string, not JSON"
-        with patch("agent.title_generator.call_llm", return_value=mock_response):
-            title, icon_id = generate_title("question", "answer")
-            assert title is None
-            assert icon_id is None
+    def test_skips_when_title_generation_disabled(self):
+        """auxiliary.title_generation.enabled=false disables automatic titles."""
+        config = {"auxiliary": {"title_generation": {"enabled": False}}}
 
-    def test_missing_title_field_returns_none(self):
-        """JSON without 'title' key should return (None, None)."""
-        mock = MagicMock()
-        mock.choices = [MagicMock()]
-        mock.choices[0].message.content = json.dumps({"icon": 3})
-        with patch("agent.title_generator.call_llm", return_value=mock):
-            title, icon_id = generate_title("question", "answer")
-            assert title is None
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+            patch("agent.title_generator.call_llm") as mock_call_llm,
+        ):
+            assert generate_title("question", "answer") is None
 
-    def test_out_of_range_icon_returns_none_icon(self):
-        """Icon index outside 1-28 should yield icon_id=None."""
-        mock = MagicMock()
-        mock.choices = [MagicMock()]
-        mock.choices[0].message.content = json.dumps({"title": "Valid Title", "icon": 999})
-        with patch("agent.title_generator.call_llm", return_value=mock):
-            title, icon_id = generate_title("question", "answer")
-            assert title == "Valid Title"
-            assert icon_id is None
+        mock_call_llm.assert_not_called()
 
 
 class TestAutoTitleSession:
-    """Tests for auto_title_session() — updated for title+icon tuple return."""
+    """Tests for auto_title_session() — the sync worker function."""
 
     def test_skips_if_no_session_db(self):
-        auto_title_session(None, "sess-1", "hi", "hello")
+        auto_title_session(None, "sess-1", "hi", "hello")  # should not crash
 
     def test_skips_if_title_exists(self):
         db = MagicMock()
         db.get_session_title.return_value = "Existing Title"
+
         with patch("agent.title_generator.generate_title") as gen:
             auto_title_session(db, "sess-1", "hi", "hello")
             gen.assert_not_called()
 
-    def test_replaces_generated_telegram_fallback_title(self):
-        db = MagicMock()
-        db.get_session_title.return_value = "Telegram May 10 12:38 deadbe"
-
-        with patch("agent.title_generator.generate_title", return_value=("DeFi Liquidation Searcher", None)):
-            auto_title_session(db, "sess-1", "hi", "hello")
-
-        db.set_session_title.assert_called_once_with("sess-1", "DeFi Liquidation Searcher")
-
     def test_generates_and_sets_title(self):
         db = MagicMock()
         db.get_session_title.return_value = None
-        with patch("agent.title_generator.generate_title", return_value=("New Title", "emoji_123")):
+        db.set_auto_title_if_empty.return_value = True
+
+        with patch("agent.title_generator.generate_title", return_value="New Title"):
             auto_title_session(db, "sess-1", "hi", "hello")
-            db.set_session_title.assert_called_once_with("sess-1", "New Title")
+            db.set_auto_title_if_empty.assert_called_once_with("sess-1", "New Title")
 
-    def test_invokes_title_callback_with_icon(self):
-        db = MagicMock()
-        db.get_session_title.return_value = None
+    def test_does_not_overwrite_title_set_immediately_before_conditional_write(
+        self, tmp_path
+    ):
+        db = SessionDB(tmp_path / "state.db")
+        db.create_session(session_id="sess-1", source="cli")
         seen = []
 
-        def two_arg_callback(title, icon_id=None):
-            seen.append((title, icon_id))
+        def generate_after_manual_title(*_args, **_kwargs):
+            db.set_session_title("sess-1", "Manual Title")
+            return "Auto Title"
 
-        with patch("agent.title_generator.generate_title", return_value=("Readable Session", "emoji_456")):
+        with patch(
+            "agent.title_generator.generate_title",
+            side_effect=generate_after_manual_title,
+        ):
             auto_title_session(
-                db, "sess-1", "hello", "hi there",
-                title_callback=two_arg_callback,
-            )
-        db.set_session_title.assert_called_once_with("sess-1", "Readable Session")
-        assert seen == [("Readable Session", "emoji_456")]
-
-    def test_backward_compat_one_arg_callback(self):
-        """Legacy 1-arg callbacks still work — they just get the title."""
-        db = MagicMock()
-        db.get_session_title.return_value = None
-        seen = []
-
-        with patch("agent.title_generator.generate_title", return_value=("Title Only", "emoji_789")):
-            auto_title_session(
-                db, "sess-1", "hello", "hi there",
+                db,
+                "sess-1",
+                "hi",
+                "hello",
                 title_callback=seen.append,
             )
-        assert seen == ["Title Only"]
+
+        assert db.get_session_title("sess-1") == "Manual Title"
+        assert seen == []
+
+    def test_invokes_title_callback_after_setting_title(self):
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        db.set_auto_title_if_empty.return_value = True
+        seen = []
+        with patch("agent.title_generator.generate_title", return_value="Readable Session"):
+            auto_title_session(
+                db,
+                "sess-1",
+                "hello",
+                "hi there",
+                title_callback=seen.append,
+            )
+        db.set_auto_title_if_empty.assert_called_once_with("sess-1", "Readable Session")
+        assert seen == ["Readable Session"]
 
     def test_skips_if_generation_fails(self):
         db = MagicMock()
         db.get_session_title.return_value = None
-        with patch("agent.title_generator.generate_title", return_value=(None, None)):
+
+        with patch("agent.title_generator.generate_title", return_value=None):
             auto_title_session(db, "sess-1", "hi", "hello")
-            db.set_session_title.assert_not_called()
+            db.set_auto_title_if_empty.assert_not_called()
 
     def test_never_raises_when_body_throws(self):
         """Daemon-thread target must swallow ALL exceptions (e.g. the
@@ -352,9 +344,10 @@ class TestAutoTitleSession:
 
 
 class TestMaybeAutoTitle:
-    """Tests for maybe_auto_title() — fire-and-forget entry point."""
+    """Tests for maybe_auto_title() — the fire-and-forget entry point."""
 
     def test_skips_if_not_first_exchange(self):
+        """Should not fire for conversations with more than 2 user messages."""
         db = MagicMock()
         history = [
             {"role": "user", "content": "first"},
@@ -364,31 +357,61 @@ class TestMaybeAutoTitle:
             {"role": "user", "content": "third"},
             {"role": "assistant", "content": "response 3"},
         ]
+
         with patch("agent.title_generator.auto_title_session") as mock_auto:
             maybe_auto_title(db, "sess-1", "third", "response 3", history)
+            # Wait briefly for any thread to start
             import time
             time.sleep(0.1)
             mock_auto.assert_not_called()
 
     def test_fires_on_first_exchange(self):
+        """Should fire a background thread for the first exchange."""
         db = MagicMock()
         db.get_session_title.return_value = None
         history = [
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "hi there"},
         ]
+
         with patch("agent.title_generator.auto_title_session") as mock_auto:
+            import threading
+            called = threading.Event()
+            mock_auto.side_effect = lambda *a, **k: called.set()
             maybe_auto_title(db, "sess-1", "hello", "hi there", history)
-            import time
-            time.sleep(0.3)
+            # Event-based wait: sleep-sync flaked when the daemon thread
+            # wasn't scheduled within the fixed nap on a loaded runner.
+            assert called.wait(timeout=10), "auto_title thread never ran"
             mock_auto.assert_called_once_with(
-                db, "sess-1", "hello", "hi there",
+                db,
+                "sess-1",
+                "hello",
+                "hi there",
                 failure_callback=None,
                 main_runtime=None,
                 title_callback=None,
+                runtime_validator=None,
             )
 
+    def test_skips_when_title_generation_disabled(self):
+        """Disabled title generation should not even start the background worker."""
+        db = MagicMock()
+        history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ]
+        config = {"auxiliary": {"title_generation": {"enabled": False}}}
+
+        with (
+            patch("hermes_cli.config.load_config_readonly", return_value=config),
+            patch("agent.title_generator.auto_title_session") as mock_auto,
+        ):
+            maybe_auto_title(db, "sess-1", "hello", "hi there", history)
+
+        mock_auto.assert_not_called()
+
     def test_forwards_failure_callback_to_worker(self):
+        """maybe_auto_title must forward failure_callback into the thread."""
         db = MagicMock()
         db.get_session_title.return_value = None
         history = [
@@ -400,19 +423,163 @@ class TestMaybeAutoTitle:
             pass
 
         with patch("agent.title_generator.auto_title_session") as mock_auto:
+            import threading
+            called = threading.Event()
+            mock_auto.side_effect = lambda *a, **k: called.set()
             maybe_auto_title(db, "sess-1", "hello", "hi there", history, failure_callback=_cb)
-            import time
-            time.sleep(0.3)
+            assert called.wait(timeout=10), "auto_title thread never ran"
             mock_auto.assert_called_once_with(
-                db, "sess-1", "hello", "hi there",
+                db,
+                "sess-1",
+                "hello",
+                "hi there",
                 failure_callback=_cb,
                 main_runtime=None,
                 title_callback=None,
+                runtime_validator=None,
             )
 
     def test_skips_if_no_response(self):
         db = MagicMock()
-        maybe_auto_title(db, "sess-1", "hello", "", [])
+        maybe_auto_title(db, "sess-1", "hello", "", [])  # empty response
 
     def test_skips_if_no_session_db(self):
-        maybe_auto_title(None, "sess-1", "hello", "response", [])
+        maybe_auto_title(None, "sess-1", "hello", "response", [])  # no db
+
+
+class TestAutoTitleDuplicateHandling:
+    """Duplicate auto-title handling and not-found hardening (#50537)."""
+
+    def test_dedupes_duplicate_title_via_lineage(self):
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        # Atomic write path: collision raises ValueError, retry persists.
+        db.set_auto_title_if_empty.side_effect = [ValueError("in use"), True]
+        db.get_next_title_in_lineage.return_value = "Debugging Import Error #2"
+        with patch(
+            "agent.title_generator.generate_title",
+            return_value="Debugging Import Error",
+        ):
+            seen = []
+            auto_title_session(db, "sess-1", "hi", "hello", title_callback=seen.append)
+        db.get_next_title_in_lineage.assert_called_once_with("Debugging Import Error")
+        assert db.set_auto_title_if_empty.call_args_list[-1][0] == (
+            "sess-1",
+            "Debugging Import Error #2",
+        )
+        # callback fires with the actually-persisted (deduped) title
+        assert seen == ["Debugging Import Error #2"]
+
+    def test_dedupes_duplicate_title_via_lineage_legacy_store(self):
+        # Store without set_auto_title_if_empty: same dedup via the plain
+        # set_session_title fallback.
+        db = MagicMock(
+            spec=["get_session_title", "set_session_title", "get_next_title_in_lineage"]
+        )
+        db.get_session_title.return_value = None
+        db.set_session_title.side_effect = [ValueError("in use"), True]
+        db.get_next_title_in_lineage.return_value = "Debugging Import Error #2"
+        with patch(
+            "agent.title_generator.generate_title",
+            return_value="Debugging Import Error",
+        ):
+            seen = []
+            auto_title_session(db, "sess-1", "hi", "hello", title_callback=seen.append)
+        assert db.set_session_title.call_args_list[-1][0] == (
+            "sess-1",
+            "Debugging Import Error #2",
+        )
+        assert seen == ["Debugging Import Error #2"]
+
+    def test_swallows_value_error_without_lineage_support(self):
+        # No get_next_title_in_lineage -> ValueError propagates out of the
+        # persist helper but auto_title_session still swallows it (no crash).
+        db = MagicMock(spec=["get_session_title", "set_session_title"])
+        db.get_session_title.return_value = None
+        db.set_session_title.side_effect = ValueError("in use")
+        with patch(
+            "agent.title_generator.generate_title", return_value="Dup Title"
+        ):
+            auto_title_session(db, "sess-1", "hi", "hello")  # must not raise
+
+    def test_manual_title_race_skips_without_callback(self):
+        # Atomic predicate fails (manual /title landed while generation was in
+        # flight) -> nothing persisted, no callback fired.
+        from agent.title_generator import _persist_session_title
+        db = MagicMock()
+        db.set_auto_title_if_empty.return_value = False
+        assert _persist_session_title(db, "sess-1", "Some Title") is None
+        db.set_session_title.assert_not_called()
+
+    def test_not_found_raises_runtime_error_internally(self):
+        # Legacy store (no atomic write): set_session_title returning False
+        # (session vanished) -> RuntimeError in the persist helper, swallowed
+        # by auto_title_session, no callback.
+        from agent.title_generator import _persist_session_title
+        db = MagicMock(spec=["get_session_title", "set_session_title"])
+        db.set_session_title.return_value = False
+        with pytest.raises(RuntimeError):
+            _persist_session_title(db, "missing", "Some Title")
+
+
+class TestRuntimeValidator:
+    """runtime_validator gating (#19027): a stale background title request
+    must not fire when the session's model/provider changed after spawn."""
+
+    def test_skips_when_validator_returns_false(self):
+        with patch("agent.title_generator.call_llm") as mock_llm:
+            title = generate_title(
+                "question", "answer",
+                runtime_validator=lambda: False,
+            )
+            assert title is None
+            mock_llm.assert_not_called()
+
+    def test_allows_when_validator_returns_true(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Validated Title"
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response) as mock_llm:
+            title = generate_title(
+                "question", "answer",
+                runtime_validator=lambda: True,
+            )
+            assert title == "Validated Title"
+            mock_llm.assert_called_once()
+
+    def test_broken_validator_fails_open(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "Resilient Title"
+
+        def _bad_validator():
+            raise RuntimeError("validator gone")
+
+        with patch("agent.title_generator.call_llm", return_value=mock_response) as mock_llm:
+            title = generate_title(
+                "question", "answer",
+                runtime_validator=_bad_validator,
+            )
+            assert title == "Resilient Title"
+            mock_llm.assert_called_once()
+
+    def test_forwards_runtime_validator_to_worker(self):
+        db = MagicMock()
+        db.get_session_title.return_value = None
+        history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ]
+
+        def _v():
+            return True
+
+        with patch("agent.title_generator.auto_title_session") as mock_auto:
+            import threading
+            called = threading.Event()
+            mock_auto.side_effect = lambda *a, **k: called.set()
+            maybe_auto_title(db, "sess-1", "hello", "hi there", history, runtime_validator=_v)
+            assert called.wait(timeout=10), "auto_title thread never ran"
+            kwargs = mock_auto.call_args.kwargs
+            assert kwargs["runtime_validator"] is _v
